@@ -1,0 +1,513 @@
+# ============================================================================
+# SPTRANS REAL-TIME PIPELINE - MAKEFILE
+# ============================================================================
+# Comandos úteis para gerenciar o projeto
+# Uso: make <command>
+# Lista de comandos: make help
+# ============================================================================
+
+.PHONY: help setup start stop restart status logs clean test lint format docs
+
+# Variáveis
+DOCKER_COMPOSE := docker-compose
+PYTHON := python3
+PIP := pip3
+PYTEST := pytest
+
+# Colors
+RED := \033[0;31m
+GREEN := \033[0;32m
+YELLOW := \033[0;33m
+BLUE := \033[0;34m
+NC := \033[0m # No Color
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+help: ## Mostra esta mensagem de ajuda
+	@echo "$(BLUE)============================================$(NC)"
+	@echo "$(BLUE)  SPTrans Real-Time Pipeline - Comandos$(NC)"
+	@echo "$(BLUE)============================================$(NC)"
+	@echo ""
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "$(GREEN)%-20s$(NC) %s\n", $$1, $$2}'
+	@echo ""
+
+# ============================================================================
+# SETUP & INSTALLATION
+# ============================================================================
+
+setup: ## Setup completo do projeto (primeira vez)
+	@echo "$(BLUE)Iniciando setup do projeto...$(NC)"
+	@make check-requirements
+	@make create-env
+	@make create-dirs
+	@make build
+	@make init-services
+	@echo "$(GREEN)✓ Setup concluído!$(NC)"
+
+check-requirements: ## Verifica pré-requisitos
+	@echo "$(YELLOW)Verificando pré-requisitos...$(NC)"
+	@command -v docker >/dev/null 2>&1 || { echo "$(RED)Docker não instalado!$(NC)"; exit 1; }
+	@command -v docker-compose >/dev/null 2>&1 || { echo "$(RED)Docker Compose não instalado!$(NC)"; exit 1; }
+	@echo "$(GREEN)✓ Pré-requisitos OK$(NC)"
+
+create-env: ## Cria arquivo .env a partir do template
+	@if [ ! -f .env ]; then \
+		echo "$(YELLOW)Criando arquivo .env...$(NC)"; \
+		cp .env.example .env; \
+		echo "$(GREEN)✓ Arquivo .env criado$(NC)"; \
+		echo "$(RED)⚠ ATENÇÃO: Edite o .env e configure suas credenciais!$(NC)"; \
+	else \
+		echo "$(YELLOW)Arquivo .env já existe$(NC)"; \
+	fi
+
+create-dirs: ## Cria estrutura de diretórios
+	@echo "$(YELLOW)Criando diretórios...$(NC)"
+	@mkdir -p data/gtfs data/samples data/backups
+	@mkdir -p logs/airflow logs/spark logs/application
+	@mkdir -p config/spark config/prometheus config/grafana/dashboards
+	@chmod -R 755 data/ logs/ config/
+	@echo "$(GREEN)✓ Diretórios criados$(NC)"
+
+# ============================================================================
+# DOCKER OPERATIONS
+# ============================================================================
+
+build: ## Build das imagens Docker
+	@echo "$(YELLOW)Building Docker images...$(NC)"
+	@$(DOCKER_COMPOSE) build
+	@echo "$(GREEN)✓ Build concluído$(NC)"
+
+start: ## Inicia todos os serviços
+	@echo "$(YELLOW)Iniciando serviços...$(NC)"
+	@$(DOCKER_COMPOSE) up -d
+	@echo "$(GREEN)✓ Serviços iniciados$(NC)"
+	@make status
+
+stop: ## Para todos os serviços
+	@echo "$(YELLOW)Parando serviços...$(NC)"
+	@$(DOCKER_COMPOSE) down
+	@echo "$(GREEN)✓ Serviços parados$(NC)"
+
+restart: ## Reinicia todos os serviços
+	@make stop
+	@make start
+
+status: ## Mostra status dos serviços
+	@echo "$(BLUE)Status dos serviços:$(NC)"
+	@$(DOCKER_COMPOSE) ps
+
+logs: ## Mostra logs de todos os serviços
+	@$(DOCKER_COMPOSE) logs -f
+
+logs-airflow: ## Logs do Airflow Scheduler
+	@$(DOCKER_COMPOSE) logs -f airflow-scheduler
+
+logs-spark: ## Logs do Spark Master
+	@$(DOCKER_COMPOSE) logs -f spark-master
+
+logs-postgres: ## Logs do PostgreSQL
+	@$(DOCKER_COMPOSE) logs -f postgres
+
+# ============================================================================
+# SERVICES INITIALIZATION
+# ============================================================================
+
+init-services: ## Inicializa todos os serviços
+	@echo "$(YELLOW)Inicializando serviços...$(NC)"
+	@make start
+	@sleep 30
+	@make init-minio
+	@make init-postgres
+	@make init-airflow
+	@echo "$(GREEN)✓ Serviços inicializados$(NC)"
+
+init-minio: ## Inicializa MinIO (cria buckets)
+	@echo "$(YELLOW)Inicializando MinIO...$(NC)"
+	@$(DOCKER_COMPOSE) exec -T minio mc config host add minio http://localhost:9000 minioadmin minioadmin123
+	@$(DOCKER_COMPOSE) exec -T minio mc mb -p minio/sptrans-bronze
+	@$(DOCKER_COMPOSE) exec -T minio mc mb -p minio/sptrans-silver
+	@$(DOCKER_COMPOSE) exec -T minio mc mb -p minio/sptrans-gold
+	@echo "$(GREEN)✓ MinIO inicializado$(NC)"
+
+init-postgres: ## Inicializa PostgreSQL (cria schemas e tabelas)
+	@echo "$(YELLOW)Inicializando PostgreSQL...$(NC)"
+	@$(DOCKER_COMPOSE) exec -T postgres psql -U airflow -d postgres -f /sql/00_create_databases.sql
+	@$(DOCKER_COMPOSE) exec -T postgres psql -U airflow -d sptrans -f /sql/01_serving_schema.sql
+	@$(DOCKER_COMPOSE) exec -T postgres psql -U airflow -d sptrans -f /sql/02_serving_tables.sql
+	@$(DOCKER_COMPOSE) exec -T postgres psql -U airflow -d sptrans -f /sql/03_materialized_views.sql
+	@$(DOCKER_COMPOSE) exec -T postgres psql -U airflow -d sptrans -f /sql/04_indexes.sql
+	@echo "$(GREEN)✓ PostgreSQL inicializado$(NC)"
+
+init-airflow: ## Inicializa Airflow (cria usuário admin)
+	@echo "$(YELLOW)Inicializando Airflow...$(NC)"
+	@$(DOCKER_COMPOSE) exec -T airflow-webserver airflow users create \
+		--username admin \
+		--password admin123 \
+		--firstname Admin \
+		--lastname User \
+		--role Admin \
+		--email admin@sptrans.local || true
+	@echo "$(GREEN)✓ Airflow inicializado$(NC)"
+	@echo "$(BLUE)  URL: http://localhost:8080$(NC)"
+	@echo "$(BLUE)  User: admin | Pass: admin123$(NC)"
+
+# ============================================================================
+# DATA OPERATIONS
+# ============================================================================
+
+download-gtfs: ## Download dos arquivos GTFS
+	@echo "$(YELLOW)Baixando arquivos GTFS...$(NC)"
+	@$(PYTHON) scripts/download_gtfs.py
+	@echo "$(GREEN)✓ GTFS baixado$(NC)"
+
+load-gtfs: ## Carrega GTFS no Bronze Layer
+	@echo "$(YELLOW)Carregando GTFS...$(NC)"
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags trigger dag_01_gtfs_ingestion
+	@echo "$(GREEN)✓ DAG de GTFS triggered$(NC)"
+
+trigger-api-ingestion: ## Trigger manual de ingestão da API
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags trigger dag_02_api_ingestion
+
+# ============================================================================
+# AIRFLOW DAGS
+# ============================================================================
+
+dags-list: ## Lista todos os DAGs
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags list
+
+dags-enable: ## Ativa todos os DAGs
+	@echo "$(YELLOW)Ativando DAGs...$(NC)"
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags unpause dag_01_gtfs_ingestion
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags unpause dag_02_api_ingestion
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags unpause dag_03_bronze_to_silver
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags unpause dag_04_silver_to_gold
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags unpause dag_05_gold_to_serving
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags unpause dag_06_data_quality
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags unpause dag_07_maintenance
+	@echo "$(GREEN)✓ Todos os DAGs ativados$(NC)"
+
+dags-disable: ## Desativa todos os DAGs
+	@echo "$(YELLOW)Desativando DAGs...$(NC)"
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags pause dag_01_gtfs_ingestion
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags pause dag_02_api_ingestion
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags pause dag_03_bronze_to_silver
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags pause dag_04_silver_to_gold
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags pause dag_05_gold_to_serving
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags pause dag_06_data_quality
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow dags pause dag_07_maintenance
+	@echo "$(GREEN)✓ Todos os DAGs desativados$(NC)"
+
+# ============================================================================
+# HEALTH CHECKS
+# ============================================================================
+
+health-check: ## Verifica saúde de todos os serviços
+	@echo "$(BLUE)Verificando saúde dos serviços...$(NC)"
+	@echo ""
+	@echo "$(YELLOW)MinIO:$(NC)"
+	@curl -s -I http://localhost:9001/ | head -n 1 || echo "$(RED)✗ Falhou$(NC)"
+	@echo ""
+	@echo "$(YELLOW)PostgreSQL:$(NC)"
+	@$(DOCKER_COMPOSE) exec -T postgres pg_isready -U airflow || echo "$(RED)✗ Falhou$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Redis:$(NC)"
+	@$(DOCKER_COMPOSE) exec -T redis redis-cli ping || echo "$(RED)✗ Falhou$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Airflow:$(NC)"
+	@curl -s http://localhost:8080/health | grep -q "healthy" && echo "$(GREEN)✓ OK$(NC)" || echo "$(RED)✗ Falhou$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Spark:$(NC)"
+	@curl -s -I http://localhost:8081 | head -n 1 || echo "$(RED)✗ Falhou$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Superset:$(NC)"
+	@curl -s -I http://localhost:8088/health | head -n 1 || echo "$(RED)✗ Falhou$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Grafana:$(NC)"
+	@curl -s http://localhost:3000/api/health | grep -q "ok" && echo "$(GREEN)✓ OK$(NC)" || echo "$(RED)✗ Falhou$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Prometheus:$(NC)"
+	@curl -s http://localhost:9090/-/healthy || echo "$(RED)✗ Falhou$(NC)"
+
+# ============================================================================
+# DATABASE OPERATIONS
+# ============================================================================
+
+db-shell: ## Abre shell do PostgreSQL
+	@$(DOCKER_COMPOSE) exec postgres psql -U airflow -d sptrans
+
+db-backup: ## Backup do PostgreSQL
+	@echo "$(YELLOW)Criando backup do PostgreSQL...$(NC)"
+	@mkdir -p data/backups
+	@$(DOCKER_COMPOSE) exec -T postgres pg_dump -U airflow sptrans > data/backups/sptrans_$(shell date +%Y%m%d_%H%M%S).sql
+	@echo "$(GREEN)✓ Backup criado em data/backups/$(NC)"
+
+db-restore: ## Restore do PostgreSQL (uso: make db-restore FILE=backup.sql)
+	@if [ -z "$(FILE)" ]; then \
+		echo "$(RED)Erro: Especifique o arquivo com FILE=backup.sql$(NC)"; \
+		exit 1; \
+	fi
+	@echo "$(YELLOW)Restaurando backup $(FILE)...$(NC)"
+	@$(DOCKER_COMPOSE) exec -T postgres psql -U airflow -d sptrans < $(FILE)
+	@echo "$(GREEN)✓ Backup restaurado$(NC)"
+
+db-reset: ## Reseta database (CUIDADO: apaga todos os dados!)
+	@echo "$(RED)⚠ ATENÇÃO: Isso vai apagar TODOS os dados!$(NC)"
+	@read -p "Tem certeza? [y/N] " -n 1 -r; \
+	echo; \
+	if [[ $REPLY =~ ^[Yy]$ ]]; then \
+		make init-postgres; \
+	fi
+
+# ============================================================================
+# TESTING
+# ============================================================================
+
+test: ## Roda todos os testes
+	@echo "$(YELLOW)Executando testes...$(NC)"
+	@$(DOCKER_COMPOSE) exec -T airflow-worker $(PYTEST) tests/ -v
+	@echo "$(GREEN)✓ Testes concluídos$(NC)"
+
+test-unit: ## Roda apenas testes unitários
+	@$(DOCKER_COMPOSE) exec -T airflow-worker $(PYTEST) tests/unit/ -v
+
+test-integration: ## Roda apenas testes de integração
+	@$(DOCKER_COMPOSE) exec -T airflow-worker $(PYTEST) tests/integration/ -v
+
+test-coverage: ## Gera relatório de cobertura de testes
+	@$(DOCKER_COMPOSE) exec -T airflow-worker $(PYTEST) tests/ --cov=src --cov-report=html
+	@echo "$(GREEN)✓ Relatório gerado em htmlcov/index.html$(NC)"
+
+# ============================================================================
+# CODE QUALITY
+# ============================================================================
+
+lint: ## Verifica qualidade do código
+	@echo "$(YELLOW)Verificando qualidade do código...$(NC)"
+	@$(PYTHON) -m flake8 src/ dags/ --max-line-length=120
+	@$(PYTHON) -m pylint src/ dags/
+	@echo "$(GREEN)✓ Lint concluído$(NC)"
+
+format: ## Formata código automaticamente
+	@echo "$(YELLOW)Formatando código...$(NC)"
+	@$(PYTHON) -m black src/ dags/ tests/
+	@$(PYTHON) -m isort src/ dags/ tests/
+	@echo "$(GREEN)✓ Código formatado$(NC)"
+
+type-check: ## Verifica tipos estáticos
+	@echo "$(YELLOW)Verificando tipos...$(NC)"
+	@$(PYTHON) -m mypy src/ --ignore-missing-imports
+	@echo "$(GREEN)✓ Type check concluído$(NC)"
+
+# ============================================================================
+# MONITORING
+# ============================================================================
+
+metrics: ## Mostra métricas do sistema
+	@echo "$(BLUE)Métricas do Sistema:$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Uso de Recursos (Docker):$(NC)"
+	@docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+	@echo ""
+	@echo "$(YELLOW)Dados no Data Lake:$(NC)"
+	@$(DOCKER_COMPOSE) exec -T minio mc du minio/sptrans-bronze || true
+	@$(DOCKER_COMPOSE) exec -T minio mc du minio/sptrans-silver || true
+	@$(DOCKER_COMPOSE) exec -T minio mc du minio/sptrans-gold || true
+
+open-airflow: ## Abre Airflow no navegador
+	@echo "$(BLUE)Abrindo Airflow...$(NC)"
+	@open http://localhost:8080 || xdg-open http://localhost:8080 || echo "Acesse: http://localhost:8080"
+
+open-superset: ## Abre Superset no navegador
+	@echo "$(BLUE)Abrindo Superset...$(NC)"
+	@open http://localhost:8088 || xdg-open http://localhost:8088 || echo "Acesse: http://localhost:8088"
+
+open-grafana: ## Abre Grafana no navegador
+	@echo "$(BLUE)Abrindo Grafana...$(NC)"
+	@open http://localhost:3000 || xdg-open http://localhost:3000 || echo "Acesse: http://localhost:3000"
+
+open-minio: ## Abre MinIO Console no navegador
+	@echo "$(BLUE)Abrindo MinIO Console...$(NC)"
+	@open http://localhost:9001 || xdg-open http://localhost:9001 || echo "Acesse: http://localhost:9001"
+
+open-spark: ## Abre Spark UI no navegador
+	@echo "$(BLUE)Abrindo Spark UI...$(NC)"
+	@open http://localhost:8081 || xdg-open http://localhost:8081 || echo "Acesse: http://localhost:8081"
+
+open-all: ## Abre todas as UIs
+	@make open-airflow
+	@make open-superset
+	@make open-grafana
+	@make open-minio
+	@make open-spark
+
+# ============================================================================
+# DOCUMENTATION
+# ============================================================================
+
+docs: ## Gera documentação do projeto
+	@echo "$(YELLOW)Gerando documentação...$(NC)"
+	@cd docs && make html
+	@echo "$(GREEN)✓ Documentação gerada em docs/_build/html/index.html$(NC)"
+
+docs-serve: ## Serve documentação localmente
+	@cd docs && python -m http.server 8000 --directory _build/html
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+
+clean: ## Remove arquivos temporários
+	@echo "$(YELLOW)Limpando arquivos temporários...$(NC)"
+	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	@find . -type f -name "*.pyc" -delete
+	@find . -type f -name "*.pyo" -delete
+	@find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+	@find . -type d -name ".pytest_cache" -exec rm -rf {} + 2>/dev/null || true
+	@find . -type d -name ".mypy_cache" -exec rm -rf {} + 2>/dev/null || true
+	@rm -rf htmlcov/
+	@rm -rf .coverage
+	@echo "$(GREEN)✓ Arquivos temporários removidos$(NC)"
+
+clean-logs: ## Limpa logs
+	@echo "$(YELLOW)Limpando logs...$(NC)"
+	@rm -rf logs/airflow/* logs/spark/* logs/application/*
+	@echo "$(GREEN)✓ Logs limpos$(NC)"
+
+clean-data: ## Limpa dados locais (CUIDADO!)
+	@echo "$(RED)⚠ ATENÇÃO: Isso vai apagar todos os dados locais!$(NC)"
+	@read -p "Tem certeza? [y/N] " -n 1 -r; \
+	echo; \
+	if [[ $REPLY =~ ^[Yy]$ ]]; then \
+		rm -rf data/backups/*; \
+		echo "$(GREEN)✓ Dados locais limpos$(NC)"; \
+	fi
+
+clean-all: ## Remove TUDO (containers, volumes, dados)
+	@echo "$(RED)⚠ ATENÇÃO: Isso vai remover TUDO - containers, volumes, dados!$(NC)"
+	@read -p "Tem certeza? [y/N] " -n 1 -r; \
+	echo; \
+	if [[ $REPLY =~ ^[Yy]$ ]]; then \
+		make stop; \
+		docker-compose down -v; \
+		docker volume prune -f; \
+		make clean; \
+		make clean-logs; \
+		make clean-data; \
+		echo "$(GREEN)✓ Tudo removido$(NC)"; \
+	fi
+
+# ============================================================================
+# DEVELOPMENT
+# ============================================================================
+
+shell-airflow: ## Abre shell no container Airflow
+	@$(DOCKER_COMPOSE) exec airflow-scheduler bash
+
+shell-spark: ## Abre shell no container Spark Master
+	@$(DOCKER_COMPOSE) exec spark-master bash
+
+shell-postgres: ## Abre shell no container PostgreSQL
+	@$(DOCKER_COMPOSE) exec postgres bash
+
+shell-minio: ## Abre shell no container MinIO
+	@$(DOCKER_COMPOSE) exec minio sh
+
+install-dev: ## Instala dependências de desenvolvimento
+	@$(PIP) install -r requirements.txt
+	@$(PIP) install -r requirements-dev.txt
+	@echo "$(GREEN)✓ Dependências instaladas$(NC)"
+
+jupyter: ## Inicia Jupyter Lab
+	@echo "$(BLUE)Iniciando Jupyter Lab...$(NC)"
+	@jupyter lab --port=8888 --no-browser
+
+# ============================================================================
+# CI/CD
+# ============================================================================
+
+ci-test: ## Executa pipeline de CI (tests + lint)
+	@make test
+	@make lint
+	@make type-check
+
+ci-build: ## Build para CI/CD
+	@$(DOCKER_COMPOSE) build --no-cache
+
+# ============================================================================
+# BACKUP & RESTORE
+# ============================================================================
+
+backup-all: ## Backup completo (PostgreSQL + MinIO)
+	@echo "$(YELLOW)Criando backup completo...$(NC)"
+	@mkdir -p data/backups/$(shell date +%Y%m%d_%H%M%S)
+	@make db-backup
+	@echo "$(GREEN)✓ Backup completo criado$(NC)"
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+version: ## Mostra versões dos componentes
+	@echo "$(BLUE)Versões dos Componentes:$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Docker:$(NC) $(docker --version)"
+	@echo "$(YELLOW)Docker Compose:$(NC) $(docker-compose --version)"
+	@echo "$(YELLOW)Python:$(NC) $(python3 --version)"
+	@echo ""
+	@echo "$(YELLOW)Airflow:$(NC)"
+	@$(DOCKER_COMPOSE) exec -T airflow-scheduler airflow version || echo "N/A"
+	@echo ""
+	@echo "$(YELLOW)Spark:$(NC)"
+	@$(DOCKER_COMPOSE) exec -T spark-master spark-submit --version 2>&1 | head -1 || echo "N/A"
+
+ps: ## Lista processos Docker
+	@$(DOCKER_COMPOSE) ps -a
+
+top: ## Mostra top dos containers
+	@docker stats
+
+restart-service: ## Reinicia serviço específico (uso: make restart-service SERVICE=airflow-scheduler)
+	@if [ -z "$(SERVICE)" ]; then \
+		echo "$(RED)Erro: Especifique o serviço com SERVICE=nome_servico$(NC)"; \
+		exit 1; \
+	fi
+	@echo "$(YELLOW)Reiniciando $(SERVICE)...$(NC)"
+	@$(DOCKER_COMPOSE) restart $(SERVICE)
+	@echo "$(GREEN)✓ $(SERVICE) reiniciado$(NC)"
+
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+
+troubleshoot: ## Diagnóstico de problemas comuns
+	@echo "$(BLUE)Executando diagnóstico...$(NC)"
+	@echo ""
+	@echo "$(YELLOW)1. Verificando portas em uso:$(NC)"
+	@lsof -i :8080,5432,9000,9001,3000,8088 || echo "Nenhuma porta em conflito"
+	@echo ""
+	@echo "$(YELLOW)2. Verificando espaço em disco:$(NC)"
+	@df -h | grep -E "Filesystem|/$"
+	@echo ""
+	@echo "$(YELLOW)3. Verificando memória:$(NC)"
+	@free -h || echo "N/A"
+	@echo ""
+	@echo "$(YELLOW)4. Verificando containers com problemas:$(NC)"
+	@docker ps -a --filter "status=exited" --format "table {{.Names}}\t{{.Status}}" || echo "Nenhum container com problemas"
+	@echo ""
+	@echo "$(YELLOW)5. Verificando logs de erro:$(NC)"
+	@$(DOCKER_COMPOSE) logs --tail=50 | grep -i error || echo "Nenhum erro recente"
+
+fix-permissions: ## Corrige permissões de arquivos
+	@echo "$(YELLOW)Corrigindo permissões...$(NC)"
+	@chmod -R 755 data/ logs/ config/
+	@sudo chown -R 50000:50000 logs/airflow || echo "Requer sudo"
+	@echo "$(GREEN)✓ Permissões corrigidas$(NC)"
+
+# ============================================================================
+# DEFAULT
+# ============================================================================
+
+.DEFAULT_GOAL := help

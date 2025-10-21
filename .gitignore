@@ -1,0 +1,379 @@
+# ============================================================================
+# SPTRANS REAL-TIME PIPELINE - GITIGNORE
+# ============================================================================
+
+# ============================================================================
+# ENVIRONMENT & SECRETS
+# ============================================================================
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.crt
+secrets/
+credentials/
+
+# ============================================================================
+# PYTHON
+# ============================================================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+docs/_static/
+docs/_templates/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# ============================================================================
+# AIRFLOW
+# ============================================================================
+airflow.db
+airflow.cfg
+airflow-webserver.pid
+airflow_login_session/
+logs/airflow/
+airflow/logs/
+unittests.cfg
+unittests.db
+webserver_config.py
+
+# ============================================================================
+# SPARK
+# ============================================================================
+*.class
+metastore_db/
+derby.log
+spark-warehouse/
+logs/spark/
+*.log
+
+# ============================================================================
+# DATA & BACKUPS
+# ============================================================================
+data/gtfs/*.txt
+data/gtfs/*.zip
+data/samples/*.json
+data/samples/*.csv
+data/samples/*.parquet
+data/backups/*.sql
+data/backups/*.tar.gz
+data/backups/*.zip
+
+# Mantém estrutura de pastas
+!data/gtfs/.gitkeep
+!data/samples/.gitkeep
+!data/backups/.gitkeep
+
+# ============================================================================
+# LOGS
+# ============================================================================
+logs/
+*.log
+*.out
+*.err
+
+# Mantém estrutura
+!logs/.gitkeep
+!logs/airflow/.gitkeep
+!logs/spark/.gitkeep
+!logs/application/.gitkeep
+
+# ============================================================================
+# DOCKER
+# ============================================================================
+.dockerignore
+docker-compose.override.yml
+
+# ============================================================================
+# IDE & EDITORS
+# ============================================================================
+
+# VSCode
+.vscode/
+*.code-workspace
+.history/
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# JetBrains
+.idea/
+*.iml
+.idea_modules/
+
+# Eclipse
+.project
+.pydevproject
+.settings/
+
+# ============================================================================
+# OS
+# ============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ============================================================================
+# DATABASE
+# ============================================================================
+*.sqlite
+*.db
+*.sql
+
+# PostgreSQL
+pgdata/
+postgres-data/
+
+# MinIO
+minio-data/
+
+# Redis
+dump.rdb
+appendonly.aof
+
+# ============================================================================
+# TEMPORARY FILES
+# ============================================================================
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# ============================================================================
+# NOTEBOOKS
+# ============================================================================
+.ipynb_checkpoints/
+*.ipynb
+!notebooks/examples/*.ipynb
+
+# ============================================================================
+# TERRAFORM (se usar)
+# ============================================================================
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ============================================================================
+# KUBERNETES (se usar)
+# ============================================================================
+*.kubeconfig
+
+# ============================================================================
+# MONITORING
+# ============================================================================
+prometheus-data/
+grafana-data/
+
+# ============================================================================
+# SSL/TLS
+# ============================================================================
+*.csr
+*.cer
+*.der
+*.p12
+*.pfx
+ssl/
+
+# ============================================================================
+# MISC
+# ============================================================================
+.sass-cache/
+.cache/
+*.pid
+node_modules/
+package-lock.json
+yarn.lock
+
+# ============================================================================
+# PROJECT SPECIFIC
+# ============================================================================
+# Adicione aqui arquivos específicos do seu ambiente
+
+# Configurações locais
+config/local/
+
+# Testes locais
+tests/local/
+
+# Scripts experimentais
+scripts/experimental/
+
+# ============================================================================
+# KEEP STRUCTURE
+# ============================================================================
+# Arquivos .gitkeep para manter estrutura de pastas vazias
+!**/.gitkeep
