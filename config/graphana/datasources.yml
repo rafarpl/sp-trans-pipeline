@@ -1,0 +1,60 @@
+# ============================================================================
+# GRAFANA DATASOURCES CONFIGURATION
+# ============================================================================
+# Localização: config/grafana/datasources.yml
+# Provisiona datasources automaticamente no Grafana
+# ============================================================================
+
+apiVersion: 1
+
+datasources:
+  # ==========================================================================
+  # PROMETHEUS (Metrics)
+  # ==========================================================================
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
+
+  # ==========================================================================
+  # POSTGRESQL - SPTrans Database
+  # ==========================================================================
+  - name: PostgreSQL-SPTrans
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    database: sptrans
+    user: airflow
+    secureJsonData:
+      password: airflow123
+    jsonData:
+      sslmode: 'disable'
+      postgresVersion: 1600
+      timescaledb: false
+    editable: true
+
+  # ==========================================================================
+  # POSTGRESQL - Airflow Database
+  # ==========================================================================
+  - name: PostgreSQL-Airflow
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    database: airflow
+    user: airflow
+    secureJsonData:
+      password: airflow123
+    jsonData:
+      sslmode: 'disable'
+      postgresVersion: 1600
+      timescaledb: false
+    editable: true
+
+# ============================================================================
+# FIM DO ARQUIVO
+# ============================================================================

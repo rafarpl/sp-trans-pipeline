@@ -1,0 +1,105 @@
+# ============================================================================
+# PROMETHEUS CONFIGURATION
+# ============================================================================
+# Localização: config/prometheus/prometheus.yml
+# ============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'sptrans-pipeline'
+    environment: 'development'
+
+# Alertmanager configuration (opcional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# Rule files
+rule_files:
+  # - "alert_rules.yml"
+
+# Scrape configurations
+scrape_configs:
+
+  # ============================================================================
+  # PROMETHEUS SELF-MONITORING
+  # ============================================================================
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ============================================================================
+  # POSTGRESQL EXPORTER
+  # ============================================================================
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres:5432']
+    metrics_path: '/metrics'
+
+  # ============================================================================
+  # REDIS EXPORTER
+  # ============================================================================
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+
+  # ============================================================================
+  # AIRFLOW METRICS
+  # ============================================================================
+  - job_name: 'airflow'
+    static_configs:
+      - targets: ['airflow-webserver:8080']
+    metrics_path: '/admin/metrics'
+    scheme: http
+
+  # ============================================================================
+  # SPARK MASTER
+  # ============================================================================
+  - job_name: 'spark-master'
+    static_configs:
+      - targets: ['spark-master:8081']
+    metrics_path: '/metrics/prometheus'
+    scheme: http
+
+  # ============================================================================
+  # SPARK WORKERS
+  # ============================================================================
+  - job_name: 'spark-workers'
+    static_configs:
+      - targets: 
+        - 'spark-worker-1:8081'
+        - 'spark-worker-2:8081'
+    metrics_path: '/metrics/prometheus'
+    scheme: http
+
+  # ============================================================================
+  # MINIO
+  # ============================================================================
+  - job_name: 'minio'
+    metrics_path: /minio/v2/metrics/cluster
+    scheme: http
+    static_configs:
+      - targets: ['minio:9000']
+
+  # ============================================================================
+  # GRAFANA
+  # ============================================================================
+  - job_name: 'grafana'
+    static_configs:
+      - targets: ['grafana:3000']
+    metrics_path: '/metrics'
+
+  # ============================================================================
+  # SUPERSET
+  # ============================================================================
+  - job_name: 'superset'
+    static_configs:
+      - targets: ['superset:8088']
+
+# ============================================================================
+# FIM DO ARQUIVO
+# ============================================================================
