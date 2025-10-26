@@ -1,213 +1,435 @@
 """
-DAG 02: Ingestão da API SPTrans em tempo real.
+DAG 02 - API Real-Time Ingestion
+=================================
+Ingestão contínua de posições dos ônibus da API SPTrans.
 
-Schedule: A cada 2 minutos
-Responsabilidade: Coletar posições dos ônibus e salvar no Bronze Layer
+Execução: A cada 2 minutos
+Destino: Bronze Layer (MinIO)
 
-Tasks:
-1. ingest_api_to_bronze - Spark job para ingestão
-2. validate_bronze_data - Validação básica dos dados
-3. send_metrics - Envia métricas para Prometheus
+Autor: Rafael - SPTrans Pipeline
 """
+
 from datetime import datetime, timedelta
 from airflow import DAG
-from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
+from airflow.operators.empty import EmptyOperator
+
+import sys
+import os
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from src.common.config import Config
+from src.common.logging_config import get_logger
+from src.ingestion.sptrans_api_client import SPTransClient
+from src.common.metrics import reporter, track_job_execution
+
+logger = get_logger(__name__)
 
 
-# ============================================================================
-# DEFAULT ARGS
-# ============================================================================
+# ===========================
+# CONFIGURAÇÕES DO DAG
+# ===========================
+
 default_args = {
-    'owner': 'data-engineering',
+    'owner': 'sptrans-data-team',
     'depends_on_past': False,
+    'start_date': datetime(2025, 1, 1),
+    'email': ['alerts@sptrans-pipeline.com'],
     'email_on_failure': True,
     'email_on_retry': False,
-    'email': ['alert@sptrans.local'],
     'retries': 3,
-    'retry_delay': timedelta(minutes=1),
-    'retry_exponential_backoff': True,
-    'max_retry_delay': timedelta(minutes=5),
+    'retry_delay': timedelta(seconds=30),
+    'execution_timeout': timedelta(minutes=1),
 }
 
-
-# ============================================================================
-# DAG DEFINITION
-# ============================================================================
 dag = DAG(
-    dag_id='dag_02_api_ingestion',
+    'dag_02_api_ingestion',
     default_args=default_args,
-    description='Ingestão em tempo real da API SPTrans para Bronze Layer',
+    description='Ingestão em tempo real da API SPTrans (a cada 2 min)',
     schedule_interval='*/2 * * * *',  # A cada 2 minutos
-    start_date=days_ago(1),
     catchup=False,
-    max_active_runs=3,
-    tags=['ingestion', 'api', 'bronze', 'realtime'],
+    max_active_runs=3,  # Permitir 3 execuções simultâneas
+    tags=['ingestion', 'api', 'real-time', 'bronze'],
 )
 
 
-# ============================================================================
-# PYTHON FUNCTIONS
-# ============================================================================
+# ===========================
+# FUNÇÕES DAS TASKS
+# ===========================
 
-def validate_bronze_data(**context):
+@track_job_execution('authenticate_api')
+def authenticate_sptrans_api(**context):
     """
-    Valida dados escritos no Bronze Layer.
+    Task 1: Autentica na API SPTrans.
     """
-    from pyspark.sql import SparkSession
-    from src.common.config import get_spark_config
-    from src.common.constants import DataLakePath
-    from src.common.utils import get_partition_path
+    logger.info("Autenticando na API SPTrans")
     
+    config = Config()
+    client = SPTransClient(token=config.SPTRANS_API_TOKEN)
+    
+    # Autenticar
+    success = client.authenticate()
+    
+    if not success:
+        raise Exception("Falha na autenticação da API SPTrans")
+    
+    logger.info("✅ Autenticação bem-sucedida")
+    
+    # Salvar client ID no XCom (apenas para tracking)
+    context['task_instance'].xcom_push(
+        key='auth_timestamp',
+        value=datetime.now().isoformat()
+    )
+    
+    return {'authenticated': True, 'timestamp': datetime.now().isoformat()}
+
+
+@track_job_execution('fetch_positions')
+def fetch_vehicle_positions(**context):
+    """
+    Task 2: Busca posições atuais dos veículos.
+    """
+    logger.info("Buscando posições dos veículos")
+    
+    config = Config()
+    client = SPTransClient(token=config.SPTRANS_API_TOKEN)
+    
+    # Autenticar novamente (cookie pode ter expirado)
+    client.authenticate()
+    
+    # Buscar posições
+    positions_data = client.get_all_positions()
+    
+    if not positions_data or 'l' not in positions_data:
+        logger.warning("Nenhuma posição retornada pela API")
+        return {'total_vehicles': 0, 'total_routes': 0}
+    
+    # Contar veículos
+    total_vehicles = sum(len(line.get('vs', [])) for line in positions_data.get('l', []))
+    total_routes = len(positions_data.get('l', []))
+    
+    logger.info(f"Posições obtidas: {total_vehicles:,} veículos em {total_routes:,} rotas")
+    
+    # Salvar dados no XCom
+    context['task_instance'].xcom_push(
+        key='positions_data',
+        value=positions_data
+    )
+    
+    context['task_instance'].xcom_push(
+        key='vehicle_count',
+        value=total_vehicles
+    )
+    
+    # Reportar métricas
+    reporter.report_api_call(
+        endpoint='positions',
+        status_code=200,
+        response_time_ms=0,  # Client não retorna tempo
+        records_count=total_vehicles
+    )
+    
+    return {
+        'total_vehicles': total_vehicles,
+        'total_routes': total_routes,
+        'timestamp': datetime.now().isoformat()
+    }
+
+
+@track_job_execution('process_and_save')
+def process_and_save_to_bronze(**context):
+    """
+    Task 3: Processa e salva dados na Bronze Layer.
+    """
+    logger.info("Processando e salvando dados na Bronze")
+    
+    import json
+    from pyspark.sql import SparkSession
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import *
+    
+    config = Config()
     execution_date = context['execution_date']
     
-    print(f"Validando dados do Bronze Layer para: {execution_date}")
+    # Recuperar dados do XCom
+    ti = context['task_instance']
+    positions_data = ti.xcom_pull(task_ids='fetch_vehicle_positions', key='positions_data')
     
-    # Criar Spark Session
-    spark_config = get_spark_config()
+    if not positions_data:
+        logger.warning("Nenhum dado para processar")
+        return {'records_saved': 0}
+    
+    # Criar sessão Spark
     spark = SparkSession.builder \
-        .appName("Validate Bronze Data") \
-        .config("spark.master", spark_config.get('spark.master')) \
-        .config("spark.hadoop.fs.s3a.endpoint", spark_config.get('spark.hadoop.fs.s3a.endpoint')) \
-        .config("spark.hadoop.fs.s3a.access.key", spark_config.get('spark.hadoop.fs.s3a.access.key')) \
-        .config("spark.hadoop.fs.s3a.secret.key", spark_config.get('spark.hadoop.fs.s3a.secret.key')) \
+        .appName("API_to_Bronze_Ingestion") \
+        .config("spark.driver.memory", "2g") \
+        .config("spark.hadoop.fs.s3a.endpoint", config.MINIO_ENDPOINT) \
+        .config("spark.hadoop.fs.s3a.access.key", config.MINIO_ROOT_USER) \
+        .config("spark.hadoop.fs.s3a.secret.key", config.MINIO_ROOT_PASSWORD) \
         .config("spark.hadoop.fs.s3a.path.style.access", "true") \
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
         .getOrCreate()
     
     try:
-        # Ler dados do Bronze
-        partition_path = get_partition_path(
-            DataLakePath.BRONZE_API_POSITIONS,
-            execution_date
+        # Processar dados em lista de registros
+        records = []
+        ingestion_timestamp = datetime.now()
+        
+        for line in positions_data.get('l', []):
+            route_code = line.get('c')
+            route_name = line.get('lt0', '')
+            route_direction = line.get('sl', 0)
+            
+            for vehicle in line.get('vs', []):
+                records.append({
+                    'vehicle_id': vehicle.get('p'),
+                    'route_code': route_code,
+                    'route_name': route_name,
+                    'direction': route_direction,
+                    'latitude': vehicle.get('py'),
+                    'longitude': vehicle.get('px'),
+                    'timestamp': vehicle.get('ta'),
+                    'has_accessibility': vehicle.get('a', False),
+                    'timestamp_capture': ingestion_timestamp.isoformat(),
+                    'ingestion_timestamp': ingestion_timestamp,
+                    'ingestion_date': ingestion_timestamp.date()
+                })
+        
+        if not records:
+            logger.warning("Nenhum registro para salvar")
+            spark.stop()
+            return {'records_saved': 0}
+        
+        # Criar DataFrame
+        df = spark.createDataFrame(records)
+        
+        # Adicionar metadados da Bronze Layer
+        df = df.withColumn('layer', F.lit('bronze')) \
+               .withColumn('source', F.lit('sptrans_api')) \
+               .withColumn('raw_data', F.lit(json.dumps(positions_data)))
+        
+        # Salvar na Bronze (particionado por data)
+        bronze_path = f"{config.BRONZE_LAYER_PATH}/api_positions"
+        
+        df.write \
+            .mode('append') \
+            .partitionBy('ingestion_date') \
+            .parquet(bronze_path)
+        
+        record_count = len(records)
+        
+        logger.info(f"✅ {record_count:,} registros salvos na Bronze")
+        
+        # Reportar métricas
+        reporter.report_processing_stats(
+            layer='bronze',
+            source='api_positions',
+            total=record_count,
+            invalid=0,
+            duplicated=0
         )
         
-        df = spark.read.parquet(partition_path)
-        
-        # Validações básicas
-        record_count = df.count()
-        
-        if record_count == 0:
-            raise ValueError("Nenhum registro encontrado no Bronze Layer")
-        
-        # Verificar campos obrigatórios não-nulos
-        null_counts = df.select([
-            (df[col].isNull().cast("int")).alias(col)
-            for col in ['vehicle_id', 'latitude', 'longitude', 'timestamp']
-        ]).agg(*[
-            sum(col).alias(col) 
-            for col in ['vehicle_id', 'latitude', 'longitude', 'timestamp']
-        ]).collect()[0]
-        
-        null_counts_dict = null_counts.asDict()
-        
-        for field, null_count in null_counts_dict.items():
-            if null_count > 0:
-                print(f"⚠️  WARNING: {null_count} registros com {field} nulo")
-        
-        # Verificar ranges de coordenadas
-        invalid_coords = df.filter(
-            (df.latitude < -90) | (df.latitude > 90) |
-            (df.longitude < -180) | (df.longitude > 180)
-        ).count()
-        
-        if invalid_coords > 0:
-            print(f"⚠️  WARNING: {invalid_coords} registros com coordenadas inválidas")
-        
-        print(f"✓ Validação concluída: {record_count} registros válidos")
-        
-        # Retornar métricas via XCom
         return {
-            'record_count': record_count,
-            'invalid_coords': invalid_coords,
-            'null_counts': null_counts_dict
+            'records_saved': record_count,
+            'output_path': bronze_path,
+            'timestamp': datetime.now().isoformat()
         }
+    
+    except Exception as e:
+        logger.error(f"Erro ao processar dados: {e}")
+        raise
     
     finally:
         spark.stop()
 
 
-def send_metrics_to_prometheus(**context):
+def validate_data_quality(**context):
     """
-    Envia métricas para Prometheus.
+    Task 4: Validação básica de qualidade dos dados.
     """
-    from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+    logger.info("Validando qualidade dos dados")
     
+    ti = context['task_instance']
+    vehicle_count = ti.xcom_pull(task_ids='fetch_vehicle_positions', key='vehicle_count')
+    
+    # Validações básicas
+    quality_checks = {
+        'has_vehicles': vehicle_count > 0,
+        'reasonable_count': 100 <= vehicle_count <= 20000,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    if not quality_checks['has_vehicles']:
+        logger.warning("⚠️ Nenhum veículo encontrado!")
+    
+    if not quality_checks['reasonable_count']:
+        logger.warning(f"⚠️ Contagem suspeita de veículos: {vehicle_count}")
+    
+    all_checks_passed = all([
+        quality_checks['has_vehicles'],
+        quality_checks['reasonable_count']
+    ])
+    
+    if all_checks_passed:
+        logger.info("✅ Todos os checks de qualidade passaram")
+    else:
+        logger.warning("⚠️ Alguns checks de qualidade falharam")
+    
+    # Reportar métricas de qualidade
+    reporter.report_data_quality(
+        layer='bronze',
+        quality_metrics={
+            'completeness': 100.0 if quality_checks['has_vehicles'] else 0.0,
+            'validity': 100.0 if quality_checks['reasonable_count'] else 50.0
+        }
+    )
+    
+    return quality_checks
+
+
+def send_completion_notification(**context):
+    """
+    Task 5: Notificação de conclusão (apenas em caso de sucesso).
+    """
+    ti = context['task_instance']
     execution_date = context['execution_date']
     
-    # Obter métricas do XCom
-    ti = context['ti']
-    validation_metrics = ti.xcom_pull(task_ids='validate_bronze_data')
+    vehicle_count = ti.xcom_pull(task_ids='fetch_vehicle_positions', key='vehicle_count')
     
-    if not validation_metrics:
-        print("Nenhuma métrica para enviar")
-        return
+    # Log simples (em produção, poderia enviar para Slack, email, etc)
+    message = f"""
+    ✅ Ingestão API Concluída
     
-    # Criar registry
-    registry = CollectorRegistry()
+    Execução: {execution_date}
+    Veículos: {vehicle_count:,}
+    Status: SUCCESS
+    """
     
-    # Definir métricas
-    records_gauge = Gauge(
-        'sptrans_bronze_records_total',
-        'Total de registros no Bronze Layer',
-        registry=registry
+    logger.info(message)
+    
+    return message
+
+
+# ===========================
+# DEFINIÇÃO DAS TASKS
+# ===========================
+
+with dag:
+    
+    start = EmptyOperator(
+        task_id='start',
+        dag=dag
     )
-    records_gauge.set(validation_metrics['record_count'])
     
-    invalid_coords_gauge = Gauge(
-        'sptrans_bronze_invalid_coords_total',
-        'Total de coordenadas inválidas',
-        registry=registry
+    # Task 1: Autenticação
+    auth_task = PythonOperator(
+        task_id='authenticate_api',
+        python_callable=authenticate_sptrans_api,
+        provide_context=True,
+        dag=dag
     )
-    invalid_coords_gauge.set(validation_metrics['invalid_coords'])
     
-    print(f"✓ Métricas enviadas para Prometheus")
-    print(f"  - Records: {validation_metrics['record_count']}")
-    print(f"  - Invalid coords: {validation_metrics['invalid_coords']}")
+    # Task 2: Buscar posições
+    fetch_task = PythonOperator(
+        task_id='fetch_vehicle_positions',
+        python_callable=fetch_vehicle_positions,
+        provide_context=True,
+        dag=dag
+    )
+    
+    # Task 3: Processar e salvar
+    save_task = PythonOperator(
+        task_id='process_and_save_to_bronze',
+        python_callable=process_and_save_to_bronze,
+        provide_context=True,
+        dag=dag
+    )
+    
+    # Task 4: Validação
+    validate_task = PythonOperator(
+        task_id='validate_data_quality',
+        python_callable=validate_data_quality,
+        provide_context=True,
+        dag=dag
+    )
+    
+    # Task 5: Notificação
+    notify_task = PythonOperator(
+        task_id='send_notification',
+        python_callable=send_completion_notification,
+        provide_context=True,
+        trigger_rule='all_success',
+        dag=dag
+    )
+    
+    end = EmptyOperator(
+        task_id='end',
+        trigger_rule='all_done',
+        dag=dag
+    )
+    
+    # ===========================
+    # FLUXO
+    # ===========================
+    
+    start >> auth_task >> fetch_task >> save_task >> validate_task >> notify_task >> end
 
 
-# ============================================================================
-# TASKS
-# ============================================================================
+# ===========================
+# DOCUMENTAÇÃO
+# ===========================
 
-# Task 1: Ingestão via Spark
-ingest_api_task = SparkSubmitOperator(
-    task_id='ingest_api_to_bronze',
-    application='/opt/airflow/src/processing/jobs/ingest_api_to_bronze.py',
-    name='sptrans-api-to-bronze',
-    conn_id='spark_default',
-    conf={
-        'spark.master': 'spark://spark-master:7077',
-        'spark.executor.memory': '4g',
-        'spark.executor.cores': '2',
-        'spark.driver.memory': '2g',
-    },
-    application_args=[
-        '--execution-date', '{{ execution_date.isoformat() }}'
-    ],
-    verbose=True,
-    dag=dag,
-)
+dag.doc_md = """
+# DAG 02 - API Real-Time Ingestion
 
-# Task 2: Validação
-validate_data_task = PythonOperator(
-    task_id='validate_bronze_data',
-    python_callable=validate_bronze_data,
-    provide_context=True,
-    dag=dag,
-)
+## Objetivo
+Coletar posições dos ônibus da API SPTrans em tempo real e armazenar na Bronze Layer.
 
-# Task 3: Métricas
-send_metrics_task = PythonOperator(
-    task_id='send_metrics',
-    python_callable=send_metrics_to_prometheus,
-    provide_context=True,
-    dag=dag,
-)
+## Schedule
+- **Frequência**: A cada 2 minutos
+- **Primeira execução**: 2025-01-01
+- **Catchup**: Desabilitado
 
+## Fluxo de Execução
 
-# ============================================================================
-# TASK DEPENDENCIES
-# ============================================================================
-ingest_api_task >> validate_data_task >> send_metrics_task
+```
+Start → Auth → Fetch → Save → Validate → Notify → End
+```
+
+### Tasks
+
+1. **authenticate_api**: Autentica na API SPTrans
+2. **fetch_vehicle_positions**: Busca posições atuais dos veículos
+3. **process_and_save_to_bronze**: Processa e salva no Data Lake (Bronze)
+4. **validate_data_quality**: Validação básica de qualidade
+5. **send_notification**: Notificação de conclusão
+
+## Dados Coletados
+
+- **vehicle_id**: Prefixo do veículo
+- **route_code**: Código da linha
+- **latitude/longitude**: Coordenadas
+- **timestamp**: Momento da captura
+- **has_accessibility**: Acessibilidade
+
+## Destino
+MinIO (Bronze Layer): `s3a://sptrans-datalake/bronze/api_positions/`
+
+Particionado por: `ingestion_date`
+
+## Monitoramento
+- Métricas exportadas para Prometheus
+- Alertas configurados se falhar por 3 tentativas consecutivas
+- Logs centralizados
+
+## Dependências
+- API SPTrans (externa)
+- MinIO (storage)
+- Spark (processamento)
+
+## SLA
+- Tempo esperado: < 1 minuto
+- Taxa de sucesso esperada: > 99%
+"""

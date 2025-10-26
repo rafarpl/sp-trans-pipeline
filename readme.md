@@ -1,9 +1,18 @@
-# 🚌 SPTrans Real-Time Data Pipeline
+# 🚌 SPTrans Data Pipeline
 
-> **Projeto de Conclusão - Pós-Graduação em Engenharia de Dados**  
-> **FIA/LABDATA - 2025**
+<div align="center">
 
-Pipeline completo de dados para monitoramento em tempo real do sistema de transporte público de São Paulo, processando posições de ~15.000 ônibus a cada 2 minutos, com ingestão, processamento distribuído e visualização de KPIs operacionais.
+![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
+![Apache Airflow](https://img.shields.io/badge/Apache%20Airflow-2.8-red.svg)
+![Apache Spark](https://img.shields.io/badge/Apache%20Spark-3.5-orange.svg)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-blue.svg)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
+
+**Pipeline de dados em tempo real para análise do sistema de transporte público de São Paulo**
+
+[Documentação](docs/) · [Arquitetura](docs/01_architecture.md) · [API Reference](docs/04_api_reference.md) · [Troubleshooting](docs/05_troubleshooting.md)
+
+</div>
 
 ---
 
@@ -11,16 +20,14 @@ Pipeline completo de dados para monitoramento em tempo real do sistema de transp
 
 - [Visão Geral](#-visão-geral)
 - [Arquitetura](#-arquitetura)
-- [Tecnologias Utilizadas](#-tecnologias-utilizadas)
-- [Estrutura do Projeto](#-estrutura-do-projeto)
-- [Pré-requisitos](#-pré-requisitos)
+- [Features](#-features)
+- [Tecnologias](#-tecnologias)
 - [Instalação](#-instalação)
-- [Configuração](#-configuração)
 - [Uso](#-uso)
-- [Dashboards e KPIs](#-dashboards-e-kpis)
-- [Testes](#-testes)
+- [Estrutura do Projeto](#-estrutura-do-projeto)
+- [DAGs do Airflow](#-dags-do-airflow)
 - [Monitoramento](#-monitoramento)
-- [Troubleshooting](#-troubleshooting)
+- [Testes](#-testes)
 - [Contribuindo](#-contribuindo)
 - [Licença](#-licença)
 
@@ -28,532 +35,470 @@ Pipeline completo de dados para monitoramento em tempo real do sistema de transp
 
 ## 🎯 Visão Geral
 
-### Objetivo
+O **SPTrans Data Pipeline** é uma solução completa de engenharia de dados para coletar, processar e analisar dados em tempo real do sistema de transporte público de São Paulo. O pipeline integra dados da API Olho Vivo da SPTrans e arquivos GTFS para fornecer insights operacionais e estratégicos.
 
-Criar um produto de dados em **near real-time** que possibilite métricas, KPIs, monitoramento e acompanhamento dos ônibus em circulação no sistema público de transporte da cidade de São Paulo.
+### 🎁 Principais Características
 
-### Funcionalidades Principais
-
-- ✅ **Ingestão em Near Real-Time**: Coleta posições de todos os ônibus a cada 2 minutos via API SPTrans Olho Vivo
-- ✅ **Processamento Distribuído**: Apache Spark para transformação e agregação de dados massivos
-- ✅ **Data Lake Multi-Camada**: Bronze (raw), Silver (cleaned), Gold (aggregated) com Delta Lake
-- ✅ **Enriquecimento de Dados**: Cruzamento com GTFS + geocoding reverso (lat/long → endereço)
-- ✅ **KPIs Operacionais**: Velocidade média, headway, pontualidade, cobertura de frota
-- ✅ **Orquestração Robusta**: Apache Airflow com 7 DAGs para automação completa
-- ✅ **Visualização Interativa**: Dashboards em Apache Superset e Grafana
-- ✅ **Monitoramento 24/7**: Prometheus + Grafana para observabilidade do pipeline
-- ✅ **Qualidade de Dados**: Data quality checks automatizados em cada camada
-
-### Métricas e KPIs Implementados
-
-| KPI | Descrição | Atualização |
-|-----|-----------|-------------|
-| **Cobertura de Frota** | % de veículos operando vs programados | Tempo real |
-| **Velocidade Média** | Por rota, corredor e sistema | A cada 15 min |
-| **Headway** | Tempo entre ônibus consecutivos | Tempo real |
-| **Pontualidade** | Análise de atrasos/adiantamentos | Horária |
-| **Ocupação de Corredor** | Densidade de veículos por via | A cada 5 min |
-| **Tempo de Viagem** | Duração real vs programada | Por viagem |
-| **Congestionamento** | Identificação de gargalos | Tempo real |
+- ⚡ **Ingestão em tempo real** - Coleta de posições dos ônibus a cada 2 minutos
+- 🏗️ **Arquitetura Lakehouse** - Camadas Bronze, Silver e Gold para processamento estruturado
+- 📊 **Dashboards interativos** - Visualizações com Superset e Grafana
+- 🔍 **Monitoramento completo** - Métricas, alertas e observabilidade
+- 🧪 **Qualidade de dados** - Validação, limpeza e enriquecimento automatizados
+- 📈 **KPIs operacionais** - Análise de performance, headway e acessibilidade
 
 ---
 
-## 🏗️ Arquitetura
-
-### Visão Macro
+## 🏛️ Arquitetura
 
 ```
-API SPTrans → Spark Batch → MinIO (Bronze) → Spark → Delta Lake (Silver/Gold) → PostgreSQL → Dashboards
-     ↓                                                        ↓
-  GTFS Data                                            Redis Cache
-     ↓                                                        ↓
-Apache Airflow (Orquestração) ← Prometheus + Grafana (Monitoramento)
+┌─────────────────┐
+│  API SPTrans    │
+│  GTFS Files     │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────┐
+│              INGESTION LAYER                        │
+│  ┌─────────────┐          ┌─────────────┐          │
+│  │ API Client  │          │ GTFS        │          │
+│  │ (Python)    │          │ Downloader  │          │
+│  └──────┬──────┘          └──────┬──────┘          │
+└─────────┼────────────────────────┼─────────────────┘
+          │                        │
+          ▼                        ▼
+┌─────────────────────────────────────────────────────┐
+│         DATA LAKE (MinIO - S3 Compatible)           │
+│  ┌──────────────────────────────────────────────┐  │
+│  │  BRONZE LAYER (Raw Data)                     │  │
+│  │  - api_positions/                            │  │
+│  │  - gtfs/routes, stops, trips, shapes         │  │
+│  └──────────────┬───────────────────────────────┘  │
+│                 │                                   │
+│                 ▼                                   │
+│  ┌──────────────────────────────────────────────┐  │
+│  │  SILVER LAYER (Cleaned & Enriched)          │  │
+│  │  - positions_enriched                        │  │
+│  │  - Validated, deduplicated, geocoded        │  │
+│  └──────────────┬───────────────────────────────┘  │
+│                 │                                   │
+│                 ▼                                   │
+│  ┌──────────────────────────────────────────────┐  │
+│  │  GOLD LAYER (Aggregated & Analytics)        │  │
+│  │  - kpis_hourly                               │  │
+│  │  - metrics_by_route                          │  │
+│  │  - headway_analysis                          │  │
+│  └──────────────┬───────────────────────────────┘  │
+└─────────────────┼───────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────┐
+│           SERVING LAYER (PostgreSQL)                │
+│  - Materialized Views                               │
+│  - Optimized Indexes                                │
+│  - Real-time Queries                                │
+└─────────────────┬───────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────┐
+│        VISUALIZATION & ANALYTICS                    │
+│  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │
+│  │  Superset   │  │   Grafana   │  │  Jupyter   │  │
+│  │  (BI)       │  │  (Metrics)  │  │  (Analysis)│  │
+│  └─────────────┘  └─────────────┘  └────────────┘  │
+└─────────────────────────────────────────────────────┘
+
+Orchestration: Apache Airflow
+Processing: Apache Spark
+Monitoring: Prometheus + Grafana
 ```
-
-### Camadas do Pipeline
-
-1. **Data Sources**
-   - API SPTrans Olho Vivo (posições em tempo real)
-   - GTFS SPTrans (dados estáticos: rotas, paradas, horários)
-
-2. **Ingestion Layer**
-   - Apache Spark Batch Jobs (orquestrados por Airflow)
-   - Coleta a cada 2 minutos
-   - Validação de schema na entrada
-
-3. **Storage Layer (Data Lake)**
-   - **MinIO** (S3-compatible object storage)
-   - **Bronze**: Raw data em Parquet (particionado por data)
-   - **Silver**: Cleaned data com Delta Lake (deduplicado, validado, enriquecido)
-   - **Gold**: Aggregated data com Delta Lake (KPIs, métricas agregadas)
-
-4. **Processing Layer**
-   - **Apache Spark** para todas as transformações
-   - Jobs batch orquestrados por Airflow
-   - Data quality checks em cada transformação
-
-5. **Serving Layer**
-   - **PostgreSQL**: Data Warehouse com dados agregados para dashboards
-   - **Redis**: Cache para dados de tempo real (TTL 2 minutos)
-
-6. **Presentation Layer**
-   - **Apache Superset**: Dashboards interativos e análises
-   - **Grafana**: Monitoramento do sistema e KPIs operacionais
-
-7. **Orchestration & Monitoring**
-   - **Apache Airflow**: Orquestração de todos os jobs
-   - **Prometheus + Grafana**: Métricas e alertas do pipeline
-
-### Fluxo de Dados Detalhado
-
-Ver documentação completa em: [`docs/01_architecture.md`](docs/01_architecture.md)
 
 ---
 
-## 🛠️ Tecnologias Utilizadas
+## ✨ Features
 
-### Core Stack (100% Open Source)
+### 📥 Ingestão de Dados
 
-| Categoria | Tecnologia | Versão | Justificativa |
-|-----------|-----------|---------|---------------|
-| **Orquestração** | Apache Airflow | 2.8.0 | Padrão de mercado, scheduler robusto |
-| **Processing** | Apache Spark | 3.5.0 | Processamento distribuído, alta performance |
-| **Storage** | MinIO | RELEASE.2024 | S3-compatible, escalável, baixo custo |
-| **Table Format** | Delta Lake | 3.0.0 | ACID transactions, time travel |
-| **Data Warehouse** | PostgreSQL | 16.0 | Serving layer otimizado para OLAP |
-| **Cache** | Redis | 7.2 | Cache de baixa latência para real-time |
-| **Visualization** | Apache Superset | 3.0 | BI moderno e flexível |
-| **Monitoring** | Prometheus | 2.48 | Métricas e alertas |
-| **Monitoring** | Grafana | 10.2 | Dashboards de observabilidade |
-| **Message Queue** | Apache Kafka | 3.6 | (Opcional) Streaming real-time |
+- **API em Tempo Real**: Coleta de posições dos ônibus a cada 2 minutos
+- **Dados Estáticos GTFS**: Download diário de rotas, paradas e horários
+- **Resiliente**: Retry automático, tratamento de erros, circuit breaker
 
-### Linguagens e Frameworks
+### 🔄 Processamento
 
-- **Python 3.11**: Linguagem principal
-- **PySpark**: Processamento distribuído
-- **SQL**: Queries e transformações
-- **Docker**: Containerização
-- **Docker Compose**: Orquestração local
+- **Validação**: Coordenadas, timestamps, IDs de veículos
+- **Limpeza**: Deduplicação, normalização, tratamento de nulos
+- **Enriquecimento**: Join com dados GTFS, geocoding reverso
+- **Agregações**: KPIs por hora/dia/rota, análise de headway
+
+### 📊 Analytics
+
+- **KPIs Operacionais**:
+  - Total de veículos ativos
+  - Velocidade média e máxima
+  - Taxa de movimentação
+  - Acessibilidade
+
+- **Análise de Performance**:
+  - Headway (intervalo entre ônibus)
+  - Regularidade do serviço
+  - Distância percorrida
+  - Horas de operação
+
+- **Qualidade de Dados**:
+  - Score de completude
+  - Taxa de validade
+  - Alertas automáticos
+
+### 🎯 Visualização
+
+- **Dashboards Executivos** (Superset): Visão geral do sistema
+- **Monitoramento Técnico** (Grafana): Métricas de infraestrutura
+- **Análises Ad-hoc** (Jupyter): Notebooks interativos
+
+---
+
+## 🛠️ Tecnologias
+
+### Core Stack
+
+| Tecnologia | Versão | Função |
+|-----------|--------|--------|
+| **Python** | 3.10+ | Linguagem principal |
+| **Apache Airflow** | 2.8.1 | Orquestração de pipelines |
+| **Apache Spark** | 3.5.0 | Processamento distribuído |
+| **PostgreSQL** | 15 | Database (Airflow + Serving) |
+| **MinIO** | Latest | Data Lake (S3-compatible) |
+| **Redis** | 7 | Cache e message broker |
+
+### Monitoramento
+
+| Tecnologia | Função |
+|-----------|--------|
+| **Prometheus** | Coleta de métricas |
+| **Grafana** | Dashboards de monitoramento |
+| **Apache Superset** | BI e dashboards analíticos |
+
+### Bibliotecas Python
+
+```
+pandas, numpy, pyspark, psycopg2-binary, 
+boto3, requests, prometheus-client, pytest
+```
+
+Veja [requirements.txt](requirements.txt) para lista completa.
+
+---
+
+## 🚀 Instalação
+
+### Pré-requisitos
+
+- Docker 20.10+
+- Docker Compose 2.0+
+- 8GB RAM mínimo (16GB recomendado)
+- 20GB espaço em disco
+
+### Quick Start
+
+```bash
+# 1. Clone o repositório
+git clone https://github.com/rafarpl/sptrans-pipeline.git
+cd sptrans-pipeline
+
+# 2. Configure variáveis de ambiente
+cp .env.example .env
+# Edite .env e adicione seu token da API SPTrans
+
+# 3. Execute setup inicial
+chmod +x scripts/*.sh
+./scripts/setup.sh
+
+# 4. Inicie os serviços
+make start
+# ou: ./scripts/start_services.sh
+```
+
+### Configuração do Token da API
+
+1. Obtenha seu token em: https://www.sptrans.com.br/desenvolvedores/
+2. Adicione no arquivo `.env`:
+   ```
+   SPTRANS_API_TOKEN=seu_token_aqui
+   ```
+
+### Verificação
+
+Aguarde ~2 minutos para todos os serviços iniciarem, então acesse:
+
+- **Airflow**: http://localhost:8080 (admin/admin)
+- **Spark UI**: http://localhost:8081
+- **MinIO Console**: http://localhost:9001 (admin/miniopassword123)
+- **Grafana**: http://localhost:3000 (admin/admin)
+- **Superset**: http://localhost:8088 (admin/admin)
+
+---
+
+## 📖 Uso
+
+### Comandos Make
+
+```bash
+# Gerenciamento de Serviços
+make start          # Inicia todos os serviços
+make stop           # Para todos os serviços
+make restart        # Reinicia serviços
+make ps             # Status dos containers
+make logs           # Logs de todos os serviços
+
+# Acesso Rápido (abre no navegador)
+make airflow        # Abre Airflow UI
+make spark          # Abre Spark UI
+make minio          # Abre MinIO Console
+make grafana        # Abre Grafana
+make superset       # Abre Superset
+
+# Database
+make db-shell       # Acessa PostgreSQL
+make db-create-tables  # Cria tabelas
+make db-backup      # Backup do banco
+
+# Data Lake
+make minio-list-bronze  # Lista arquivos Bronze
+make minio-list-silver  # Lista arquivos Silver
+make minio-list-gold    # Lista arquivos Gold
+
+# Testes
+make test           # Executa todos os testes
+make test-unit      # Testes unitários
+make test-integration  # Testes de integração
+make lint           # Linter (flake8)
+
+# Desenvolvimento
+make notebook       # Inicia Jupyter Lab
+make shell          # Shell do container
+
+# Informações
+make help           # Lista todos os comandos
+make status         # Status completo do sistema
+make info           # Informações do projeto
+```
+
+### Executando DAGs
+
+1. Acesse o Airflow: http://localhost:8080
+2. Ative as DAGs desejadas:
+   - `dag_01_gtfs_ingestion` - Ingestão diária GTFS
+   - `dag_02_api_ingestion` - Ingestão API (2 min)
+   - `dag_03_bronze_to_silver` - Transformação Silver
+   - `dag_04_silver_to_gold` - Agregação Gold
+   - `dag_05_gold_to_serving` - Load PostgreSQL
 
 ---
 
 ## 📁 Estrutura do Projeto
 
 ```
-sptrans-realtime-pipeline/
-├── 📂 docs/              # Documentação completa
-├── 📂 infra/             # Docker, Kubernetes, Terraform
-├── 📂 config/            # Configurações de serviços
-├── 📂 sql/               # Scripts SQL (serving layer)
-├── 📂 src/               # Código-fonte Python
-│   ├── common/           # Utils, config, logging
-│   ├── ingestion/        # Clientes API e schemas
-│   ├── processing/       # Spark jobs e transformações
-│   ├── serving/          # Load para PostgreSQL/Redis
-│   └── monitoring/       # Health checks e alertas
-├── 📂 dags/              # DAGs do Airflow
-├── 📂 tests/             # Testes unitários e integração
-├── 📂 scripts/           # Scripts auxiliares
-├── 📂 notebooks/         # Jupyter notebooks (EDA)
-└── 📂 dashboards/        # Dashboards exportados
-```
-
-Ver estrutura completa: [`docs/02_setup_guide.md`](docs/02_setup_guide.md)
-
----
-
-## 📋 Pré-requisitos
-
-### Hardware Mínimo
-
-- **CPU**: 4+ cores (8+ recomendado)
-- **RAM**: 16GB (32GB recomendado para Spark)
-- **Storage**: 100GB SSD
-- **Network**: 10Mbps+ (API SPTrans)
-
-### Software
-
-- **Docker** 24.0+
-- **Docker Compose** 2.20+
-- **Git** 2.40+
-- **Python** 3.11+ (para desenvolvimento local)
-- **Make** (opcional, para comandos úteis)
-
-### Credenciais Necessárias
-
-1. **Token API SPTrans**: Solicitar em https://www.sptrans.com.br/desenvolvedores/
-2. **SMTP** (opcional): Para envio de alertas por email
-
----
-
-## 🚀 Instalação
-
-### 1. Clone o Repositório
-
-```bash
-git clone https://github.com/rafarpl/sp-trans-pipeline.git
-cd sp-trans-pipeline
-```
-
-### 2. Configure Variáveis de Ambiente
-
-```bash
-cp .env.example .env
-nano .env  # Edite com suas credenciais
-```
-
-**Variáveis obrigatórias:**
-```bash
-SPTRANS_API_TOKEN=seu_token_aqui
-POSTGRES_PASSWORD=senha_segura
-```
-
-### 3. Inicie os Serviços
-
-```bash
-# Usando Make (recomendado)
-make setup
-
-# OU manualmente
-docker-compose up -d
-```
-
-Isso irá iniciar:
-- ✅ MinIO (Data Lake)
-- ✅ PostgreSQL (Data Warehouse)
-- ✅ Redis (Cache)
-- ✅ Airflow (Webserver, Scheduler, Workers)
-- ✅ Spark (Master + 2 Workers)
-- ✅ Superset (Dashboards)
-- ✅ Prometheus + Grafana (Monitoring)
-
-### 4. Verifique Status dos Serviços
-
-```bash
-make status
-
-# OU
-docker-compose ps
-```
-
-**URLs de Acesso:**
-- **Airflow**: http://localhost:8080 (admin/admin)
-- **MinIO Console**: http://localhost:9001 (minioadmin/minioadmin)
-- **Superset**: http://localhost:8088 (admin/admin)
-- **Grafana**: http://localhost:3000 (admin/admin)
-- **Prometheus**: http://localhost:9090
-
----
-
-## ⚙️ Configuração
-
-### 1. Inicializar Data Lake (MinIO)
-
-```bash
-# Criar buckets necessários
-make init-minio
-
-# OU manualmente
-docker-compose exec minio mc mb minio/sptrans-bronze
-docker-compose exec minio mc mb minio/sptrans-silver
-docker-compose exec minio mc mb minio/sptrans-gold
-```
-
-### 2. Criar Schemas no PostgreSQL
-
-```bash
-# Executar todos os scripts SQL
-make init-postgres
-
-# OU manualmente
-docker-compose exec postgres psql -U airflow -f /sql/00_create_databases.sql
-docker-compose exec postgres psql -U airflow -d sptrans -f /sql/01_serving_schema.sql
-```
-
-### 3. Baixar Dados GTFS
-
-```bash
-# Download automático
-make download-gtfs
-
-# OU manualmente
-python scripts/download_gtfs.py
-```
-
-### 4. Ativar DAGs no Airflow
-
-Acesse http://localhost:8080 e ative:
-
-1. ✅ `gtfs_ingestion_daily` - Carga diária GTFS (3h AM)
-2. ✅ `api_ingestion_realtime` - Ingestão API (a cada 2 min)
-3. ✅ `bronze_to_silver` - Limpeza e validação (a cada 10 min)
-4. ✅ `silver_to_gold` - Agregações (a cada 15 min)
-5. ✅ `gold_to_serving` - Load PostgreSQL (a cada 15 min)
-6. ✅ `data_quality_monitoring` - DQ checks (horária)
-7. ✅ `maintenance_cleanup` - Limpeza (diária, 2h AM)
-
----
-
-## 💻 Uso
-
-### Executar Ingestão Manual
-
-```bash
-# Trigger DAG via CLI
-docker-compose exec airflow-scheduler airflow dags trigger api_ingestion_realtime
-
-# OU via UI
-# Acesse http://localhost:8080 → DAGs → Play button
-```
-
-### Consultar Dados no Data Lake
-
-```python
-# Notebook Jupyter ou Spark Shell
-from pyspark.sql import SparkSession
-
-spark = SparkSession.builder \
-    .appName("SPTrans Analysis") \
-    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-    .getOrCreate()
-
-# Ler camada Bronze
-df_bronze = spark.read.parquet("s3a://sptrans-bronze/api_positions/")
-df_bronze.show()
-
-# Ler camada Silver (Delta Lake)
-df_silver = spark.read.format("delta").load("s3a://sptrans-silver/positions_cleaned/")
-df_silver.show()
-
-# Ler camada Gold (agregado)
-df_gold = spark.read.format("delta").load("s3a://sptrans-gold/kpis_hourly/")
-df_gold.show()
-```
-
-### Consultar Dados no PostgreSQL
-
-```sql
--- Conectar ao PostgreSQL
-docker-compose exec postgres psql -U airflow -d sptrans
-
--- Ver KPIs em tempo real
-SELECT * FROM serving.kpis_realtime ORDER BY updated_at DESC LIMIT 10;
-
--- Velocidade média por rota
-SELECT 
-    route_short_name,
-    AVG(speed_kmh) as avg_speed,
-    COUNT(*) as samples
-FROM serving.route_metrics
-WHERE timestamp >= NOW() - INTERVAL '1 hour'
-GROUP BY route_short_name
-ORDER BY avg_speed DESC;
-```
-
-### Acessar Cache Redis
-
-```bash
-# Conectar ao Redis
-docker-compose exec redis redis-cli
-
-# Ver posições em cache
-KEYS bus:position:*
-GET bus:position:12345
-
-# Ver estatísticas
-INFO stats
+sptrans-pipeline/
+├── config/                 # Configurações
+│   ├── airflow/           # Airflow configs
+│   ├── spark/             # Spark configs
+│   ├── prometheus/        # Prometheus configs
+│   └── grafana/           # Grafana datasources
+│
+├── dags/                   # Airflow DAGs
+│   ├── dag_01_gtfs_ingestion.py
+│   ├── dag_02_api_ingestion.py
+│   ├── dag_03_bronze_to_silver.py
+│   ├── dag_04_silver_to_gold.py
+│   └── dag_05_gold_to_serving.py
+│
+├── docs/                   # Documentação
+│   ├── 01_architecture.md
+│   ├── 02_setup_guide.md
+│   ├── 03_data_dictionary.md
+│   └── ...
+│
+├── infra/                  # Infraestrutura
+│   ├── docker/            # Dockerfiles
+│   └── kubernetes/        # K8s manifests
+│
+├── notebooks/              # Jupyter notebooks
+│   └── 01_exploratory_data_analysis.ipynb
+│
+├── scripts/                # Scripts utilitários
+│   ├── setup.sh
+│   ├── start_services.sh
+│   └── backup_data.sh
+│
+├── sql/                    # Scripts SQL
+│   ├── 01_serving_schema.sql
+│   ├── 02_serving_tables.sql
+│   ├── 03_materialized_views.sql
+│   └── 04_indexes.sql
+│
+├── src/                    # Código fonte
+│   ├── common/            # Código compartilhado
+│   ├── ingestion/         # Camada de ingestão
+│   ├── processing/        # Processamento Spark
+│   ├── serving/           # Camada de serving
+│   └── monitoring/        # Monitoramento
+│
+├── tests/                  # Testes
+│   ├── unit/              # Testes unitários
+│   ├── integration/       # Testes de integração
+│   └── fixtures/          # Dados de teste
+│
+├── .env.example           # Template de variáveis
+├── .gitignore             # Git ignore
+├── docker-compose.yml     # Orquestração Docker
+├── Makefile              # Comandos úteis
+├── README.md             # Este arquivo
+└── requirements.txt      # Dependências Python
 ```
 
 ---
 
-## 📊 Dashboards e KPIs
+## 🔄 DAGs do Airflow
 
-### Apache Superset
+### DAG 01 - GTFS Ingestion
+- **Frequência**: Diária (2 AM)
+- **Função**: Download e ingestão de dados GTFS estáticos
+- **Output**: Bronze Layer (routes, stops, trips, shapes)
 
-Acesse: http://localhost:8088
+### DAG 02 - API Ingestion
+- **Frequência**: A cada 2 minutos
+- **Função**: Coleta de posições em tempo real
+- **Output**: Bronze Layer (api_positions)
 
-**Dashboards Disponíveis:**
+### DAG 03 - Bronze to Silver
+- **Frequência**: A cada 30 minutos
+- **Função**: Limpeza, validação e enriquecimento
+- **Output**: Silver Layer (positions_enriched)
 
-1. **Operational Dashboard**
-   - Total de veículos ativos
-   - Mapa de posições em tempo real
-   - Velocidade média por corredor
-   - Alertas ativos
+### DAG 04 - Silver to Gold
+- **Frequência**: A cada hora
+- **Função**: Agregações e cálculo de KPIs
+- **Output**: Gold Layer (kpis_hourly, metrics_by_route, headway_analysis)
 
-2. **Executive Summary**
-   - KPIs principais (cards)
-   - Tendências semanais
-   - Comparativos dia útil vs fim de semana
+### DAG 05 - Gold to Serving
+- **Frequência**: A cada hora (15 min após DAG 04)
+- **Função**: Load para PostgreSQL
+- **Output**: Serving Layer (PostgreSQL tables)
 
-3. **Route Performance**
-   - Ranking de rotas por pontualidade
-   - Headway médio por linha
-   - Análise de desvios
+---
 
-### Grafana (Monitoring)
+## 📊 Monitoramento
 
-Acesse: http://localhost:3000
+### Métricas Disponíveis
 
-**Dashboards:**
+- **Pipeline**: Taxa de sucesso, tempo de execução, registros processados
+- **Data Quality**: Completude, acurácia, validade
+- **Infraestrutura**: CPU, memória, disco, rede
+- **Aplicação**: Latência API, throughput Spark, queries PostgreSQL
 
-1. **Pipeline Monitoring**
-   - Taxa de sucesso dos DAGs
-   - Latência de ingestão
-   - Throughput de processamento
-   - Erros e retries
+### Dashboards
 
-2. **Data Quality**
-   - % de registros válidos
-   - Duplicatas detectadas
-   - Outliers identificados
-   - Completude dos dados
+**Grafana** (http://localhost:3000):
+- System Monitoring
+- Data Quality
+- Pipeline Performance
+
+**Superset** (http://localhost:8088):
+- Operational Dashboard
+- Executive Summary
+- Route Analysis
 
 ---
 
 ## 🧪 Testes
 
-### Executar Todos os Testes
-
 ```bash
-# Usando Make
+# Todos os testes
 make test
 
-# OU manualmente
-docker-compose exec airflow-worker pytest tests/ -v
-```
+# Testes unitários
+make test-unit
 
-### Testes Unitários
+# Testes de integração
+make test-integration
 
-```bash
-pytest tests/unit/ -v
-```
+# Com cobertura
+make test-coverage
 
-### Testes de Integração
-
-```bash
-pytest tests/integration/ -v
+# Lint
+make lint
 ```
 
 ### Cobertura de Testes
 
-```bash
-make test-coverage
-
-# Gera relatório HTML em htmlcov/index.html
-```
-
----
-
-## 📈 Monitoramento
-
-### Health Checks
-
-```bash
-# Via script
-make health-check
-
-# OU manualmente
-curl http://localhost:8080/health  # Airflow
-curl http://localhost:9000/minio/health/live  # MinIO
-```
-
-### Logs
-
-```bash
-# Airflow logs
-docker-compose logs -f airflow-scheduler
-
-# Spark logs
-docker-compose logs -f spark-master
-
-# Todos os serviços
-docker-compose logs -f
-```
-
-### Métricas Prometheus
-
-Acesse: http://localhost:9090
-
-**Queries úteis:**
-```promql
-# Taxa de sucesso de ingestão
-rate(airflow_dag_run_success_total{dag_id="api_ingestion_realtime"}[5m])
-
-# Latência de processamento
-histogram_quantile(0.95, rate(spark_job_duration_seconds_bucket[5m]))
-
-# Erros no pipeline
-sum(rate(pipeline_errors_total[5m])) by (component)
-```
-
----
-
-## 🔧 Troubleshooting
-
-### Problemas Comuns
-
-| Problema | Solução |
-|----------|---------|
-| **DAG não aparece no Airflow** | Verificar logs: `docker-compose logs airflow-scheduler` |
-| **Erro de conexão MinIO** | Verificar credenciais no `.env` e restart: `make restart-minio` |
-| **Spark job travado** | Verificar recursos: `docker stats` e aumentar memória se necessário |
-| **API SPTrans timeout** | Verificar token válido e conectividade: `curl -H "Authorization: Bearer $TOKEN" https://api.olhovivo.sptrans.com.br/v2.1/Posicao` |
-
-Ver guia completo: [`docs/05_troubleshooting.md`](docs/05_troubleshooting.md)
-
----
-
-## 🤝 Contribuindo
-
-Contribuições são bem-vindas! Para contribuir:
-
-1. Fork o projeto
-2. Crie uma branch para sua feature (`git checkout -b feature/MinhaFeature`)
-3. Commit suas mudanças (`git commit -m 'Adiciona MinhaFeature'`)
-4. Push para a branch (`git push origin feature/MinhaFeature`)
-5. Abra um Pull Request
-
-### Guidelines
-
-- Siga PEP 8 para código Python
-- Adicione testes para novas funcionalidades
-- Atualize documentação quando necessário
-- Use commits semânticos (feat, fix, docs, etc)
-
----
-
-## 📄 Licença
-
-Este projeto está sob a licença MIT. Veja [LICENSE](LICENSE) para mais detalhes.
-
----
-
-## 👥 Autores
-
-**Rafael** - Projeto de Conclusão FIA/LABDATA  
-GitHub: [@rafarpl](https://github.com/rafarpl)
-
----
-
-## 🙏 Agradecimentos
-
-- **SPTrans** pela disponibilização da API Olho Vivo
-- **FIA/LABDATA** pelo programa de Engenharia de Dados
-- Comunidades **Apache Airflow**, **Spark**, **Delta Lake**
-- Todos os contribuidores do ecossistema open source
+- Validadores: 95%+
+- API Client: 90%+
+- Transformações: 85%+
+- Jobs Spark: 80%+
 
 ---
 
 ## 📚 Documentação Adicional
 
 - [Arquitetura Detalhada](docs/01_architecture.md)
-- [Guia de Setup](docs/02_setup_guide.md)
+- [Guia de Instalação](docs/02_setup_guide.md)
 - [Dicionário de Dados](docs/03_data_dictionary.md)
-- [Referência API SPTrans](docs/04_api_reference.md)
+- [Referência da API](docs/04_api_reference.md)
 - [Troubleshooting](docs/05_troubleshooting.md)
 - [Justificativas Técnicas](docs/06_justifications.md)
 - [Catálogo de Metadados](docs/07_metadata_catalog.md)
 
 ---
 
-**🚀 Desenvolvido com ❤️ para melhorar o transporte público de São Paulo**
+## 🤝 Contribuindo
+
+Contribuições são bem-vindas! Por favor:
+
+1. Fork o projeto
+2. Crie uma branch para sua feature (`git checkout -b feature/AmazingFeature`)
+3. Commit suas mudanças (`git commit -m 'Add some AmazingFeature'`)
+4. Push para a branch (`git push origin feature/AmazingFeature`)
+5. Abra um Pull Request
+
+### Guidelines
+
+- Siga o style guide PEP 8
+- Adicione testes para novas features
+- Atualize a documentação
+- Mantenha cobertura de testes > 80%
+
+---
+
+## 📝 Licença
+
+Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](LICENSE) para detalhes.
+
+---
+
+## 👥 Autores
+
+- **Rafael** - *Engenheiro de Dados* - [GitHub](https://github.com/rafarpl)
+
+---
+
+## 🙏 Agradecimentos
+
+- **SPTrans** - Por disponibilizar a API Olho Vivo
+- **Comunidade Open Source** - Pelas ferramentas incríveis
+
+---
+
+## 📞 Suporte
+
+- 📧 Email: rafael@example.com
+- 🐛 Issues: [GitHub Issues](https://github.com/rafarpl/sptrans-pipeline/issues)
+- 📖 Docs: [Documentação Completa](docs/)
+
+---
+
+<div align="center">
+
+**⭐ Se este projeto foi útil, considere dar uma estrela!**
+
+Made with ❤️ and ☕ by Rafael
+
+</div>

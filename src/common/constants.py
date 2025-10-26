@@ -1,400 +1,412 @@
-"""
-Constantes do projeto.
-Valores fixos utilizados em todo o pipeline.
-"""
+# =============================================================================
+# SPTRANS PIPELINE - CONSTANTS
+# =============================================================================
+# Constantes do sistema, enumerações e valores padrão
+# =============================================================================
+
 from enum import Enum
+from typing import Final
 
-
-# ============================================================================
+# =============================================================================
 # PROJECT INFO
-# ============================================================================
-PROJECT_NAME = "sptrans-realtime-pipeline"
-PROJECT_VERSION = "1.0.0"
-PROJECT_DESCRIPTION = "Pipeline de dados em tempo real para monitoramento de ônibus SPTrans"
+# =============================================================================
 
+PROJECT_NAME: Final[str] = "sptrans-pipeline"
+PROJECT_VERSION: Final[str] = "1.0.0"
 
-# ============================================================================
-# DATA LAKE PATHS
-# ============================================================================
-class DataLakePath:
-    """Caminhos no Data Lake (MinIO)."""
-    
-    # Bronze Layer (Raw Data)
-    BRONZE_API_POSITIONS = "s3a://sptrans-bronze/api_positions/"
-    BRONZE_GTFS_ROUTES = "s3a://sptrans-bronze/gtfs_routes/"
-    BRONZE_GTFS_TRIPS = "s3a://sptrans-bronze/gtfs_trips/"
-    BRONZE_GTFS_STOPS = "s3a://sptrans-bronze/gtfs_stops/"
-    BRONZE_GTFS_STOP_TIMES = "s3a://sptrans-bronze/gtfs_stop_times/"
-    BRONZE_GTFS_SHAPES = "s3a://sptrans-bronze/gtfs_shapes/"
-    
-    # Silver Layer (Cleaned Data)
-    SILVER_POSITIONS_CLEANED = "s3a://sptrans-silver/positions_cleaned/"
-    SILVER_TRIPS_ENRICHED = "s3a://sptrans-silver/trips_enriched/"
-    SILVER_STOPS_GEOCODED = "s3a://sptrans-silver/stops_geocoded/"
-    SILVER_ROUTES_METADATA = "s3a://sptrans-silver/routes_metadata/"
-    
-    # Gold Layer (Aggregated Data)
-    GOLD_KPIS_REALTIME = "s3a://sptrans-gold/kpis_realtime/"
-    GOLD_METRICS_BY_ROUTE = "s3a://sptrans-gold/metrics_by_route/"
-    GOLD_METRICS_BY_HOUR = "s3a://sptrans-gold/metrics_by_hour/"
-    GOLD_HEADWAY_ANALYSIS = "s3a://sptrans-gold/headway_analysis/"
-    GOLD_SPEED_ANALYSIS = "s3a://sptrans-gold/speed_analysis/"
-    GOLD_ANOMALIES_DETECTED = "s3a://sptrans-gold/anomalies_detected/"
+# =============================================================================
+# DATA LAKE LAYERS
+# =============================================================================
 
+class DataLakeLayer(str, Enum):
+    """Camadas do Data Lake"""
+    BRONZE = "bronze"
+    SILVER = "silver"
+    GOLD = "gold"
+    SERVING = "serving"
 
-# ============================================================================
-# SPTRANS API
-# ============================================================================
-class SPTransEndpoint:
-    """Endpoints da API SPTrans."""
-    
-    AUTENTICAR = "/Login/Autenticar"
-    POSICAO = "/Posicao"
-    POSICAO_LINHA = "/Posicao/Linha"
-    LINHAS = "/Linha/Buscar"
-    PARADAS = "/Parada/Buscar"
-    PREVISAO_CHEGADA = "/Previsao/Linha"
-    PREVISAO_PARADA = "/Previsao/Parada"
+# Paths das camadas
+BRONZE_LAYER_PATH: Final[str] = "s3a://sptrans-datalake/bronze"
+SILVER_LAYER_PATH: Final[str] = "s3a://sptrans-datalake/silver"
+GOLD_LAYER_PATH: Final[str] = "s3a://sptrans-datalake/gold"
 
+# =============================================================================
+# API SPTRANS
+# =============================================================================
 
-# ============================================================================
-# COLUMNS
-# ============================================================================
-class BronzeColumns:
-    """Colunas da camada Bronze."""
-    
-    # API Positions
-    ROUTE_CODE = "route_code"
-    ROUTE_ID = "route_id"
-    DIRECTION = "direction"
-    DESTINATION_0 = "destination_0"
-    DESTINATION_1 = "destination_1"
-    VEHICLE_ID = "vehicle_id"
-    ACCESSIBLE = "accessible"
-    LATITUDE = "latitude"
-    LONGITUDE = "longitude"
-    TIMESTAMP = "timestamp"
-    INGESTION_TIMESTAMP = "ingestion_timestamp"
-    PIPELINE_VERSION = "pipeline_version"
-    SOURCE_SYSTEM = "source_system"
+# Endpoints da API Olho Vivo
+SPTRANS_API_BASE_URL: Final[str] = "http://api.olhovivo.sptrans.com.br/v2.1"
 
+class SPTransEndpoint(str, Enum):
+    """Endpoints da API SPTrans"""
+    LOGIN = "/Login/Autenticar"
+    POSITIONS = "/Posicao"
+    POSITIONS_BY_LINE = "/Posicao/Linha"
+    LINES = "/Linha/Buscar"
+    LINE_DETAILS = "/Linha/BuscarLinhaTermo"
+    STOPS = "/Parada/Buscar"
+    STOP_BY_LINE = "/Parada/BuscarParadasPorLinha"
+    CORRIDORS = "/Corredor"
+    FORECAST = "/Previsao"
+    FORECAST_BY_LINE = "/Previsao/Linha"
+    FORECAST_BY_STOP = "/Previsao/Parada"
 
-class SilverColumns:
-    """Colunas da camada Silver."""
-    
-    # Campos base (herdados do Bronze)
-    VEHICLE_ID = "vehicle_id"
-    ROUTE_ID = "route_id"
-    ROUTE_CODE = "route_code"
-    DIRECTION = "direction"
-    LATITUDE = "latitude"
-    LONGITUDE = "longitude"
-    TIMESTAMP = "timestamp"
-    ACCESSIBLE = "accessible"
-    
-    # Enriquecimento GTFS
-    ROUTE_SHORT_NAME = "route_short_name"
-    ROUTE_LONG_NAME = "route_long_name"
-    AGENCY_ID = "agency_id"
-    NEAREST_STOP_ID = "nearest_stop_id"
-    NEAREST_STOP_NAME = "nearest_stop_name"
-    DISTANCE_TO_STOP_METERS = "distance_to_stop_meters"
-    
-    # Geocoding
-    STREET_NAME = "street_name"
-    NEIGHBORHOOD = "neighborhood"
-    DISTRICT = "district"
-    CITY = "city"
-    
-    # Campos calculados
-    SPEED_KMH = "speed_kmh"
-    HEADING_DEGREES = "heading_degrees"
-    IS_MOVING = "is_moving"
-    
-    # Data Quality
-    DQ_SCORE = "dq_score"
-    DQ_FLAGS = "dq_flags"
-    
-    # Metadados
-    PROCESSED_TIMESTAMP = "processed_timestamp"
-    DATE = "date"
+# Timeouts e retries
+API_TIMEOUT: Final[int] = 30  # segundos
+API_MAX_RETRIES: Final[int] = 3
+API_RETRY_DELAY: Final[int] = 5  # segundos
+API_BACKOFF_FACTOR: Final[float] = 2.0
 
+# Rate limiting
+API_MAX_REQUESTS_PER_MINUTE: Final[int] = 60
+API_REQUEST_INTERVAL: Final[float] = 1.0  # segundos entre requests
 
-class GoldColumns:
-    """Colunas da camada Gold."""
-    
-    # KPIs Realtime
-    ROUTE_ID = "route_id"
-    ROUTE_SHORT_NAME = "route_short_name"
-    TIMESTAMP_WINDOW = "timestamp_window"
-    VEHICLES_ACTIVE = "vehicles_active"
-    AVG_SPEED_KMH = "avg_speed_kmh"
-    MEDIAN_SPEED_KMH = "median_speed_kmh"
-    SPEED_STDDEV = "speed_stddev"
-    AVG_HEADWAY_MINUTES = "avg_headway_minutes"
-    PUNCTUALITY_RATE = "punctuality_rate"
-    TOTAL_TRIPS_COMPLETED = "total_trips_completed"
-    TOTAL_DISTANCE_KM = "total_distance_km"
-    ANOMALIES_DETECTED = "anomalies_detected"
+# =============================================================================
+# GTFS
+# =============================================================================
 
+# URL de download do GTFS
+GTFS_DOWNLOAD_URL: Final[str] = "https://www.sptrans.com.br/umbraco/surface/PerfilDesenvolvedor/BaixarGTFS"
 
-# ============================================================================
+# Arquivos GTFS esperados
+class GTFSFile(str, Enum):
+    """Arquivos do feed GTFS"""
+    AGENCY = "agency.txt"
+    STOPS = "stops.txt"
+    ROUTES = "routes.txt"
+    TRIPS = "trips.txt"
+    STOP_TIMES = "stop_times.txt"
+    CALENDAR = "calendar.txt"
+    CALENDAR_DATES = "calendar_dates.txt"
+    SHAPES = "shapes.txt"
+    FARE_ATTRIBUTES = "fare_attributes.txt"
+    FARE_RULES = "fare_rules.txt"
+    FREQUENCIES = "frequencies.txt"
+
+GTFS_REQUIRED_FILES: Final[list] = [
+    GTFSFile.STOPS.value,
+    GTFSFile.ROUTES.value,
+    GTFSFile.TRIPS.value,
+    GTFSFile.STOP_TIMES.value,
+]
+
+# =============================================================================
+# COORDENADAS SÃO PAULO
+# =============================================================================
+
+# Limites geográficos da cidade de São Paulo
+SP_COORDINATES: Final[dict] = {
+    "lat_min": -24.0,
+    "lat_max": -23.3,
+    "lon_min": -46.9,
+    "lon_max": -46.3,
+}
+
+# Centro de São Paulo (Praça da Sé)
+SP_CENTER: Final[dict] = {
+    "latitude": -23.5505,
+    "longitude": -46.6333,
+}
+
+# =============================================================================
 # DATA QUALITY
-# ============================================================================
-class DQCheckType(Enum):
-    """Tipos de verificação de qualidade de dados."""
-    
-    NULL_CHECK = "null_check"
-    RANGE_CHECK = "range_check"
-    DUPLICATE_CHECK = "duplicate_check"
-    REFERENTIAL_INTEGRITY = "referential_integrity"
-    FRESHNESS_CHECK = "freshness_check"
-    SCHEMA_CHECK = "schema_check"
-    COMPLETENESS_CHECK = "completeness_check"
+# =============================================================================
 
-
-class DQThreshold:
-    """Thresholds de qualidade de dados."""
-    
-    # Score geral
-    SCORE_EXCELLENT = 95.0
-    SCORE_GOOD = 90.0
-    SCORE_ACCEPTABLE = 85.0
-    SCORE_CRITICAL = 85.0  # Abaixo disso, bloqueia pipeline
-    
-    # Por tipo de check
-    NULL_RATE_MAX = 0.01  # Máximo 1% de nulos
-    DUPLICATE_RATE_MAX = 0.001  # Máximo 0.1% de duplicatas
-    COMPLETENESS_MIN = 0.98  # Mínimo 98% de completude
-
-
-# ============================================================================
-# GEOCODING
-# ============================================================================
-class GeocodingProvider(Enum):
-    """Provedores de geocoding."""
-    
-    NOMINATIM = "nominatim"
-    GOOGLE_MAPS = "google"
-    MAPBOX = "mapbox"
-
-
-# ============================================================================
-# COORDINATE VALIDATION
-# ============================================================================
-class CoordinateRange:
-    """Ranges válidos para coordenadas."""
-    
-    # Latitude
-    LAT_MIN = -90.0
-    LAT_MAX = 90.0
-    
-    # Longitude
-    LON_MIN = -180.0
-    LON_MAX = 180.0
-    
-    # São Paulo (para validação específica)
-    SAO_PAULO_LAT_MIN = -24.0
-    SAO_PAULO_LAT_MAX = -23.0
-    SAO_PAULO_LON_MIN = -47.0
-    SAO_PAULO_LON_MAX = -46.0
-
-
-# ============================================================================
-# SPEED VALIDATION
-# ============================================================================
-class SpeedRange:
-    """Ranges válidos para velocidade."""
-    
-    MIN_KMH = 0.0
-    MAX_KMH = 120.0  # Velocidade máxima realista para ônibus
-    
-    # Limites para anomalias
-    VERY_SLOW = 5.0  # Abaixo disso, considerado parado
-    VERY_FAST = 80.0  # Acima disso, suspeito
-    
-    # Velocidade média esperada
-    EXPECTED_AVG_KMH = 15.0
-    EXPECTED_STDDEV_KMH = 10.0
-
-
-# ============================================================================
-# TIME WINDOWS
-# ============================================================================
-class TimeWindow:
-    """Janelas de tempo para agregações."""
-    
-    REALTIME = "2 minutes"
-    SHORT = "15 minutes"
-    MEDIUM = "1 hour"
-    LONG = "1 day"
-    
-    # Em minutos (para cálculos)
-    REALTIME_MINUTES = 2
-    SHORT_MINUTES = 15
-    MEDIUM_MINUTES = 60
-    LONG_MINUTES = 1440
-
-
-# ============================================================================
-# SPARK CONFIGS
-# ============================================================================
-class SparkDefaults:
-    """Configurações padrão do Spark."""
-    
-    # Particionamento
-    DEFAULT_PARALLELISM = 12
-    SQL_SHUFFLE_PARTITIONS = 8
-    
-    # Write modes
-    WRITE_MODE_APPEND = "append"
-    WRITE_MODE_OVERWRITE = "overwrite"
-    WRITE_MODE_ERROR = "error"
-    WRITE_MODE_IGNORE = "ignore"
-    
-    # Formatos
-    FORMAT_PARQUET = "parquet"
-    FORMAT_DELTA = "delta"
-    FORMAT_CSV = "csv"
-    FORMAT_JSON = "json"
-    
-    # Compression
-    COMPRESSION_SNAPPY = "snappy"
-    COMPRESSION_GZIP = "gzip"
-    COMPRESSION_NONE = "none"
-
-
-# ============================================================================
-# POSTGRES TABLES
-# ============================================================================
-class PostgresTable:
-    """Nomes de tabelas no PostgreSQL."""
-    
-    # Serving Schema
-    KPIS_REALTIME = "serving.kpis_realtime"
-    ROUTE_METRICS = "serving.route_metrics"
-    VEHICLE_STATUS = "serving.vehicle_status"
-    ALERTS_ACTIVE = "serving.alerts_active"
-    HISTORICAL_AGGREGATES = "serving.historical_aggregates"
-    
-    # Metadata Schema
-    PIPELINE_EXECUTION_LOG = "metadata.pipeline_execution_log"
-    DATA_QUALITY_METRICS = "metadata.data_quality_metrics"
-
-
-# ============================================================================
-# REDIS KEYS
-# ============================================================================
-class RedisKey:
-    """Padrões de chaves no Redis."""
-    
-    # Prefixos
-    PREFIX_POSITION = "bus:pos:"
-    PREFIX_KPI = "kpi:route:"
-    PREFIX_ALERT = "alert:"
-    PREFIX_CACHE = "cache:"
-    
-    # TTL (em segundos)
-    TTL_POSITION = 120  # 2 minutos
-    TTL_KPI = 900  # 15 minutos
-    TTL_ALERT = 3600  # 1 hora
-    TTL_CACHE = 300  # 5 minutos
-
-
-# ============================================================================
-# METRICS
-# ============================================================================
-class MetricName:
-    """Nomes de métricas Prometheus."""
-    
-    # Pipeline
-    PIPELINE_RECORDS_PROCESSED = "pipeline_records_processed_total"
-    PIPELINE_ERRORS = "pipeline_errors_total"
-    PIPELINE_DURATION = "pipeline_duration_seconds"
-    
-    # Data Quality
-    DATA_QUALITY_SCORE = "data_quality_score"
-    DATA_QUALITY_CHECKS_PASSED = "data_quality_checks_passed_total"
-    DATA_QUALITY_CHECKS_FAILED = "data_quality_checks_failed_total"
-    
-    # API
-    API_REQUEST_DURATION = "api_request_duration_seconds"
-    API_REQUEST_ERRORS = "api_request_errors_total"
-    
-    # Spark
-    SPARK_JOB_DURATION = "spark_job_duration_seconds"
-    SPARK_EXECUTOR_MEMORY_USED = "spark_executor_memory_used_bytes"
-
-
-# ============================================================================
-# LOGGING
-# ============================================================================
-class LogLevel:
-    """Níveis de log."""
-    
-    DEBUG = "DEBUG"
-    INFO = "INFO"
-    WARNING = "WARNING"
-    ERROR = "ERROR"
-    CRITICAL = "CRITICAL"
-
-
-# ============================================================================
-# FEATURE FLAGS
-# ============================================================================
-class FeatureFlag:
-    """Feature flags do projeto."""
-    
-    KAFKA_STREAMING = "kafka_streaming"
-    ML_PREDICTIONS = "ml_predictions"
-    REAL_TIME_ALERTS = "real_time_alerts"
-    ADVANCED_ANALYTICS = "advanced_analytics"
-    GEOCODING = "geocoding"
-
-
-# ============================================================================
-# ERROR CODES
-# ============================================================================
-class ErrorCode:
-    """Códigos de erro customizados."""
-    
-    # API
-    API_AUTHENTICATION_FAILED = "E001"
-    API_TIMEOUT = "E002"
-    API_RATE_LIMIT = "E003"
-    API_INVALID_RESPONSE = "E004"
-    
-    # Data Quality
-    DQ_SCORE_BELOW_THRESHOLD = "E101"
-    DQ_NULL_VALUES = "E102"
-    DQ_DUPLICATE_RECORDS = "E103"
-    DQ_INVALID_COORDINATES = "E104"
-    
-    # Storage
-    STORAGE_CONNECTION_FAILED = "E201"
-    STORAGE_WRITE_FAILED = "E202"
-    STORAGE_READ_FAILED = "E203"
-    
-    # Spark
-    SPARK_JOB_FAILED = "E301"
-    SPARK_OUT_OF_MEMORY = "E302"
-
-
-# ============================================================================
-# ALERT SEVERITY
-# ============================================================================
-class AlertSeverity(Enum):
-    """Severidade de alertas."""
-    
-    INFO = "info"
-    WARNING = "warning"
-    ERROR = "error"
+class DataQualitySeverity(str, Enum):
+    """Severidade de problemas de qualidade"""
     CRITICAL = "critical"
+    WARNING = "warning"
+    INFO = "info"
 
+class DataQualityMetric(str, Enum):
+    """Métricas de qualidade de dados"""
+    COMPLETENESS = "completeness"
+    VALIDITY = "validity"
+    ACCURACY = "accuracy"
+    CONSISTENCY = "consistency"
+    TIMELINESS = "timeliness"
+    UNIQUENESS = "uniqueness"
 
-if __name__ == '__main__':
-    # Teste de constantes
-    print(f"Project: {PROJECT_NAME} v{PROJECT_VERSION}")
-    print(f"Bronze Path: {DataLakePath.BRONZE_API_POSITIONS}")
-    print(f"DQ Threshold: {DQThreshold.SCORE_CRITICAL}")
-    print(f"Speed Range: {SpeedRange.MIN_KMH} - {SpeedRange.MAX_KMH} km/h")
+# Thresholds de qualidade (percentuais)
+DQ_THRESHOLDS: Final[dict] = {
+    "completeness_min": 80.0,
+    "validity_min": 90.0,
+    "accuracy_min": 85.0,
+    "overall_quality_min": 80.0,
+}
+
+# Campos obrigatórios
+REQUIRED_FIELDS_POSITIONS: Final[list] = [
+    "vehicle_id",
+    "timestamp",
+    "latitude",
+    "longitude",
+]
+
+# =============================================================================
+# SPARK
+# =============================================================================
+
+# Configurações padrão Spark
+SPARK_APP_NAME: Final[str] = "SPTrans-Pipeline"
+SPARK_MASTER: Final[str] = "spark://spark-master:7077"
+
+# Particionamento
+SPARK_SHUFFLE_PARTITIONS: Final[int] = 200
+SPARK_DEFAULT_PARALLELISM: Final[int] = 100
+
+# Batch sizes
+SPARK_BATCH_SIZE: Final[int] = 10000
+SPARK_WRITE_BATCH_SIZE: Final[int] = 5000
+
+# =============================================================================
+# POSTGRESQL
+# =============================================================================
+
+# Schemas
+POSTGRES_SCHEMA_SERVING: Final[str] = "serving"
+
+# Tabelas
+class ServingTable(str, Enum):
+    """Tabelas do serving layer"""
+    KPIS_HOURLY = "kpis_hourly"
+    ROUTE_METRICS = "route_metrics"
+    HEADWAY_ANALYSIS = "headway_analysis"
+    SYSTEM_SUMMARY = "system_summary"
+    ALERTS_LOG = "alerts_log"
+    DATA_QUALITY_METRICS = "data_quality_metrics"
+    ROUTE_CATALOG = "route_catalog"
+
+# Connection pool
+POSTGRES_POOL_SIZE: Final[int] = 10
+POSTGRES_MAX_OVERFLOW: Final[int] = 20
+POSTGRES_POOL_TIMEOUT: Final[int] = 30
+
+# Batch loading
+POSTGRES_BATCH_SIZE: Final[int] = 1000
+
+# =============================================================================
+# REDIS
+# =============================================================================
+
+# Cache TTL (segundos)
+REDIS_CACHE_TTL: Final[int] = 300  # 5 minutos
+
+# Prefixos de cache keys
+class RedisCacheKey(str, Enum):
+    """Prefixos para cache keys"""
+    VEHICLE_POSITION = "vehicle:position:"
+    ROUTE_INFO = "route:info:"
+    STOP_INFO = "stop:info:"
+    API_RESPONSE = "api:response:"
+    METRICS = "metrics:"
+
+# =============================================================================
+# SCHEDULING
+# =============================================================================
+
+# Schedules dos DAGs (cron format)
+DAG_SCHEDULES: Final[dict] = {
+    "gtfs_ingestion": "0 2 * * *",          # Daily at 2 AM
+    "api_ingestion": "*/2 * * * *",         # Every 2 minutes
+    "bronze_to_silver": "*/30 * * * *",     # Every 30 minutes
+    "silver_to_gold": "0 * * * *",          # Every hour
+    "gold_to_serving": "15 * * * *",        # Every hour at :15
+    "data_quality": "30 * * * *",           # Every hour at :30
+    "maintenance": "0 3 * * 0",             # Weekly on Sunday at 3 AM
+}
+
+# =============================================================================
+# RETENTION PERIODS
+# =============================================================================
+
+# Períodos de retenção de dados (dias)
+RETENTION_PERIODS: Final[dict] = {
+    "bronze_api": 7,        # 7 dias
+    "bronze_gtfs": 90,      # 90 dias
+    "silver": 30,           # 30 dias
+    "gold": 365,            # 1 ano
+    "serving": 90,          # 90 dias
+    "logs": 30,             # 30 dias
+    "backups": 7,           # 7 dias
+}
+
+# =============================================================================
+# FILE FORMATS
+# =============================================================================
+
+class FileFormat(str, Enum):
+    """Formatos de arquivo suportados"""
+    PARQUET = "parquet"
+    CSV = "csv"
+    JSON = "json"
+    AVRO = "avro"
+    ORC = "orc"
+
+# Formato padrão por camada
+LAYER_FILE_FORMAT: Final[dict] = {
+    DataLakeLayer.BRONZE: FileFormat.JSON,
+    DataLakeLayer.SILVER: FileFormat.PARQUET,
+    DataLakeLayer.GOLD: FileFormat.PARQUET,
+}
+
+# =============================================================================
+# PARTITIONING
+# =============================================================================
+
+# Colunas de particionamento
+PARTITION_COLUMNS: Final[dict] = {
+    "api_positions": ["date", "hour"],
+    "gtfs_routes": ["date"],
+    "silver_positions": ["date", "hour"],
+    "gold_kpis": ["date"],
+}
+
+# =============================================================================
+# MONITORING
+# =============================================================================
+
+class MetricType(str, Enum):
+    """Tipos de métricas"""
+    COUNTER = "counter"
+    GAUGE = "gauge"
+    HISTOGRAM = "histogram"
+    SUMMARY = "summary"
+
+# Portas de monitoramento
+PROMETHEUS_PORT: Final[int] = 9090
+GRAFANA_PORT: Final[int] = 3000
+AIRFLOW_PORT: Final[int] = 8080
+SPARK_UI_PORT: Final[int] = 8081
+
+# =============================================================================
+# ALERTS
+# =============================================================================
+
+class AlertType(str, Enum):
+    """Tipos de alertas"""
+    DATA_QUALITY = "data_quality"
+    PIPELINE_FAILURE = "pipeline_failure"
+    PERFORMANCE = "performance"
+    RESOURCE = "resource"
+    SECURITY = "security"
+
+class AlertSeverity(str, Enum):
+    """Severidade de alertas"""
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INFO = "info"
+
+# =============================================================================
+# STATUS
+# =============================================================================
+
+class JobStatus(str, Enum):
+    """Status de jobs"""
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+
+class ServiceQuality(str, Enum):
+    """Qualidade do serviço"""
+    EXCELLENT = "excellent"
+    GOOD = "good"
+    FAIR = "fair"
+    POOR = "poor"
+
+# =============================================================================
+# VEHICLE TYPES
+# =============================================================================
+
+class VehicleType(str, Enum):
+    """Tipos de veículos"""
+    BUS = "bus"
+    METRO = "metro"
+    TRAIN = "train"
+
+# =============================================================================
+# TIMEZONE
+# =============================================================================
+
+TIMEZONE: Final[str] = "America/Sao_Paulo"
+
+# =============================================================================
+# DATE FORMATS
+# =============================================================================
+
+DATE_FORMAT: Final[str] = "%Y-%m-%d"
+DATETIME_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
+TIMESTAMP_FORMAT: Final[str] = "%Y-%m-%dT%H:%M:%S"
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+LOG_LEVEL_DEFAULT: Final[str] = "INFO"
+LOG_FORMAT: Final[str] = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# =============================================================================
+# TIMEOUTS
+# =============================================================================
+
+DEFAULT_TIMEOUT: Final[int] = 300  # 5 minutos
+LONG_TIMEOUT: Final[int] = 3600    # 1 hora
+SHORT_TIMEOUT: Final[int] = 60     # 1 minuto
+
+# =============================================================================
+# REGEX PATTERNS
+# =============================================================================
+
+# Padrões de validação
+REGEX_PATTERNS: Final[dict] = {
+    "vehicle_id": r"^\d{4,6}$",
+    "route_code": r"^[A-Z0-9\-]+$",
+    "timestamp": r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+}
+
+# =============================================================================
+# FEATURE FLAGS
+# =============================================================================
+
+# Flags para habilitar/desabilitar features
+FEATURE_FLAGS: Final[dict] = {
+    "enable_real_time_ingestion": True,
+    "enable_gtfs_ingestion": True,
+    "enable_geocoding": False,
+    "enable_ml_predictions": False,
+    "enable_streaming": False,
+    "enable_data_quality_checks": True,
+}
+
+# =============================================================================
+# ERROR CODES
+# =============================================================================
+
+class ErrorCode(str, Enum):
+    """Códigos de erro"""
+    API_ERROR = "API_ERROR"
+    DATABASE_ERROR = "DATABASE_ERROR"
+    VALIDATION_ERROR = "VALIDATION_ERROR"
+    PROCESSING_ERROR = "PROCESSING_ERROR"
+    CONFIGURATION_ERROR = "CONFIGURATION_ERROR"
+
+# =============================================================================
+# DEFAULTS
+# =============================================================================
+
+# Valores padrão
+DEFAULTS: Final[dict] = {
+    "batch_size": 1000,
+    "max_retries": 3,
+    "timeout": 30,
+    "parallelism": 4,
+}
+
+# =============================================================================
+# END
+# =============================================================================

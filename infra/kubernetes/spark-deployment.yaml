@@ -1,0 +1,424 @@
+# =============================================================================
+# KUBERNETES - SPARK DEPLOYMENT
+# =============================================================================
+# Deployment do Apache Spark (Master + Workers)
+# =============================================================================
+
+---
+# =============================================================================
+# CONFIGMAP - Spark Configuration
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-config
+  namespace: sptrans-pipeline
+data:
+  SPARK_MODE: "master"
+  SPARK_MASTER_PORT: "7077"
+  SPARK_MASTER_WEBUI_PORT: "8081"
+  SPARK_WORKER_CORES: "2"
+  SPARK_WORKER_MEMORY: "4g"
+  SPARK_DRIVER_MEMORY: "2g"
+  SPARK_EXECUTOR_MEMORY: "4g"
+
+---
+# =============================================================================
+# DEPLOYMENT - Spark Master
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-master
+  namespace: sptrans-pipeline
+  labels:
+    app: spark
+    component: master
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark
+      component: master
+  template:
+    metadata:
+      labels:
+        app: spark
+        component: master
+    spec:
+      serviceAccountName: sptrans-service-account
+      priorityClassName: sptrans-high-priority
+      
+      containers:
+        - name: spark-master
+          image: bitnami/spark:3.5
+          imagePullPolicy: IfNotPresent
+          
+          ports:
+            - name: master-ui
+              containerPort: 8081
+              protocol: TCP
+            - name: master-rpc
+              containerPort: 7077
+              protocol: TCP
+          
+          env:
+            - name: SPARK_MODE
+              value: "master"
+            - name: SPARK_MASTER_PORT
+              value: "7077"
+            - name: SPARK_MASTER_WEBUI_PORT
+              value: "8081"
+            - name: SPARK_RPC_AUTHENTICATION_ENABLED
+              value: "no"
+            - name: SPARK_RPC_ENCRYPTION_ENABLED
+              value: "no"
+          
+          resources:
+            requests:
+              cpu: 1
+              memory: 2Gi
+            limits:
+              cpu: 4
+              memory: 8Gi
+          
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 10
+
+---
+# =============================================================================
+# SERVICE - Spark Master
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-master
+  namespace: sptrans-pipeline
+  labels:
+    app: spark
+    component: master
+spec:
+  type: ClusterIP
+  selector:
+    app: spark
+    component: master
+  ports:
+    - name: master-ui
+      port: 8081
+      targetPort: 8081
+      protocol: TCP
+    - name: master-rpc
+      port: 7077
+      targetPort: 7077
+      protocol: TCP
+
+---
+# =============================================================================
+# SERVICE - Spark Master UI (LoadBalancer)
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-master-ui
+  namespace: sptrans-pipeline
+  labels:
+    app: spark
+    component: master
+spec:
+  type: LoadBalancer
+  selector:
+    app: spark
+    component: master
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+      protocol: TCP
+
+---
+# =============================================================================
+# STATEFULSET - Spark Workers
+# =============================================================================
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spark-worker
+  namespace: sptrans-pipeline
+  labels:
+    app: spark
+    component: worker
+spec:
+  serviceName: spark-worker-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: spark
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: spark
+        component: worker
+    spec:
+      serviceAccountName: sptrans-service-account
+      priorityClassName: sptrans-medium-priority
+      
+      initContainers:
+        # Aguardar Spark Master estar pronto
+        - name: wait-for-master
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z spark-master 7077; do
+                echo "Waiting for Spark Master..."
+                sleep 2
+              done
+      
+      containers:
+        - name: spark-worker
+          image: bitnami/spark:3.5
+          imagePullPolicy: IfNotPresent
+          
+          ports:
+            - name: worker-ui
+              containerPort: 8082
+              protocol: TCP
+          
+          env:
+            - name: SPARK_MODE
+              value: "worker"
+            - name: SPARK_MASTER_URL
+              value: "spark://spark-master:7077"
+            - name: SPARK_WORKER_CORES
+              value: "2"
+            - name: SPARK_WORKER_MEMORY
+              value: "4g"
+            - name: SPARK_RPC_AUTHENTICATION_ENABLED
+              value: "no"
+            - name: SPARK_RPC_ENCRYPTION_ENABLED
+              value: "no"
+          
+          resources:
+            requests:
+              cpu: 2
+              memory: 4Gi
+            limits:
+              cpu: 4
+              memory: 8Gi
+          
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8082
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8082
+            initialDelaySeconds: 15
+            periodSeconds: 10
+
+---
+# =============================================================================
+# SERVICE - Spark Workers (Headless)
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-worker-headless
+  namespace: sptrans-pipeline
+  labels:
+    app: spark
+    component: worker
+spec:
+  clusterIP: None
+  selector:
+    app: spark
+    component: worker
+  ports:
+    - name: worker-ui
+      port: 8082
+      targetPort: 8082
+      protocol: TCP
+
+---
+# =============================================================================
+# HORIZONTAL POD AUTOSCALER - Workers
+# =============================================================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: spark-worker-hpa
+  namespace: sptrans-pipeline
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: spark-worker
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# =============================================================================
+# POD DISRUPTION BUDGET - Master
+# =============================================================================
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: spark-master-pdb
+  namespace: sptrans-pipeline
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: spark
+      component: master
+
+---
+# =============================================================================
+# POD DISRUPTION BUDGET - Workers
+# =============================================================================
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: spark-worker-pdb
+  namespace: sptrans-pipeline
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: spark
+      component: worker
+
+---
+# =============================================================================
+# INGRESS - Spark UI (opcional)
+# =============================================================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spark-ingress
+  namespace: sptrans-pipeline
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+    - hosts:
+        - spark.sptrans-pipeline.com
+      secretName: spark-tls
+  rules:
+    - host: spark.sptrans-pipeline.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: spark-master-ui
+                port:
+                  number: 8081
+
+---
+# =============================================================================
+# SPARK SUBMIT JOB TEMPLATE (exemplo)
+# =============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spark-job-example
+  namespace: sptrans-pipeline
+spec:
+  template:
+    spec:
+      serviceAccountName: sptrans-service-account
+      restartPolicy: Never
+      
+      containers:
+        - name: spark-submit
+          image: bitnami/spark:3.5
+          command:
+            - spark-submit
+            - --master
+            - spark://spark-master:7077
+            - --deploy-mode
+            - client
+            - --class
+            - org.apache.spark.examples.SparkPi
+            - /opt/bitnami/spark/examples/jars/spark-examples_2.12-3.5.0.jar
+            - "1000"
+          
+          resources:
+            requests:
+              cpu: 1
+              memory: 2Gi
+            limits:
+              cpu: 2
+              memory: 4Gi
+
+# =============================================================================
+# USAGE
+# =============================================================================
+#
+# Aplicar:
+#   kubectl apply -f spark-deployment.yaml
+#
+# Verificar:
+#   kubectl get pods -n sptrans-pipeline -l app=spark
+#   kubectl get svc -n sptrans-pipeline -l app=spark
+#
+# Logs:
+#   kubectl logs -n sptrans-pipeline -l component=master -f
+#   kubectl logs -n sptrans-pipeline spark-worker-0 -f
+#
+# Port-forward Spark UI:
+#   kubectl port-forward -n sptrans-pipeline svc/spark-master-ui 8081:8081
+#
+# Escalar workers:
+#   kubectl scale statefulset spark-worker -n sptrans-pipeline --replicas=5
+#
+# Submit job:
+#   kubectl apply -f spark-job-example.yaml
+#
+# =============================================================================
+# END
+# =============================================================================

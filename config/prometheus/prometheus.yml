@@ -1,15 +1,25 @@
 # ============================================================================
-# PROMETHEUS CONFIGURATION
+# PROMETHEUS CONFIGURATION - SPTRANS PIPELINE
 # ============================================================================
-# Localização: config/prometheus/prometheus.yml
+# Configuração de monitoramento e coleta de métricas
 # ============================================================================
 
+# Global configuration
 global:
+  # Intervalo padrão de scraping
   scrape_interval: 15s
+  
+  # Timeout para cada scrape
+  scrape_timeout: 10s
+  
+  # Intervalo de avaliação de regras
   evaluation_interval: 15s
+  
+  # Labels externos anexados a todas as métricas
   external_labels:
-    cluster: 'sptrans-pipeline'
-    environment: 'development'
+    monitor: 'sptrans-pipeline'
+    environment: 'production'
+    cluster: 'sptrans-cluster-1'
 
 # Alertmanager configuration (opcional)
 # alerting:
@@ -18,88 +28,216 @@ global:
 #         - targets:
 #           - alertmanager:9093
 
-# Rule files
-rule_files:
-  # - "alert_rules.yml"
+# Rule files (regras de alerta e recording rules)
+# rule_files:
+#   - "alerts/*.yml"
+#   - "rules/*.yml"
 
-# Scrape configurations
+# ============================================================================
+# SCRAPE CONFIGURATIONS
+# ============================================================================
+
 scrape_configs:
-
-  # ============================================================================
+  # --------------------------------------------------------------------------
   # PROMETHEUS SELF-MONITORING
-  # ============================================================================
+  # --------------------------------------------------------------------------
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+          component: 'monitoring'
 
-  # ============================================================================
-  # POSTGRESQL EXPORTER
-  # ============================================================================
-  - job_name: 'postgres'
+  # --------------------------------------------------------------------------
+  # NODE EXPORTER - Métricas do sistema (CPU, memória, disco)
+  # --------------------------------------------------------------------------
+  - job_name: 'node-exporter'
     static_configs:
-      - targets: ['postgres:5432']
-    metrics_path: '/metrics'
+      - targets: ['node-exporter:9100']
+        labels:
+          service: 'node-exporter'
+          component: 'system'
 
-  # ============================================================================
-  # REDIS EXPORTER
-  # ============================================================================
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['redis:6379']
-
-  # ============================================================================
-  # AIRFLOW METRICS
-  # ============================================================================
+  # --------------------------------------------------------------------------
+  # AIRFLOW - Métricas do orquestrador
+  # --------------------------------------------------------------------------
   - job_name: 'airflow'
     static_configs:
       - targets: ['airflow-webserver:8080']
+        labels:
+          service: 'airflow'
+          component: 'orchestration'
+    
+    # Scrape específico para métricas do Airflow
     metrics_path: '/admin/metrics'
-    scheme: http
+    
+    # Relabel para adicionar informações
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'airflow-webserver'
 
-  # ============================================================================
-  # SPARK MASTER
-  # ============================================================================
+  # --------------------------------------------------------------------------
+  # SPARK - Métricas do Spark Master e Workers
+  # --------------------------------------------------------------------------
   - job_name: 'spark-master'
     static_configs:
-      - targets: ['spark-master:8081']
+      - targets: ['spark-master:8080']
+        labels:
+          service: 'spark'
+          component: 'master'
+    
     metrics_path: '/metrics/prometheus'
-    scheme: http
 
-  # ============================================================================
-  # SPARK WORKERS
-  # ============================================================================
   - job_name: 'spark-workers'
     static_configs:
       - targets: 
-        - 'spark-worker-1:8081'
-        - 'spark-worker-2:8081'
+          - 'spark-worker-1:8081'
+          - 'spark-worker-2:8081'
+        labels:
+          service: 'spark'
+          component: 'worker'
+    
     metrics_path: '/metrics/prometheus'
-    scheme: http
 
-  # ============================================================================
-  # MINIO
-  # ============================================================================
+  # --------------------------------------------------------------------------
+  # POSTGRESQL - Métricas do banco de dados
+  # --------------------------------------------------------------------------
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+        labels:
+          service: 'postgresql'
+          component: 'database'
+          database: 'airflow'
+
+  # --------------------------------------------------------------------------
+  # REDIS - Métricas do cache
+  # --------------------------------------------------------------------------
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+        labels:
+          service: 'redis'
+          component: 'cache'
+
+  # --------------------------------------------------------------------------
+  # MINIO - Métricas do Data Lake
+  # --------------------------------------------------------------------------
   - job_name: 'minio'
-    metrics_path: /minio/v2/metrics/cluster
-    scheme: http
     static_configs:
       - targets: ['minio:9000']
+        labels:
+          service: 'minio'
+          component: 'storage'
+    
+    metrics_path: '/minio/v2/metrics/cluster'
+    
+    # Bearer token authentication para MinIO
+    bearer_token_file: /etc/prometheus/minio_token
 
-  # ============================================================================
-  # GRAFANA
-  # ============================================================================
-  - job_name: 'grafana'
+  # --------------------------------------------------------------------------
+  # SPTRANS APPLICATION - Métricas customizadas da aplicação
+  # --------------------------------------------------------------------------
+  - job_name: 'sptrans-application'
     static_configs:
-      - targets: ['grafana:3000']
+      - targets: ['sptrans-app:8000']
+        labels:
+          service: 'sptrans-app'
+          component: 'application'
+    
+    metrics_path: '/metrics'
+    
+    # Scrape com mais frequência para métricas em tempo real
+    scrape_interval: 10s
+
+  # --------------------------------------------------------------------------
+  # CADVISOR - Métricas de containers Docker
+  # --------------------------------------------------------------------------
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+        labels:
+          service: 'cadvisor'
+          component: 'containers'
+    
     metrics_path: '/metrics'
 
-  # ============================================================================
-  # SUPERSET
-  # ============================================================================
-  - job_name: 'superset'
+  # --------------------------------------------------------------------------
+  # BLACKBOX EXPORTER - Health checks externos
+  # --------------------------------------------------------------------------
+  - job_name: 'blackbox-http'
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    
     static_configs:
-      - targets: ['superset:8088']
+      - targets:
+          - http://airflow-webserver:8080/health
+          - http://minio:9000/minio/health/live
+          - http://spark-master:8080
+    
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # --------------------------------------------------------------------------
+  # SPTRANS API - Monitorar API externa (opcional)
+  # --------------------------------------------------------------------------
+  # - job_name: 'sptrans-api-external'
+  #   metrics_path: /probe
+  #   params:
+  #     module: [http_2xx]
+  #   
+  #   static_configs:
+  #     - targets:
+  #         - http://api.olhovivo.sptrans.com.br/v2.1/Posicao
+  #   
+  #   relabel_configs:
+  #     - source_labels: [__address__]
+  #       target_label: __param_target
+  #     - source_labels: [__param_target]
+  #       target_label: instance
+  #     - target_label: __address__
+  #       replacement: blackbox-exporter:9115
 
 # ============================================================================
-# FIM DO ARQUIVO
+# REMOTE WRITE (opcional - para long-term storage)
+# ============================================================================
+# remote_write:
+#   - url: "http://thanos:19291/api/v1/receive"
+#     queue_config:
+#       capacity: 10000
+#       max_shards: 50
+#       min_shards: 1
+#       max_samples_per_send: 5000
+#       batch_send_deadline: 5s
+#       min_backoff: 30ms
+#       max_backoff: 100ms
+
+# ============================================================================
+# REMOTE READ (opcional - para queries federadas)
+# ============================================================================
+# remote_read:
+#   - url: "http://thanos:10901/api/v1/query"
+#     read_recent: true
+
+# ============================================================================
+# STORAGE CONFIGURATION
+# ============================================================================
+# Configurações de retenção e armazenamento
+# (Estas configurações são passadas via command line, mas documentadas aqui)
+#
+# --storage.tsdb.path=/prometheus
+# --storage.tsdb.retention.time=30d
+# --storage.tsdb.retention.size=50GB
+# --web.enable-lifecycle
+# --web.enable-admin-api
+
+# ============================================================================
+# END OF CONFIGURATION
 # ============================================================================

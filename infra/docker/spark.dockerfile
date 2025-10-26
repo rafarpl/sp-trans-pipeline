@@ -1,111 +1,203 @@
-# ============================================================================
-# SPARK CUSTOM DOCKERFILE
-# ============================================================================
-# Build: docker build -f infra/docker/spark.Dockerfile -t sptrans-spark .
-# ============================================================================
+# =============================================================================
+# APACHE SPARK - DOCKERFILE
+# =============================================================================
+# Container customizado do Spark para SPTrans Pipeline
+# Base: Bitnami Spark 3.5
+# =============================================================================
 
-FROM bitnami/spark:3.5.0
+FROM bitnami/spark:3.5
 
-# ============================================================================
-# METADATA
-# ============================================================================
-LABEL maintainer="engenharia-dados@fia.br"
-LABEL project="sptrans-realtime-pipeline"
-LABEL version="1.0.0"
-LABEL description="Apache Spark customizado para pipeline SPTrans"
+# Metadata
+LABEL maintainer="rafael@sptrans-pipeline.com"
+LABEL description="Apache Spark for SPTrans Data Pipeline"
+LABEL version="3.5.0"
 
-# ============================================================================
-# USER ROOT - System packages
-# ============================================================================
+# Switch to root
 USER root
 
-# Instalar dependências do sistema
+# ============================================================================
+# SYSTEM DEPENDENCIES
+# ============================================================================
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Python
+    python3-pip \
+    python3-dev \
+    # Build tools
+    build-essential \
+    gcc \
+    g++ \
+    # Database clients
+    postgresql-client \
+    # Network & utils
     curl \
     wget \
+    netcat \
     vim \
-    procps \
-    && apt-get clean \
+    # For S3/MinIO
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# ============================================================================
-# SPARK JARS - Download dependencies
-# ============================================================================
-WORKDIR /opt/bitnami/spark/jars
-
-# AWS SDK para MinIO/S3
-RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar && \
-    wget -q https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar
-
-# Delta Lake
-RUN wget -q https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.0.0/delta-spark_2.12-3.0.0.jar && \
-    wget -q https://repo1.maven.org/maven2/io/delta/delta-storage/3.0.0/delta-storage-3.0.0.jar
-
-# PostgreSQL JDBC Driver
-RUN wget -q https://jdbc.postgresql.org/download/postgresql-42.7.1.jar
 
 # ============================================================================
 # PYTHON PACKAGES
 # ============================================================================
-USER 1001
 
-# Atualizar pip
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+# Upgrade pip
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
 
-# Instalar dependências Python para Spark
-RUN pip install --no-cache-dir \
+# Install Python dependencies for Spark jobs
+RUN pip3 install --no-cache-dir \
+    # Core
     pyspark==3.5.0 \
-    delta-spark==3.0.0 \
-    pyarrow==14.0.1 \
     pandas==2.1.4 \
     numpy==1.26.2 \
-    boto3==1.34.19 \
+    # Database
+    psycopg2-binary==2.9.9 \
+    SQLAlchemy==2.0.23 \
+    # S3/MinIO
+    boto3==1.34.18 \
     s3fs==2024.2.0 \
-    requests==2.31.0 \
-    geopy==2.4.1 \
-    shapely==2.0.2 \
+    # Data formats
+    pyarrow==14.0.2 \
+    fastparquet==2023.10.1 \
+    # Utils
     python-dotenv==1.0.0 \
-    pydantic==2.5.3
+    pyyaml==6.0.1 \
+    requests==2.31.0 \
+    # Geospatial (opcional)
+    shapely==2.0.2
+
+# ============================================================================
+# SPARK JARS
+# ============================================================================
+
+# Criar diretório para JARs customizados
+RUN mkdir -p /opt/spark/jars/custom && \
+    chown -R 1001:0 /opt/spark/jars/custom
+
+# Download PostgreSQL JDBC driver
+RUN wget -P /opt/spark/jars/custom \
+    https://jdbc.postgresql.org/download/postgresql-42.5.0.jar
+
+# Download Hadoop AWS (para MinIO/S3)
+RUN wget -P /opt/spark/jars/custom \
+    https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar
+
+# Download AWS SDK bundle
+RUN wget -P /opt/spark/jars/custom \
+    https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar
 
 # ============================================================================
 # SPARK CONFIGURATION
 # ============================================================================
-# Criar diretórios para aplicações
-RUN mkdir -p /opt/spark-apps /opt/spark-data
 
-# Copiar spark-defaults.conf (será substituído por volume no docker-compose)
+# Copiar configurações customizadas
 # COPY config/spark/spark-defaults.conf /opt/bitnami/spark/conf/spark-defaults.conf
+# COPY config/spark/log4j.properties /opt/bitnami/spark/conf/log4j.properties
 
-# ============================================================================
-# ENVIRONMENT VARIABLES
-# ============================================================================
+# Environment variables
 ENV SPARK_HOME=/opt/bitnami/spark
-ENV PATH=$SPARK_HOME/bin:$PATH
-ENV PYTHONPATH=$SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
+ENV SPARK_MASTER_HOST=spark-master
+ENV SPARK_MASTER_PORT=7077
+ENV SPARK_MASTER_WEBUI_PORT=8081
+
+# Python
 ENV PYSPARK_PYTHON=python3
 ENV PYSPARK_DRIVER_PYTHON=python3
+ENV PYTHONPATH=/opt/bitnami/spark/python:/opt/bitnami/spark/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
 
-# Delta Lake configuration
-ENV SPARK_SQL_EXTENSIONS=io.delta.sql.DeltaSparkSessionExtension
-ENV SPARK_SQL_CATALOG_SPARK_CATALOG=org.apache.spark.sql.delta.catalog.DeltaCatalog
+# Memory settings
+ENV SPARK_DRIVER_MEMORY=2g
+ENV SPARK_EXECUTOR_MEMORY=4g
+ENV SPARK_WORKER_MEMORY=4g
+ENV SPARK_WORKER_CORES=2
+
+# S3/MinIO configuration
+ENV AWS_ACCESS_KEY_ID=admin
+ENV AWS_SECRET_ACCESS_KEY=miniopassword123
+ENV AWS_REGION=us-east-1
+
+# ============================================================================
+# WORKING DIRECTORY
+# ============================================================================
+
+WORKDIR /app
+
+# Criar estrutura de diretórios
+RUN mkdir -p /app/src \
+             /app/dags \
+             /app/logs \
+             /app/tmp && \
+    chown -R 1001:0 /app
+
+# ============================================================================
+# APPLICATION CODE
+# ============================================================================
+
+# Código será montado via volume no docker-compose
+# COPY src/ /app/src/
+# COPY dags/ /app/dags/
+
+# ============================================================================
+# PERMISSIONS
+# ============================================================================
+
+# Ajustar permissões
+RUN chmod -R 775 /opt/bitnami/spark && \
+    chmod -R 775 /app
+
+# ============================================================================
+# USER
+# ============================================================================
+
+# Voltar para usuário não-root
+USER 1001
 
 # ============================================================================
 # HEALTHCHECK
 # ============================================================================
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8081 || exit 1
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8081/ || exit 1
 
 # ============================================================================
-# WORKDIR
+# EXPOSE PORTS
 # ============================================================================
-WORKDIR /opt/spark-apps
+
+# Master Web UI
+EXPOSE 8081
+# Master RPC
+EXPOSE 7077
+# Worker Web UI
+EXPOSE 8082
+# Driver
+EXPOSE 4040
 
 # ============================================================================
 # ENTRYPOINT
 # ============================================================================
-# Usar entrypoint padrão do Bitnami Spark
-# CMD será definido no docker-compose.yml (master ou worker)
+
+# Usar entrypoint padrão do Bitnami
+# O comando será especificado no docker-compose.yml:
+# - Master mode: /opt/bitnami/scripts/spark/run.sh
+# - Worker mode: /opt/bitnami/scripts/spark/run.sh
 
 # ============================================================================
-# FIM DO DOCKERFILE
+# USAGE EXAMPLES
+# ============================================================================
+
+# Submit a Spark job:
+#   docker exec spark-master spark-submit \
+#     --master spark://spark-master:7077 \
+#     --deploy-mode client \
+#     /app/src/processing/jobs/bronze_to_silver.py
+#
+# Access Spark shell:
+#   docker exec -it spark-master spark-shell
+#
+# Access PySpark shell:
+#   docker exec -it spark-master pyspark
+
+# ============================================================================
+# END
 # ============================================================================

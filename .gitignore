@@ -1,22 +1,13 @@
 # ============================================================================
-# SPTRANS REAL-TIME PIPELINE - GITIGNORE
+# SPTRANS PIPELINE - .gitignore
 # ============================================================================
-
+# Arquivos e diretórios ignorados pelo Git
 # ============================================================================
-# ENVIRONMENT & SECRETS
-# ============================================================================
-.env
-.env.local
-.env.*.local
-*.key
-*.pem
-*.crt
-secrets/
-credentials/
 
 # ============================================================================
 # PYTHON
 # ============================================================================
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -59,7 +50,7 @@ htmlcov/
 nosetests.xml
 coverage.xml
 *.cover
-*.log
+*.py,cover
 .hypothesis/
 .pytest_cache/
 cover/
@@ -69,6 +60,7 @@ cover/
 *.pot
 
 # Django stuff:
+*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -82,8 +74,6 @@ instance/
 
 # Sphinx documentation
 docs/_build/
-docs/_static/
-docs/_templates/
 
 # PyBuilder
 .pybuilder/
@@ -91,7 +81,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-*.ipynb
+*.ipynb_checkpoints/
 
 # IPython
 profile_default/
@@ -120,6 +110,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
+.env
 .venv
 env/
 venv/
@@ -154,76 +145,83 @@ cython_debug/
 # ============================================================================
 # AIRFLOW
 # ============================================================================
+
+# Airflow
 airflow.db
 airflow.cfg
 airflow-webserver.pid
-airflow_login_session/
-logs/airflow/
-airflow/logs/
-unittests.cfg
-unittests.db
+airflow-scheduler.pid
+logs/
+dags/__pycache__/
+plugins/__pycache__/
+standalone_admin_password.txt
 webserver_config.py
 
 # ============================================================================
 # SPARK
 # ============================================================================
-*.class
-metastore_db/
+
+# Spark
 derby.log
+metastore_db/
 spark-warehouse/
-logs/spark/
-*.log
+*.parquet
+*.avro
+*.orc
 
 # ============================================================================
-# DATA & BACKUPS
+# DATA FILES
 # ============================================================================
-data/gtfs/*.txt
-data/gtfs/*.zip
-data/samples/*.json
-data/samples/*.csv
-data/samples/*.parquet
-data/backups/*.sql
-data/backups/*.tar.gz
-data/backups/*.zip
 
-# Mantém estrutura de pastas
-!data/gtfs/.gitkeep
-!data/samples/.gitkeep
-!data/backups/.gitkeep
+# Dados locais (não versionar dados sensíveis)
+data/
+*.csv
+*.json
+*.txt
+*.parquet
+*.avro
+*.orc
+*.xlsx
+*.xls
 
-# ============================================================================
-# LOGS
-# ============================================================================
-logs/
-*.log
-*.out
-*.err
+# Exceto arquivos de exemplo
+!data/samples/
+!tests/fixtures/*.csv
+!tests/fixtures/*.json
 
-# Mantém estrutura
-!logs/.gitkeep
-!logs/airflow/.gitkeep
-!logs/spark/.gitkeep
-!logs/application/.gitkeep
+# GTFS files
+gtfs/
+*.zip
+gtfs*.txt
+
+# Backups
+backups/
+*.sql
+*.dump
+*.tar.gz
+*.bak
 
 # ============================================================================
 # DOCKER
 # ============================================================================
-.dockerignore
+
+# Docker volumes
+volumes/
 docker-compose.override.yml
 
 # ============================================================================
-# IDE & EDITORS
+# IDE / EDITORS
 # ============================================================================
 
 # VSCode
 .vscode/
 *.code-workspace
-.history/
 
 # PyCharm
 .idea/
 *.iml
 *.iws
+.idea_modules/
 
 # Sublime Text
 *.sublime-project
@@ -233,34 +231,34 @@ docker-compose.override.yml
 *.swp
 *.swo
 *~
-.netrwhist
 
 # Emacs
 *~
 \#*\#
 .\#*
 
-# JetBrains
-.idea/
-*.iml
-.idea_modules/
-
-# Eclipse
-.project
-.pydevproject
-.settings/
-
 # ============================================================================
-# OS
+# OS SPECIFIC
 # ============================================================================
 
 # macOS
 .DS_Store
 .AppleDouble
 .LSOverride
+Icon
 ._*
+.DocumentRevisions-V100
+.fseventsd
 .Spotlight-V100
+.TemporaryItems
 .Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
 
 # Windows
 Thumbs.db
@@ -270,110 +268,187 @@ ehthumbs_vista.db
 *.stackdump
 [Dd]esktop.ini
 $RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
 *.lnk
 
 # Linux
 *~
-.directory
-.Trash-*
 
 # ============================================================================
-# DATABASE
+# LOGS
 # ============================================================================
-*.sqlite
-*.db
-*.sql
+
+logs/
+*.log
+*.out
+*.err
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ============================================================================
+# DATABASES
+# ============================================================================
 
 # PostgreSQL
+*.sql
+*.dump
 pgdata/
-postgres-data/
 
-# MinIO
-minio-data/
+# SQLite
+*.sqlite
+*.db
 
-# Redis
-dump.rdb
-appendonly.aof
+# ============================================================================
+# SECRETS & CREDENTIALS
+# ============================================================================
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+
+# Credentials
+credentials/
+secrets/
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.keystore
+*.jks
+
+# API tokens
+token.txt
+api_key.txt
 
 # ============================================================================
 # TEMPORARY FILES
 # ============================================================================
+
+# Temporary directories
 tmp/
 temp/
-*.tmp
-*.temp
-*.bak
-*.swp
-*.swo
-*~
+.tmp/
 
-# ============================================================================
-# NOTEBOOKS
-# ============================================================================
-.ipynb_checkpoints/
-*.ipynb
-!notebooks/examples/*.ipynb
-
-# ============================================================================
-# TERRAFORM (se usar)
-# ============================================================================
-*.tfstate
-*.tfstate.*
-.terraform/
-.terraform.lock.hcl
-crash.log
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
-
-# ============================================================================
-# KUBERNETES (se usar)
-# ============================================================================
-*.kubeconfig
-
-# ============================================================================
-# MONITORING
-# ============================================================================
-prometheus-data/
-grafana-data/
-
-# ============================================================================
-# SSL/TLS
-# ============================================================================
-*.csr
-*.cer
-*.der
-*.p12
-*.pfx
-ssl/
-
-# ============================================================================
-# MISC
-# ============================================================================
-.sass-cache/
+# Cache
 .cache/
-*.pid
-node_modules/
-package-lock.json
-yarn.lock
+*.cache
 
 # ============================================================================
 # PROJECT SPECIFIC
 # ============================================================================
-# Adicione aqui arquivos específicos do seu ambiente
 
-# Configurações locais
-config/local/
+# MinIO data
+minio-data/
 
-# Testes locais
-tests/local/
+# Postgres data
+postgres-data/
 
-# Scripts experimentais
-scripts/experimental/
+# Prometheus data
+prometheus-data/
+
+# Grafana data
+grafana-data/
+
+# Redis data
+redis-data/
+
+# Outputs temporários
+outputs/
+output/
+
+# Checkpoints
+checkpoints/
+*.ckpt
+
+# Models (se usar ML)
+models/
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
 
 # ============================================================================
-# KEEP STRUCTURE
+# DOCUMENTATION
 # ============================================================================
-# Arquivos .gitkeep para manter estrutura de pastas vazias
-!**/.gitkeep
+
+# Generated documentation
+_build/
+_static/
+_templates/
+
+# ============================================================================
+# TESTING
+# ============================================================================
+
+# Test outputs
+test-results/
+test-reports/
+.tox/
+
+# ============================================================================
+# MONITORING
+# ============================================================================
+
+# Prometheus
+prometheus/data/
+
+# Grafana
+grafana/data/
+
+# ============================================================================
+# MISC
+# ============================================================================
+
+# Compressed files
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# Large files
+*.bin
+*.exe
+
+# Lock files
+*.lock
+package-lock.json
+
+# Node modules (se usar JS)
+node_modules/
+
+# ============================================================================
+# ALLOWED EXCEPTIONS
+# ============================================================================
+
+# Manter arquivos de exemplo
+!data/samples/
+!data/samples/**
+!tests/fixtures/
+!tests/fixtures/**
+
+# Manter templates
+!.env.example
+!config/examples/
+!sql/examples/
+
+# Manter documentação
+!docs/**/*.md
+!docs/**/*.png
+!docs/**/*.jpg
+
+# ============================================================================
+# END
+# ============================================================================

@@ -1,0 +1,425 @@
+# =============================================================================
+# KUBERNETES - AIRFLOW DEPLOYMENT
+# =============================================================================
+# Deployment do Apache Airflow (Webserver + Scheduler)
+# =============================================================================
+
+---
+# =============================================================================
+# CONFIGMAP - Airflow Configuration
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airflow-config
+  namespace: sptrans-pipeline
+data:
+  AIRFLOW__CORE__EXECUTOR: "LocalExecutor"
+  AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+  AIRFLOW__CORE__DAGS_FOLDER: "/opt/airflow/dags"
+  AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+
+---
+# =============================================================================
+# SECRET - Airflow Credentials
+# =============================================================================
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: airflow-secrets
+  namespace: sptrans-pipeline
+type: Opaque
+stringData:
+  # Database
+  sql-alchemy-conn: "postgresql+psycopg2://airflow:airflow123@postgres:5432/airflow"
+  
+  # Fernet key (gere com: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+  fernet-key: "sua_fernet_key_aqui_base64"
+  
+  # Secret key
+  secret-key: "sua_secret_key_aqui"
+  
+  # Admin credentials
+  admin-username: "admin"
+  admin-password: "admin"
+  admin-email: "admin@sptrans.com"
+
+---
+# =============================================================================
+# PERSISTENT VOLUME CLAIM - Logs
+# =============================================================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airflow-logs-pvc
+  namespace: sptrans-pipeline
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+
+---
+# =============================================================================
+# PERSISTENT VOLUME CLAIM - DAGs
+# =============================================================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airflow-dags-pvc
+  namespace: sptrans-pipeline
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard
+
+---
+# =============================================================================
+# DEPLOYMENT - Airflow Webserver
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-webserver
+  namespace: sptrans-pipeline
+  labels:
+    app: airflow
+    component: webserver
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: airflow
+      component: webserver
+  template:
+    metadata:
+      labels:
+        app: airflow
+        component: webserver
+    spec:
+      serviceAccountName: sptrans-service-account
+      priorityClassName: sptrans-high-priority
+      
+      initContainers:
+        # Aguardar PostgreSQL estar pronto
+        - name: wait-for-postgres
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z postgres 5432; do
+                echo "Waiting for PostgreSQL..."
+                sleep 2
+              done
+      
+      containers:
+        - name: webserver
+          image: apache/airflow:2.8.1-python3.10
+          imagePullPolicy: IfNotPresent
+          
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          
+          env:
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secrets
+                  key: sql-alchemy-conn
+            
+            - name: AIRFLOW__CORE__FERNET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secrets
+                  key: fernet-key
+          
+          envFrom:
+            - configMapRef:
+                name: airflow-config
+          
+          volumeMounts:
+            - name: dags
+              mountPath: /opt/airflow/dags
+            - name: logs
+              mountPath: /opt/airflow/logs
+          
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2
+              memory: 4Gi
+          
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+          
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          
+          command:
+            - bash
+            - -c
+            - |
+              airflow db upgrade && \
+              airflow webserver
+      
+      volumes:
+        - name: dags
+          persistentVolumeClaim:
+            claimName: airflow-dags-pvc
+        - name: logs
+          persistentVolumeClaim:
+            claimName: airflow-logs-pvc
+
+---
+# =============================================================================
+# DEPLOYMENT - Airflow Scheduler
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-scheduler
+  namespace: sptrans-pipeline
+  labels:
+    app: airflow
+    component: scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow
+      component: scheduler
+  template:
+    metadata:
+      labels:
+        app: airflow
+        component: scheduler
+    spec:
+      serviceAccountName: sptrans-service-account
+      priorityClassName: sptrans-high-priority
+      
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z postgres 5432; do
+                echo "Waiting for PostgreSQL..."
+                sleep 2
+              done
+      
+      containers:
+        - name: scheduler
+          image: apache/airflow:2.8.1-python3.10
+          imagePullPolicy: IfNotPresent
+          
+          env:
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secrets
+                  key: sql-alchemy-conn
+            
+            - name: AIRFLOW__CORE__FERNET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secrets
+                  key: fernet-key
+          
+          envFrom:
+            - configMapRef:
+                name: airflow-config
+          
+          volumeMounts:
+            - name: dags
+              mountPath: /opt/airflow/dags
+            - name: logs
+              mountPath: /opt/airflow/logs
+          
+          resources:
+            requests:
+              cpu: 1
+              memory: 2Gi
+            limits:
+              cpu: 4
+              memory: 8Gi
+          
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  ps aux | grep 'airflow scheduler' | grep -v grep
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          
+          command:
+            - bash
+            - -c
+            - |
+              airflow scheduler
+      
+      volumes:
+        - name: dags
+          persistentVolumeClaim:
+            claimName: airflow-dags-pvc
+        - name: logs
+          persistentVolumeClaim:
+            claimName: airflow-logs-pvc
+
+---
+# =============================================================================
+# SERVICE - Airflow Webserver
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-webserver
+  namespace: sptrans-pipeline
+  labels:
+    app: airflow
+    component: webserver
+spec:
+  type: LoadBalancer
+  selector:
+    app: airflow
+    component: webserver
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+
+---
+# =============================================================================
+# HORIZONTAL POD AUTOSCALER - Webserver
+# =============================================================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: airflow-webserver-hpa
+  namespace: sptrans-pipeline
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: airflow-webserver
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# =============================================================================
+# POD DISRUPTION BUDGET - Webserver
+# =============================================================================
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: airflow-webserver-pdb
+  namespace: sptrans-pipeline
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: airflow
+      component: webserver
+
+---
+# =============================================================================
+# INGRESS - Airflow (opcional)
+# =============================================================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: airflow-ingress
+  namespace: sptrans-pipeline
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  tls:
+    - hosts:
+        - airflow.sptrans-pipeline.com
+      secretName: airflow-tls
+  rules:
+    - host: airflow.sptrans-pipeline.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: airflow-webserver
+                port:
+                  number: 8080
+
+# =============================================================================
+# USAGE
+# =============================================================================
+#
+# Aplicar:
+#   kubectl apply -f airflow-deployment.yaml
+#
+# Verificar:
+#   kubectl get pods -n sptrans-pipeline -l app=airflow
+#   kubectl get svc -n sptrans-pipeline -l app=airflow
+#
+# Logs:
+#   kubectl logs -n sptrans-pipeline -l component=webserver -f
+#   kubectl logs -n sptrans-pipeline -l component=scheduler -f
+#
+# Port-forward (para acesso local):
+#   kubectl port-forward -n sptrans-pipeline svc/airflow-webserver 8080:8080
+#
+# Escalar:
+#   kubectl scale deployment airflow-webserver -n sptrans-pipeline --replicas=3
+#
+# =============================================================================
+# END
+# =============================================================================
