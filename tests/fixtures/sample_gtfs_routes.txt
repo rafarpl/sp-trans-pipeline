@@ -1,0 +1,51 @@
+route_id,agency_id,route_short_name,route_long_name,route_type,route_color,route_text_color
+R0001,SPTrans,8000-10,Terminal Lapa - Terminal Pinheiros,3,DC143C,FFFFFF
+R0002,SPTrans,8000-20,Terminal Lapa - Butantã,3,1E90FF,FFFFFF
+R0003,SPTrans,8100-15,Terminal Bandeira - Terminal Sacomã,3,32CD32,FFFFFF
+R0004,SPTrans,8100-25,Terminal Bandeira - Vila Prudente,3,FF8C00,FFFFFF
+R0005,SPTrans,8200-30,Terminal Parque Dom Pedro II - Terminal Capelinha,3,9370DB,FFFFFF
+R0006,SPTrans,8200-40,Terminal Parque Dom Pedro II - Penha,3,FF1493,FFFFFF
+R0007,SPTrans,8300-45,Terminal Princesa Isabel - Terminal Vila Carrão,3,00CED1,FFFFFF
+R0008,SPTrans,8300-55,Terminal Princesa Isabel - Itaquera,3,FFD700,FFFFFF
+R0009,SPTrans,8400-20,Terminal Santo Amaro - Terminal João Dias,3,FF4500,FFFFFF
+R0010,SPTrans,8400-60,Terminal Santo Amaro - Campo Limpo,3,7FFF00,FFFFFF
+R0011,SPTrans,8500-10,Terminal Pirituba - Lapa,3,4169E1,FFFFFF
+R0012,SPTrans,8500-21,Terminal Pirituba - Freguesia do Ó,3,FF69B4,FFFFFF
+R0013,SPTrans,8600-30,Terminal Jabaquara - Congonhas,3,20B2AA,FFFFFF
+R0014,SPTrans,8600-41,Terminal Jabaquara - Vila Mariana,3,DDA0DD,FFFFFF
+R0015,SPTrans,8700-10,Terminal Grajaú - Interlagos,3,F08080,FFFFFF
+R0016,SPTrans,8700-22,Terminal Grajaú - Santo Amaro,3,98FB98,FFFFFF
+R0017,SPTrans,8800-15,Terminal A.E. Carvalho - Itaquera,3,87CEEB,FFFFFF
+R0018,SPTrans,8800-26,Terminal A.E. Carvalho - Penha,3,FFA07A,FFFFFF
+R0019,SPTrans,8900-35,Terminal São Miguel - Itaim Paulista,3,DEB887,FFFFFF
+R0020,SPTrans,8900-47,Terminal São Miguel - Ermelino Matarazzo,3,BC8F8F,FFFFFF
+R0021,SPTrans,9000-10,Metrô Tucuruvi - Terminal Santana,3,6495ED,FFFFFF
+R0022,SPTrans,9000-21,Metrô Tucuruvi - Vila Guilherme,3,CD5C5C,FFFFFF
+R0023,SPTrans,9100-15,Metrô Vila Madalena - Pinheiros,3,40E0D0,FFFFFF
+R0024,SPTrans,9100-28,Metrô Vila Madalena - Butantã,3,EE82EE,FFFFFF
+R0025,SPTrans,9200-31,Metrô Belém - Tatuapé,3,F0E68C,FFFFFF
+R0026,SPTrans,9200-42,Metrô Belém - Carrão,3,FA8072,FFFFFF
+R0027,SPTrans,9300-18,Metrô Conceição - Jabaquara,3,E0FFFF,FFFFFF
+R0028,SPTrans,9300-29,Metrô Conceição - São Judas,3,FFC0CB,FFFFFF
+R0029,SPTrans,9400-25,Metrô Corinthians-Itaquera - São Miguel,3,B0E0E6,FFFFFF
+R0030,SPTrans,9400-36,Metrô Corinthians-Itaquera - Cidade Tiradentes,3,FFB6C1,FFFFFF
+R0031,SPTrans,9500-12,Metrô Capão Redondo - Campo Limpo,3,FFDAB9,FFFFFF
+R0032,SPTrans,9500-24,Metrô Capão Redondo - Jardim Ângela,3,D8BFD8,FFFFFF
+R0033,SPTrans,9600-33,Metrô Tucuruvi - Santana,3,AFEEEE,FFFFFF
+R0034,SPTrans,9600-44,Metrô Tucuruvi - Casa Verde,3,DB7093,FFFFFF
+R0035,SPTrans,9700-51,CPTM Osasco - Lapa,3,F5DEB3,FFFFFF
+R0036,SPTrans,9700-62,CPTM Osasco - Pinheiros,3,FFE4E1,FFFFFF
+R0037,SPTrans,9800-17,CPTM Brás - Belém,3,FFF0F5,FFFFFF
+R0038,SPTrans,9800-28,CPTM Brás - Tatuapé,3,F0FFF0,FFFFFF
+R0039,SPTrans,9900-39,CPTM Santo Amaro - Morumbi,3,F5F5DC,FFFFFF
+R0040,SPTrans,9900-50,CPTM Santo Amaro - Pinheiros,3,FFF5EE,FFFFFF
+R0041,SPTrans,701J-10,Jardim Ângela - Terminal Capelinha,3,8B4513,FFFFFF
+R0042,SPTrans,702U-10,Cidade Universitária - Butantã,3,A0522D,FFFFFF
+R0043,SPTrans,703L-10,Lapa - Terminal Pinheiros,3,D2691E,FFFFFF
+R0044,SPTrans,704P-10,Pirituba - Freguesia do Ó,3,CD853F,FFFFFF
+R0045,SPTrans,705S-10,Santana - Casa Verde,3,F4A460,FFFFFF
+R0046,SPTrans,706T-10,Tatuapé - Vila Carrão,3,DEB887,FFFFFF
+R0047,SPTrans,707I-10,Itaquera - São Mateus,3,D2B48C,FFFFFF
+R0048,SPTrans,708M-10,São Miguel - Ermelino Matarazzo,3,BC8F8F,FFFFFF
+R0049,SPTrans,709C-10,Campo Limpo - Capão Redondo,3,F0E68C,FFFFFF
+R0050,SPTrans,710V-10,Vila Mariana - Ipiranga,3,BDB76B,FFFFFF
