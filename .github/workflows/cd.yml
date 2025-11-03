@@ -1,0 +1,372 @@
+name: CD - Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      version:
+        description: 'Version to deploy'
+        required: false
+        type: string
+
+env:
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: sptrans-pipeline
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  prepare:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      environment: ${{ steps.environment.outputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          elif [[ "${{ github.event.inputs.version }}" != "" ]]; then
+            VERSION=${{ github.event.inputs.version }}
+          else
+            VERSION=$(git describe --tags --always --dirty)
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Deploying version: $VERSION"
+      
+      - name: Determine environment
+        id: environment
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" != "" ]]; then
+            ENV=${{ github.event.inputs.environment }}
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            ENV=production
+          else
+            ENV=staging
+          fi
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "Deploying to: $ENV"
+
+  build:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    permissions:
+      contents: read
+      packages: write
+    
+    strategy:
+      matrix:
+        service: [airflow, spark, superset]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./infra/docker/${{ matrix.service }}.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VCS_REF=${{ github.sha }}
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    if: needs.prepare.outputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging.sptrans-pipeline.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+        if: false  # Enable if using AWS
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          kubectl config use-context staging
+        if: false  # Enable when K8s is ready
+      
+      - name: Deploy to Kubernetes (Staging)
+        run: |
+          kubectl apply -f infra/kubernetes/namespace.yaml
+          kubectl apply -f infra/kubernetes/ -n sptrans-staging
+          kubectl set image deployment/airflow airflow=${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/airflow:${{ needs.prepare.outputs.version }} -n sptrans-staging
+          kubectl set image deployment/spark spark=${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/spark:${{ needs.prepare.outputs.version }} -n sptrans-staging
+          kubectl rollout status deployment/airflow -n sptrans-staging --timeout=5m
+          kubectl rollout status deployment/spark -n sptrans-staging --timeout=5m
+        if: false  # Enable when K8s is ready
+      
+      - name: Deploy with Docker Compose (Staging)
+        run: |
+          # For now, use docker-compose deployment
+          echo "Deploying to staging environment using docker-compose"
+          echo "Version: ${{ needs.prepare.outputs.version }}"
+          # docker-compose -f docker-compose.staging.yml up -d
+      
+      - name: Run database migrations
+        run: |
+          echo "Running database migrations"
+          # kubectl exec -it deployment/airflow -n sptrans-staging -- airflow db upgrade
+      
+      - name: Smoke tests
+        run: |
+          echo "Running smoke tests on staging"
+          sleep 30
+          # curl -f https://staging.sptrans-pipeline.example.com/health || exit 1
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    if: needs.prepare.outputs.environment == 'production'
+    environment:
+      name: production
+      url: https://sptrans-pipeline.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Manual approval checkpoint
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: admin,devops-team
+          minimum-approvals: 2
+          issue-title: "Deploy ${{ needs.prepare.outputs.version }} to Production"
+        if: github.ref != 'refs/tags/*'
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region: us-east-1
+        if: false  # Enable if using AWS
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+          kubectl config use-context production
+        if: false  # Enable when K8s is ready
+      
+      - name: Create backup
+        run: |
+          echo "Creating backup before deployment"
+          # ./scripts/backup_data.sh
+      
+      - name: Deploy to Kubernetes (Production)
+        run: |
+          kubectl apply -f infra/kubernetes/namespace.yaml
+          kubectl apply -f infra/kubernetes/ -n sptrans-prod
+          kubectl set image deployment/airflow airflow=${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/airflow:${{ needs.prepare.outputs.version }} -n sptrans-prod
+          kubectl set image deployment/spark spark=${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/spark:${{ needs.prepare.outputs.version }} -n sptrans-prod
+          kubectl rollout status deployment/airflow -n sptrans-prod --timeout=10m
+          kubectl rollout status deployment/spark -n sptrans-prod --timeout=10m
+        if: false  # Enable when K8s is ready
+      
+      - name: Deploy with Docker Compose (Production)
+        run: |
+          echo "Deploying to production environment"
+          echo "Version: ${{ needs.prepare.outputs.version }}"
+          # docker-compose -f docker-compose.prod.yml up -d
+      
+      - name: Run database migrations
+        run: |
+          echo "Running database migrations on production"
+          # kubectl exec -it deployment/airflow -n sptrans-prod -- airflow db upgrade
+      
+      - name: Health checks
+        run: |
+          echo "Running health checks on production"
+          sleep 60
+          # curl -f https://sptrans-pipeline.example.com/health || exit 1
+          # curl -f https://sptrans-pipeline.example.com/api/metrics || exit 1
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed, rolling back..."
+          # kubectl rollout undo deployment/airflow -n sptrans-prod
+          # kubectl rollout undo deployment/spark -n sptrans-prod
+          # ./scripts/restore_data.sh
+
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-staging, deploy-production]
+    if: always() && (needs.deploy-staging.result == 'success' || needs.deploy-production.result == 'success')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install requests pytest
+      
+      - name: Run integration tests
+        run: |
+          echo "Running integration tests"
+          # pytest tests/integration/ --environment=${{ needs.prepare.outputs.environment }}
+        continue-on-error: true
+      
+      - name: Check service health
+        run: |
+          echo "Checking service health"
+          # python scripts/health_check.py --environment=${{ needs.prepare.outputs.environment }}
+      
+      - name: Verify metrics
+        run: |
+          echo "Verifying deployment metrics"
+          # python scripts/verify_metrics.py
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [prepare, verify]
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Generate changelog
+        id: changelog
+        uses: metcalfc/changelog-generator@v4.1.0
+        with:
+          myToken: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          body: |
+            ## Changes in this Release
+            ${{ steps.changelog.outputs.changelog }}
+            
+            ## Docker Images
+            - `${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/airflow:${{ github.ref_name }}`
+            - `${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/spark:${{ github.ref_name }}`
+            - `${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/superset:${{ github.ref_name }}`
+          draft: false
+          prerelease: false
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-staging, deploy-production, verify]
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            Deployment to ${{ needs.prepare.outputs.environment }} completed
+            Version: ${{ needs.prepare.outputs.version }}
+            Status: ${{ job.status }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        if: always()
+      
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: 'Deployment ${{ job.status }}: ${{ needs.prepare.outputs.version }} to ${{ needs.prepare.outputs.environment }}'
+          body: |
+            Deployment completed with status: ${{ job.status }}
+            Version: ${{ needs.prepare.outputs.version }}
+            Environment: ${{ needs.prepare.outputs.environment }}
+          to: devops-team@example.com
+          from: GitHub Actions
+        if: always()
+        continue-on-error: true

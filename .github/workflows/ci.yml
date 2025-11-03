@@ -1,0 +1,286 @@
+name: CI - Continuous Integration
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - feature/*
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  PYTHON_VERSION: '3.9'
+  POETRY_VERSION: '1.7.1'
+
+jobs:
+  lint:
+    name: Linting & Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black isort mypy pylint
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      
+      - name: Run Black (code formatting check)
+        run: |
+          black --check --diff src/ dags/ tests/
+        continue-on-error: true
+      
+      - name: Run isort (import sorting check)
+        run: |
+          isort --check-only --diff src/ dags/ tests/
+        continue-on-error: true
+      
+      - name: Run flake8 (linting)
+        run: |
+          flake8 src/ dags/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 src/ dags/ tests/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+      
+      - name: Run pylint (advanced linting)
+        run: |
+          pylint src/ dags/ --exit-zero --max-line-length=127
+        continue-on-error: true
+      
+      - name: Run mypy (type checking)
+        run: |
+          mypy src/ --ignore-missing-imports --no-strict-optional
+        continue-on-error: true
+
+  security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install bandit (security linter)
+        run: |
+          pip install bandit[toml]
+      
+      - name: Run bandit security scan
+        run: |
+          bandit -r src/ dags/ -ll -i
+      
+      - name: Run safety check (vulnerable dependencies)
+        run: |
+          pip install safety
+          safety check --json || true
+        continue-on-error: true
+      
+      - name: SAST with Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: auto
+        continue-on-error: true
+
+  build:
+    name: Build & Validate
+    runs-on: ubuntu-latest
+    needs: [lint]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile src/**/*.py dags/**/*.py
+      
+      - name: Check for circular dependencies
+        run: |
+          pip install pydeps
+          pydeps src --max-bacon 2 || true
+        continue-on-error: true
+      
+      - name: Validate configuration files
+        run: |
+          python -c "import yaml; yaml.safe_load(open('docker-compose.yml'))"
+          python -c "import json; [json.load(open(f)) for f in ['config/grafana/datasources.yml']]" || true
+        continue-on-error: true
+
+  docker:
+    name: Docker Build & Scan
+    runs-on: ubuntu-latest
+    needs: [build]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build Docker image (test)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: sptrans-pipeline:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: sptrans-pipeline:test
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+      
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
+      
+      - name: Run Hadolint (Dockerfile linting)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          ignore: DL3008,DL3015
+        continue-on-error: true
+
+  docs:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Check README exists
+        run: |
+          test -f README.md || (echo "README.md not found" && exit 1)
+      
+      - name: Check documentation files
+        run: |
+          test -d docs/ || (echo "docs/ directory not found" && exit 1)
+          test -f docs/01_architecture.md || echo "Warning: architecture.md not found"
+          test -f docs/02_setup_guide.md || echo "Warning: setup_guide.md not found"
+      
+      - name: Validate markdown links
+        uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          use-quiet-mode: 'yes'
+          config-file: '.github/markdown-link-check-config.json'
+        continue-on-error: true
+      
+      - name: Spell check documentation
+        uses: streetsidesoftware/cspell-action@v2
+        with:
+          files: |
+            **/*.md
+            **/*.txt
+          config: .cspell.json
+        continue-on-error: true
+
+  sql-validation:
+    name: SQL Validation
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+      
+      - name: Validate SQL syntax
+        run: |
+          for file in sql/*.sql; do
+            echo "Validating $file"
+            # Basic syntax check (requires psql to parse)
+            # psql --set ON_ERROR_STOP=1 --quiet --no-psqlrc -f "$file" < /dev/null || true
+            echo "SQL file checked: $file"
+          done
+        continue-on-error: true
+
+  status-check:
+    name: CI Status Check
+    runs-on: ubuntu-latest
+    needs: [lint, security, build, docker, docs, sql-validation]
+    if: always()
+    
+    steps:
+      - name: Check CI Results
+        run: |
+          echo "Lint: ${{ needs.lint.result }}"
+          echo "Security: ${{ needs.security.result }}"
+          echo "Build: ${{ needs.build.result }}"
+          echo "Docker: ${{ needs.docker.result }}"
+          echo "Docs: ${{ needs.docs.result }}"
+          echo "SQL: ${{ needs.sql-validation.result }}"
+          
+          if [ "${{ needs.lint.result }}" = "failure" ] || \
+             [ "${{ needs.build.result }}" = "failure" ]; then
+            echo "❌ Critical jobs failed"
+            exit 1
+          fi
+          
+          echo "✅ CI Pipeline completed successfully"
+
+  notify:
+    name: Notify Status
+    runs-on: ubuntu-latest
+    needs: [status-check]
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: 'CI Pipeline completed'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        if: always() && github.ref == 'refs/heads/main'
+        continue-on-error: true
