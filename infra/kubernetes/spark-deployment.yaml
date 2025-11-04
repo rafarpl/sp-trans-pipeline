@@ -53,7 +53,7 @@ spec:
       
       containers:
         - name: spark-master
-          image: bitnami/spark:3.5
+          image: bitnami/spark:3.5.0-debian-12-r3
           imagePullPolicy: IfNotPresent
           
           ports:
@@ -194,7 +194,7 @@ spec:
       
       containers:
         - name: spark-worker
-          image: bitnami/spark:3.5
+          image: bitnami/spark:3.5.0-debian-12-r3
           imagePullPolicy: IfNotPresent
           
           ports:
@@ -375,7 +375,7 @@ spec:
       
       containers:
         - name: spark-submit
-          image: bitnami/spark:3.5
+          image: bitnami/spark:3.5.0-debian-12-r3
           command:
             - spark-submit
             - --master

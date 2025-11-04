@@ -113,7 +113,7 @@ services:
   # SPARK MASTER
   # ==========================================================================
   spark-master:
-    image: bitnami/spark:3.5.0-debian-11-r0
+    image: bitnami/spark:3.5.0-debian-12-r3
     container_name: sptrans-spark-master
     restart: unless-stopped
     environment:
@@ -134,7 +134,7 @@ services:
   # SPARK WORKER 1
   # ==========================================================================
   spark-worker-1:
-    image: bitnami/spark:3.5.0-debian-11-r0
+    image: bitnami/spark:3.5.0-debian-12-r3
     container_name: sptrans-spark-worker-1
     restart: unless-stopped
     depends_on:
@@ -154,7 +154,7 @@ services:
   # SPARK WORKER 2
   # ==========================================================================
   spark-worker-2:
-    image: bitnami/spark:3.5.0-debian-11-r0
+    image: bitnami/spark:3.5.0-debian-12-r3
     container_name: sptrans-spark-worker-2
     restart: unless-stopped
     depends_on:
