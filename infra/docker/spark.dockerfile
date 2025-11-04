@@ -5,7 +5,7 @@
 # Base: Bitnami Spark 3.5
 # =============================================================================
 
-FROM bitnami/spark:3.5
+FROM bitnami/spark:3.5.0-debian-12-r3
 
 # Metadata
 LABEL maintainer="rafael@sptrans-pipeline.com"
