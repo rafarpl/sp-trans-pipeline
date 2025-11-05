@@ -1,334 +1,202 @@
 """
-Configurações centralizadas do projeto.
-Carrega variáveis de ambiente e fornece acesso tipado.
+Configuration management using Pydantic for type safety and validation.
+All environment variables are loaded and validated here.
 """
-import os
+
+from pydantic import Field
+from pydantic_settings import BaseSettings
+from functools import lru_cache
 from typing import Optional
-from dotenv import load_dotenv
-from pydantic import BaseSettings, Field, validator
+import os
 
 
-# Carregar variáveis de ambiente
-load_dotenv()
-
-
-class SPTransAPIConfig(BaseSettings):
-    """Configurações da API SPTrans."""
+class PostgresConfig(BaseSettings):
+    """PostgreSQL database configuration"""
     
-    token: str = Field(..., env='SPTRANS_API_TOKEN')
-    base_url: str = Field(
-        default='https://api.olhovivo.sptrans.com.br/v2.1',
-        env='SPTRANS_API_BASE_URL'
-    )
-    timeout: int = Field(default=30, env='SPTRANS_API_TIMEOUT')
-    max_retries: int = Field(default=3, env='SPTRANS_API_MAX_RETRIES')
-    retry_delay: int = Field(default=5, env='SPTRANS_API_RETRY_DELAY')
+    host: str = Field(default="postgres", env="POSTGRES_HOST")
+    port: int = Field(default=5432, env="POSTGRES_PORT")
+    user: str = Field(default="sptrans", env="POSTGRES_USER")
+    password: str = Field(default="sptrans123", env="POSTGRES_PASSWORD")
+    database: str = Field(default="sptrans", env="POSTGRES_DB")
     
-    @validator('token')
-    def validate_token(cls, v):
-        if not v or v == 'seu_token_aqui':
-            raise ValueError(
-                'SPTRANS_API_TOKEN não configurado. '
-                'Obtenha um token em https://www.sptrans.com.br/desenvolvedores/'
-            )
-        return v
+    @property
+    def connection_string(self) -> str:
+        """Generate SQLAlchemy connection string"""
+        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
     
     class Config:
-        env_file = '.env'
+        env_file = ".env"
         case_sensitive = False
 
 
-class MinIOConfig(BaseSettings):
-    """Configurações do MinIO (Data Lake)."""
+class RedisConfig(BaseSettings):
+    """Redis cache configuration"""
     
-    endpoint: str = Field(default='minio:9000', env='MINIO_ENDPOINT')
-    access_key: str = Field(default='minioadmin', env='MINIO_ROOT_USER')
-    secret_key: str = Field(default='minioadmin123', env='MINIO_ROOT_PASSWORD')
-    use_ssl: bool = Field(default=False, env='MINIO_USE_SSL')
-    
-    # Buckets
-    bucket_bronze: str = Field(default='sptrans-bronze', env='MINIO_BUCKET_BRONZE')
-    bucket_silver: str = Field(default='sptrans-silver', env='MINIO_BUCKET_SILVER')
-    bucket_gold: str = Field(default='sptrans-gold', env='MINIO_BUCKET_GOLD')
+    host: str = Field(default="redis", env="REDIS_HOST")
+    port: int = Field(default=6379, env="REDIS_PORT")
+    db: int = Field(default=0, env="REDIS_DB")
+    password: Optional[str] = Field(default=None, env="REDIS_PASSWORD")
     
     @property
-    def s3a_endpoint(self) -> str:
-        """Endpoint no formato s3a://"""
-        protocol = 'https' if self.use_ssl else 'http'
+    def connection_url(self) -> str:
+        """Generate Redis connection URL"""
+        if self.password:
+            return f"redis://:{self.password}@{self.host}:{self.port}/{self.db}"
+        return f"redis://{self.host}:{self.port}/{self.db}"
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+
+
+class MinioConfig(BaseSettings):
+    """MinIO (S3-compatible) storage configuration"""
+    
+    endpoint: str = Field(default="minio:9000", env="MINIO_ENDPOINT")
+    access_key: str = Field(default="minioadmin", env="MINIO_ROOT_USER")
+    secret_key: str = Field(default="minioadmin123", env="MINIO_ROOT_PASSWORD")
+    bucket: str = Field(default="sptrans-datalake", env="MINIO_BUCKET")
+    use_ssl: bool = Field(default=False, env="MINIO_USE_SSL")
+    region: str = Field(default="us-east-1", env="MINIO_REGION")
+    
+    @property
+    def s3_endpoint(self) -> str:
+        """Generate S3 endpoint URL"""
+        protocol = "https" if self.use_ssl else "http"
         return f"{protocol}://{self.endpoint}"
     
     class Config:
-        env_file = '.env'
-
-
-class PostgreSQLConfig(BaseSettings):
-    """Configurações do PostgreSQL."""
-    
-    host: str = Field(default='postgres', env='POSTGRES_HOST')
-    port: int = Field(default=5432, env='POSTGRES_PORT')
-    database: str = Field(default='sptrans', env='POSTGRES_DB_SPTRANS')
-    user: str = Field(default='airflow', env='POSTGRES_USER')
-    password: str = Field(default='airflow123', env='POSTGRES_PASSWORD')
-    
-    # Schemas
-    schema_serving: str = Field(default='serving', env='POSTGRES_SCHEMA_SERVING')
-    schema_metadata: str = Field(default='metadata', env='POSTGRES_SCHEMA_METADATA')
-    
-    @property
-    def connection_string(self) -> str:
-        """SQLAlchemy connection string."""
-        return (
-            f"postgresql://{self.user}:{self.password}@"
-            f"{self.host}:{self.port}/{self.database}"
-        )
-    
-    @property
-    def jdbc_url(self) -> str:
-        """JDBC URL para Spark."""
-        return f"jdbc:postgresql://{self.host}:{self.port}/{self.database}"
-    
-    class Config:
-        env_file = '.env'
-
-
-class RedisConfig(BaseSettings):
-    """Configurações do Redis."""
-    
-    host: str = Field(default='redis', env='REDIS_HOST')
-    port: int = Field(default=6379, env='REDIS_PORT')
-    password: str = Field(default='redis123', env='REDIS_PASSWORD')
-    db: int = Field(default=0, env='REDIS_DB')
-    
-    @property
-    def connection_string(self) -> str:
-        """Redis connection string."""
-        return f"redis://:{self.password}@{self.host}:{self.port}/{self.db}"
-    
-    class Config:
-        env_file = '.env'
+        env_file = ".env"
+        case_sensitive = False
 
 
 class SparkConfig(BaseSettings):
-    """Configurações do Spark."""
+    """Apache Spark configuration"""
     
-    master: str = Field(default='spark://spark-master:7077', env='SPARK_MASTER_HOST')
-    app_name: str = Field(default='SPTransPipeline')
-    
-    # Driver
-    driver_memory: str = Field(default='2g', env='SPARK_DRIVER_MEMORY')
-    
-    # Executor
-    executor_memory: str = Field(default='4g', env='SPARK_EXECUTOR_MEMORY')
-    executor_cores: int = Field(default=2, env='SPARK_WORKER_CORES')
-    
-    # Parallelism
-    default_parallelism: int = Field(default=12)
-    sql_shuffle_partitions: int = Field(default=8)
+    master: str = Field(default="spark://spark-master:7077", env="SPARK_MASTER")
+    app_name: str = Field(default="SPTrans-Pipeline", env="SPARK_APP_NAME")
+    executor_memory: str = Field(default="2g", env="SPARK_EXECUTOR_MEMORY")
+    driver_memory: str = Field(default="2g", env="SPARK_DRIVER_MEMORY")
     
     class Config:
-        env_file = '.env'
+        env_file = ".env"
+        case_sensitive = False
 
 
-class PipelineConfig(BaseSettings):
-    """Configurações do pipeline de dados."""
+class SPTransAPIConfig(BaseSettings):
+    """SPTrans API configuration"""
     
-    # Frequências de ingestão (em minutos)
-    api_ingestion_interval: int = Field(
-        default=2, 
-        env='API_INGESTION_INTERVAL_MINUTES'
-    )
-    bronze_to_silver_interval: int = Field(
-        default=10, 
-        env='BRONZE_TO_SILVER_INTERVAL_MINUTES'
-    )
-    silver_to_gold_interval: int = Field(
-        default=15, 
-        env='SILVER_TO_GOLD_INTERVAL_MINUTES'
-    )
-    gold_to_serving_interval: int = Field(
-        default=15, 
-        env='GOLD_TO_SERVING_INTERVAL_MINUTES'
-    )
-    
-    # Data Quality
-    dq_score_threshold: float = Field(default=95.0, env='DQ_SCORE_THRESHOLD')
-    dq_critical_threshold: float = Field(default=85.0, env='DQ_CRITICAL_THRESHOLD')
-    
-    # Retenção de dados (em dias)
-    retention_bronze: int = Field(default=90, env='DATA_RETENTION_BRONZE_DAYS')
-    retention_silver: int = Field(default=90, env='DATA_RETENTION_SILVER_DAYS')
-    retention_gold: int = Field(default=365, env='DATA_RETENTION_GOLD_DAYS')
-    retention_serving: int = Field(default=7, env='DATA_RETENTION_SERVING_DAYS')
-    
-    # Batch sizes
-    batch_size_api: int = Field(default=15000, env='BATCH_SIZE_API_INGESTION')
-    batch_size_bronze_silver: int = Field(default=100000, env='BATCH_SIZE_BRONZE_TO_SILVER')
-    batch_size_silver_gold: int = Field(default=50000, env='BATCH_SIZE_SILVER_TO_GOLD')
+    token: str = Field(..., env="SPTRANS_API_TOKEN")  # Required!
+    base_url: str = Field(default="http://api.olhovivo.sptrans.com.br/v2.1", env="SPTRANS_API_BASE_URL")
+    timeout: int = Field(default=30, env="SPTRANS_API_TIMEOUT")
+    max_retries: int = Field(default=3, env="SPTRANS_API_MAX_RETRIES")
+    retry_delay: int = Field(default=5, env="SPTRANS_API_RETRY_DELAY")
     
     class Config:
-        env_file = '.env'
+        env_file = ".env"
+        case_sensitive = False
+
+
+class DataIngestionConfig(BaseSettings):
+    """Data ingestion configuration"""
+    
+    api_polling_interval: int = Field(default=180, env="API_POLLING_INTERVAL_SECONDS")  # 3 minutes
+    gtfs_update_schedule: str = Field(default="0 3 * * *", env="GTFS_UPDATE_SCHEDULE")  # Daily at 3 AM
+    data_retention_days: int = Field(default=30, env="DATA_RETENTION_DAYS")
+    batch_size: int = Field(default=1000, env="BATCH_SIZE")
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+
+
+class DataQualityConfig(BaseSettings):
+    """Data quality configuration"""
+    
+    check_interval: int = Field(default=60, env="DQ_CHECK_INTERVAL_MINUTES")
+    alert_threshold: float = Field(default=0.95, env="DQ_ALERT_THRESHOLD")
+    enable_checks: bool = Field(default=True, env="ENABLE_DATA_QUALITY_CHECKS")
+    null_threshold: float = Field(default=0.05, env="DQ_NULL_THRESHOLD")
+    duplicate_threshold: float = Field(default=0.01, env="DQ_DUPLICATE_THRESHOLD")
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+
+
+class MonitoringConfig(BaseSettings):
+    """Monitoring and observability configuration"""
+    
+    enable_prometheus: bool = Field(default=True, env="ENABLE_PROMETHEUS")
+    enable_grafana: bool = Field(default=True, env="ENABLE_GRAFANA")
+    metrics_port: int = Field(default=9091, env="METRICS_PORT")
+    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+
+
+class GeocodingConfig(BaseSettings):
+    """Geocoding configuration (Nominatim)"""
+    
+    api_url: str = Field(default="https://nominatim.openstreetmap.org", env="GEOCODING_API_URL")
+    rate_limit: float = Field(default=1.0, env="GEOCODING_RATE_LIMIT")  # requests per second
+    user_agent: str = Field(default="SPTrans-Pipeline/1.0", env="GEOCODING_USER_AGENT")
+    timeout: int = Field(default=10, env="GEOCODING_TIMEOUT")
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
 
 
 class AppConfig(BaseSettings):
-    """Configurações gerais da aplicação."""
+    """Main application configuration"""
     
-    environment: str = Field(default='development', env='ENVIRONMENT')
-    log_level: str = Field(default='INFO', env='LOG_LEVEL')
-    timezone: str = Field(default='America/Sao_Paulo', env='TZ')
+    env: str = Field(default="development", env="APP_ENV")
+    debug: bool = Field(default=False, env="APP_DEBUG")
+    timezone: str = Field(default="America/Sao_Paulo", env="TZ")
+    project_name: str = Field(default="SPTrans Real-Time Pipeline", env="PROJECT_NAME")
+    version: str = Field(default="1.0.0", env="APP_VERSION")
     
-    project_name: str = Field(default='sptrans-realtime-pipeline', env='PROJECT_NAME')
-    project_version: str = Field(default='1.0.0', env='PROJECT_VERSION')
-    
-    # Feature Flags
-    enable_metrics: bool = Field(default=True, env='ENABLE_METRICS')
-    enable_tracing: bool = Field(default=False, env='ENABLE_TRACING')
-    
-    # Geocoding
-    geocoding_enabled: bool = Field(default=True, env='GEOCODING_ENABLED')
-    geocoding_provider: str = Field(default='nominatim', env='GEOCODING_PROVIDER')
-    
-    @validator('environment')
-    def validate_environment(cls, v):
-        allowed = ['development', 'staging', 'production']
-        if v not in allowed:
-            raise ValueError(f'Environment deve ser um de: {allowed}')
-        return v
-    
-    @validator('log_level')
-    def validate_log_level(cls, v):
-        allowed = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
-        if v.upper() not in allowed:
-            raise ValueError(f'Log level deve ser um de: {allowed}')
-        return v.upper()
-    
-    @property
-    def is_development(self) -> bool:
-        return self.environment == 'development'
+    # Sub-configurations
+    postgres: PostgresConfig = PostgresConfig()
+    redis: RedisConfig = RedisConfig()
+    minio: MinioConfig = MinioConfig()
+    spark: SparkConfig = SparkConfig()
+    sptrans_api: SPTransAPIConfig = SPTransAPIConfig()
+    data_ingestion: DataIngestionConfig = DataIngestionConfig()
+    data_quality: DataQualityConfig = DataQualityConfig()
+    monitoring: MonitoringConfig = MonitoringConfig()
+    geocoding: GeocodingConfig = GeocodingConfig()
     
     @property
     def is_production(self) -> bool:
-        return self.environment == 'production'
+        """Check if running in production"""
+        return self.env.lower() == "production"
+    
+    @property
+    def is_development(self) -> bool:
+        """Check if running in development"""
+        return self.env.lower() == "development"
     
     class Config:
-        env_file = '.env'
+        env_file = ".env"
+        case_sensitive = False
 
 
-class Config:
+@lru_cache()
+def get_config() -> AppConfig:
     """
-    Classe principal de configuração.
-    Agrega todas as configurações do projeto.
+    Get cached application configuration.
+    
+    Using lru_cache ensures we only load config once per process.
+    
+    Returns:
+        AppConfig: Application configuration object
     """
-    
-    def __init__(self):
-        self.app = AppConfig()
-        self.sptrans_api = SPTransAPIConfig()
-        self.minio = MinIOConfig()
-        self.postgres = PostgreSQLConfig()
-        self.redis = RedisConfig()
-        self.spark = SparkConfig()
-        self.pipeline = PipelineConfig()
-    
-    def __repr__(self) -> str:
-        return (
-            f"Config("
-            f"environment={self.app.environment}, "
-            f"project={self.app.project_name})"
-        )
-    
-    def validate(self) -> bool:
-        """Valida todas as configurações."""
-        try:
-            # Tenta instanciar todas as configs
-            _ = self.app
-            _ = self.sptrans_api
-            _ = self.minio
-            _ = self.postgres
-            _ = self.redis
-            _ = self.spark
-            _ = self.pipeline
-            return True
-        except Exception as e:
-            print(f"Erro na validação de configurações: {e}")
-            return False
-    
-    def get_spark_config(self) -> dict:
-        """
-        Retorna configurações do Spark no formato para SparkSession.
-        """
-        return {
-            # Master
-            'spark.master': self.spark.master,
-            'spark.app.name': self.spark.app_name,
-            
-            # Driver
-            'spark.driver.memory': self.spark.driver_memory,
-            
-            # Executor
-            'spark.executor.memory': self.spark.executor_memory,
-            'spark.executor.cores': str(self.spark.executor_cores),
-            
-            # Parallelism
-            'spark.default.parallelism': str(self.spark.default_parallelism),
-            'spark.sql.shuffle.partitions': str(self.spark.sql_shuffle_partitions),
-            
-            # Delta Lake
-            'spark.sql.extensions': 'io.delta.sql.DeltaSparkSessionExtension',
-            'spark.sql.catalog.spark_catalog': 'org.apache.spark.sql.delta.catalog.DeltaCatalog',
-            
-            # S3/MinIO
-            'spark.hadoop.fs.s3a.endpoint': self.minio.s3a_endpoint,
-            'spark.hadoop.fs.s3a.access.key': self.minio.access_key,
-            'spark.hadoop.fs.s3a.secret.key': self.minio.secret_key,
-            'spark.hadoop.fs.s3a.path.style.access': 'true',
-            'spark.hadoop.fs.s3a.impl': 'org.apache.hadoop.fs.s3a.S3AFileSystem',
-            
-            # AQE
-            'spark.sql.adaptive.enabled': 'true',
-            'spark.sql.adaptive.coalescePartitions.enabled': 'true',
-        }
+    return AppConfig()
 
 
-# Instância global de configuração
-config = Config()
-
-
-# Funções auxiliares para acesso rápido
-def get_config() -> Config:
-    """Retorna instância global de configuração."""
-    return config
-
-
-def get_sptrans_api_config() -> SPTransAPIConfig:
-    """Retorna configurações da API SPTrans."""
-    return config.sptrans_api
-
-
-def get_minio_config() -> MinIOConfig:
-    """Retorna configurações do MinIO."""
-    return config.minio
-
-
-def get_postgres_config() -> PostgreSQLConfig:
-    """Retorna configurações do PostgreSQL."""
-    return config.postgres
-
-
-def get_spark_config() -> dict:
-    """Retorna configurações do Spark."""
-    return config.get_spark_config()
-
-
-if __name__ == '__main__':
-    # Teste de configuração
-    cfg = get_config()
-    print(f"✓ Configuração carregada: {cfg}")
-    print(f"✓ Environment: {cfg.app.environment}")
-    print(f"✓ Log Level: {cfg.app.log_level}")
-    print(f"✓ API Token: {cfg.sptrans_api.token[:10]}...")
-    print(f"✓ MinIO Endpoint: {cfg.minio.endpoint}")
-    print(f"✓ PostgreSQL: {cfg.postgres.connection_string}")
-    
-    if cfg.validate():
-        print("✓ Todas as configurações são válidas!")
-    else:
-        print("✗ Erro na validação de configurações!")
+# Export convenience instances
+config = get_config()

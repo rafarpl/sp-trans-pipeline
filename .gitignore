@@ -1,13 +1,10 @@
 # ============================================================================
-# SPTRANS PIPELINE - .gitignore
-# ============================================================================
-# Arquivos e diretórios ignorados pelo Git
+# SPTrans Pipeline - .gitignore
 # ============================================================================
 
-# ============================================================================
+# ====================
 # PYTHON
-# ============================================================================
-
+# ====================
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -30,11 +27,20 @@ parts/
 sdist/
 var/
 wheels/
+pip-wheel-metadata/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
 
 # PyInstaller
 *.manifest
@@ -50,169 +56,87 @@ htmlcov/
 nosetests.xml
 coverage.xml
 *.cover
-*.py,cover
+*.log
 .hypothesis/
 .pytest_cache/
-cover/
-
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-.pybuilder/
-target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-*.ipynb_checkpoints/
-
-# IPython
-profile_default/
-ipython_config.py
+*.ipynb
 
 # pyenv
 .python-version
 
-# pipenv
-Pipfile.lock
-
-# poetry
-poetry.lock
-
-# pdm
-.pdm.toml
-
-# PEP 582
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
 # Environments
 .env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+.env.local
+.env.*.local
 
-# Spyder project settings
-.spyderproject
-.spyproject
+# ====================
+# SPARK
+# ====================
+spark-warehouse/
+metastore_db/
+derby.log
+*.parquet
+*.orc
 
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# ============================================================================
+# ====================
 # AIRFLOW
-# ============================================================================
-
-# Airflow
+# ====================
 airflow.db
 airflow.cfg
-airflow-webserver.pid
-airflow-scheduler.pid
 logs/
-dags/__pycache__/
-plugins/__pycache__/
-standalone_admin_password.txt
-webserver_config.py
+*.pid
+unittests.cfg
+airflow-webserver.pid
 
-# ============================================================================
-# SPARK
-# ============================================================================
-
-# Spark
-derby.log
-metastore_db/
-spark-warehouse/
-*.parquet
-*.avro
-*.orc
-
-# ============================================================================
-# DATA FILES
-# ============================================================================
-
-# Dados locais (não versionar dados sensíveis)
-data/
+# ====================
+# DATA
+# ====================
+# Data files
 *.csv
 *.json
+*.xml
 *.txt
 *.parquet
-*.avro
 *.orc
-*.xlsx
-*.xls
+*.avro
 
-# Exceto arquivos de exemplo
-!data/samples/
-!tests/fixtures/*.csv
-!tests/fixtures/*.json
+# Directories
+data/
+raw/
+processed/
+bronze/
+silver/
+gold/
+temp/
+tmp/
+cache/
 
-# GTFS files
-gtfs/
-*.zip
-gtfs*.txt
+# MinIO/S3
+.minio.sys/
 
-# Backups
-backups/
-*.sql
+# ====================
+# DATABASES
+# ====================
+*.db
+*.sqlite
+*.sqlite3
+*.sql.gz
+
+# PostgreSQL
 *.dump
-*.tar.gz
-*.bak
 
-# ============================================================================
+# ====================
 # DOCKER
-# ============================================================================
-
-# Docker volumes
-volumes/
+# ====================
 docker-compose.override.yml
+.dockerignore
 
-# ============================================================================
-# IDE / EDITORS
-# ============================================================================
-
+# ====================
+# IDEs
+# ====================
 # VSCode
 .vscode/
 *.code-workspace
@@ -221,234 +145,123 @@ docker-compose.override.yml
 .idea/
 *.iml
 *.iws
-.idea_modules/
 
 # Sublime Text
 *.sublime-project
 *.sublime-workspace
 
-# Vim
-*.swp
-*.swo
-*~
-
-# Emacs
-*~
-\#*\#
-.\#*
-
-# ============================================================================
-# OS SPECIFIC
-# ============================================================================
-
+# ====================
+# OS
+# ====================
 # macOS
 .DS_Store
 .AppleDouble
 .LSOverride
-Icon
-._*
-.DocumentRevisions-V100
-.fseventsd
-.Spotlight-V100
-.TemporaryItems
-.Trashes
-.VolumeIcon.icns
-.com.apple.timemachine.donotpresent
-.AppleDB
-.AppleDesktop
-Network Trash Folder
-Temporary Items
-.apdisk
 
 # Windows
 Thumbs.db
-Thumbs.db:encryptable
 ehthumbs.db
-ehthumbs_vista.db
-*.stackdump
-[Dd]esktop.ini
+Desktop.ini
 $RECYCLE.BIN/
-*.cab
-*.msi
-*.msix
-*.msm
-*.msp
-*.lnk
 
 # Linux
 *~
+.directory
 
-# ============================================================================
+# ====================
 # LOGS
-# ============================================================================
-
-logs/
+# ====================
 *.log
-*.out
-*.err
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+logs/
+*.log.*
 
-# ============================================================================
-# DATABASES
-# ============================================================================
+# ====================
+# BACKUPS
+# ====================
+*.bak
+*.backup
+*.old
+*.orig
 
-# PostgreSQL
-*.sql
-*.dump
-pgdata/
-
-# SQLite
-*.sqlite
-*.db
-
-# ============================================================================
-# SECRETS & CREDENTIALS
-# ============================================================================
-
-# Environment variables
-.env
-.env.local
-.env.*.local
-.env.production
-.env.development
-
-# Credentials
-credentials/
+# ====================
+# SECRETS
+# ====================
 secrets/
-*.pem
+credentials/
 *.key
+*.pem
 *.crt
-*.cer
 *.p12
-*.pfx
-*.keystore
-*.jks
 
-# API tokens
-token.txt
-api_key.txt
+# API Keys
+*_api_key*
+*_secret*
+*_token*
 
-# ============================================================================
-# TEMPORARY FILES
-# ============================================================================
-
-# Temporary directories
-tmp/
-temp/
+# ====================
+# TEMPORARY
+# ====================
+*.tmp
+*.temp
 .tmp/
+.temp/
 
-# Cache
-.cache/
-*.cache
+# ====================
+# NOTEBOOKS OUTPUT
+# ====================
+notebooks/output/
+notebooks/checkpoints/
 
-# ============================================================================
-# PROJECT SPECIFIC
-# ============================================================================
-
-# MinIO data
-minio-data/
-
-# Postgres data
-postgres-data/
-
-# Prometheus data
-prometheus-data/
-
-# Grafana data
-grafana-data/
-
-# Redis data
-redis-data/
-
-# Outputs temporários
-outputs/
-output/
-
-# Checkpoints
-checkpoints/
-*.ckpt
-
-# Models (se usar ML)
-models/
-*.pkl
-*.joblib
-*.h5
-*.pt
-*.pth
-
-# ============================================================================
+# ====================
 # DOCUMENTATION
-# ============================================================================
+# ====================
+docs/_build/
+docs/.doctrees/
+site/
 
-# Generated documentation
-_build/
-_static/
-_templates/
-
-# ============================================================================
-# TESTING
-# ============================================================================
-
-# Test outputs
-test-results/
-test-reports/
-.tox/
-
-# ============================================================================
+# ====================
 # MONITORING
-# ============================================================================
-
-# Prometheus
+# ====================
 prometheus/data/
-
-# Grafana
 grafana/data/
 
-# ============================================================================
+# ====================
 # MISC
-# ============================================================================
+# ====================
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
 
-# Compressed files
-*.zip
-*.tar
-*.tar.gz
-*.tgz
-*.rar
-*.7z
+# ====================
+# PROJECT SPECIFIC
+# ====================
+# GTFS cache
+gtfs_cache/
 
-# Large files
-*.bin
-*.exe
+# API responses cache
+api_cache/
 
-# Lock files
-*.lock
-package-lock.json
+# Test outputs
+test_output/
+test_data/
 
-# Node modules (se usar JS)
-node_modules/
-
-# ============================================================================
-# ALLOWED EXCEPTIONS
-# ============================================================================
-
-# Manter arquivos de exemplo
-!data/samples/
-!data/samples/**
-!tests/fixtures/
-!tests/fixtures/**
-
-# Manter templates
-!.env.example
-!config/examples/
-!sql/examples/
-
-# Manter documentação
-!docs/**/*.md
-!docs/**/*.png
-!docs/**/*.jpg
+# Spark checkpoints
+checkpoints/
+_spark_metadata/
 
 # ============================================================================
-# END
+# NOTES
+# ============================================================================
+# 
+# Este .gitignore é configurado para:
+# 1. Evitar commit de dados sensíveis (credenciais, secrets)
+# 2. Evitar commit de dados grandes (parquet, csv)
+# 3. Evitar commit de arquivos temporários
+# 4. Manter repositório limpo e profissional
+#
+# Para forçar add de arquivo ignorado: git add -f <file>
+#
 # ============================================================================

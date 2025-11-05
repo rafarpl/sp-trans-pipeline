@@ -1,315 +1,419 @@
 """
-GTFS to Bronze Ingestion Job
-=============================
-Job Spark para ingestão de dados GTFS (CSV) para a camada Bronze (Parquet).
+Job Spark: Ingestão de dados GTFS para camada Bronze.
 
-Processa os arquivos:
-- routes.txt
-- trips.txt
-- stops.txt
-- stop_times.txt
-- shapes.txt
-- calendar.txt
-- agency.txt
+Faz download dos arquivos GTFS estáticos, converte para formato
+Parquet e armazena no Data Lake na camada Bronze.
 """
 
-from typing import Dict, Any, List, Optional
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional
 
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import *
 
-from src.common.logging_config import get_logger
-from src.common.config import Config
-from src.common.metrics import track_job_execution, reporter
-from src.ingestion.schema_definitions import GTFSSchemas
+from ...common.config import Config
+from ...common.constants import (
+    BUCKET_BRONZE,
+    FORMAT_BRONZE,
+    PREFIX_GTFS_STATIC,
+)
+from ...common.exceptions import ProcessingException, StorageWriteException
+from ...common.logging_config import get_logger
+from ...common.metrics import (
+    records_processed_total,
+    track_pipeline_run,
+    update_processing_metrics,
+)
+from ...common.utils import generate_uuid, get_s3_path
+from ...ingestion.gtfs_downloader import GTFSDownloader
+from ...ingestion.schema_definitions import get_gtfs_schema
 
 logger = get_logger(__name__)
 
+# Arquivos GTFS a processar
+GTFS_FILES_TO_PROCESS = [
+    "stops",
+    "routes",
+    "trips",
+    "stop_times",
+    "shapes",
+]
+
 
 class GTFSToBronzeJob:
-    """Job de ingestão GTFS para Bronze layer."""
+    """
+    Job Spark para ingestão de dados GTFS para Bronze.
     
-    def __init__(self, 
-                 input_path: str,
-                 output_path: str,
-                 execution_date: Optional[datetime] = None):
+    Responsabilidades:
+    - Download do feed GTFS
+    - Extração dos arquivos
+    - Conversão para Parquet com schema validado
+    - Armazenamento no Data Lake (MinIO/S3)
+    """
+
+    def __init__(
+        self,
+        spark: Optional[SparkSession] = None,
+        config: Optional[Config] = None,
+        job_id: Optional[str] = None,
+    ):
         """
         Inicializa job.
-        
+
         Args:
-            input_path: Caminho dos arquivos CSV do GTFS
-            output_path: Caminho de saída no Data Lake (S3/MinIO)
-            execution_date: Data de execução (usa agora se None)
+            spark: SparkSession (cria nova se None)
+            config: Configuração
+            job_id: ID do job
         """
-        self.input_path = Path(input_path)
-        self.output_path = output_path
-        self.execution_date = execution_date or datetime.now()
+        self.config = config or Config()
+        self.job_id = job_id or generate_uuid()
         
-        # Configurações
-        self.config = Config()
+        # SparkSession
+        self.spark = spark or self._create_spark_session()
         
-        # Schemas GTFS
-        self.schemas = GTFSSchemas()
+        # GTFS Downloader
+        self.gtfs_downloader = GTFSDownloader(config=self.config)
         
-        # Estatísticas
-        self.stats = {
-            'files_processed': 0,
-            'total_records': 0,
-            'failed_files': []
-        }
+        # Paths
+        self.bronze_bucket = BUCKET_BRONZE
+        self.bronze_prefix = PREFIX_GTFS_STATIC
         
-        logger.info(f"GTFSToBronzeJob inicializado: input={input_path}, output={output_path}")
-    
-    def _create_spark_session(self) -> SparkSession:
-        """Cria sessão Spark com configurações otimizadas."""
-        logger.info("Criando sessão Spark")
-        
-        spark = SparkSession.builder \
-            .appName("GTFS_to_Bronze_Ingestion") \
-            .config("spark.driver.memory", "2g") \
-            .config("spark.executor.memory", "2g") \
-            .config("spark.sql.adaptive.enabled", "true") \
-            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-            .config("spark.hadoop.fs.s3a.endpoint", self.config.MINIO_ENDPOINT) \
-            .config("spark.hadoop.fs.s3a.access.key", self.config.MINIO_ROOT_USER) \
-            .config("spark.hadoop.fs.s3a.secret.key", self.config.MINIO_ROOT_PASSWORD) \
-            .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-            .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
-            .getOrCreate()
-        
-        spark.sparkContext.setLogLevel("WARN")
-        
-        logger.info(f"Spark session criada: {spark.version}")
-        
-        return spark
-    
-    def _get_partition_path(self) -> str:
-        """
-        Retorna path particionado por data.
-        
-        Returns:
-            Path com partições (ex: year=2025/month=01/day=20/)
-        """
-        return (
-            f"year={self.execution_date.year}/"
-            f"month={self.execution_date.month:02d}/"
-            f"day={self.execution_date.day:02d}"
+        logger.info(
+            "GTFSToBronzeJob initialized",
+            extra={
+                "job_id": self.job_id,
+                "bronze_bucket": self.bronze_bucket,
+                "bronze_prefix": self.bronze_prefix,
+            },
         )
-    
-    def _read_gtfs_file(self, spark: SparkSession, 
-                       filename: str, 
-                       schema: StructType) -> Optional[DataFrame]:
+
+    def _create_spark_session(self) -> SparkSession:
+        """Cria SparkSession configurada."""
+        return (
+            SparkSession.builder
+            .appName(f"SPTrans_GTFS_to_Bronze_{self.job_id}")
+            .config("spark.hadoop.fs.s3a.endpoint", self.config.minio.endpoint)
+            .config("spark.hadoop.fs.s3a.access.key", self.config.minio.access_key)
+            .config("spark.hadoop.fs.s3a.secret.key", self.config.minio.secret_key)
+            .config("spark.hadoop.fs.s3a.path.style.access", "true")
+            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+            .getOrCreate()
+        )
+
+    @track_pipeline_run(stage="bronze", job_name="gtfs_to_bronze")
+    def run(
+        self,
+        force_download: bool = False,
+        files_to_process: Optional[List[str]] = None,
+    ) -> Dict[str, any]:
         """
-        Lê arquivo GTFS CSV.
-        
+        Executa job de ingestão GTFS.
+
         Args:
-            spark: Sessão Spark
-            filename: Nome do arquivo (ex: 'routes.txt')
-            schema: Schema Spark para o arquivo
-        
+            force_download: Se True, força novo download do GTFS
+            files_to_process: Lista de arquivos GTFS (None = todos)
+
         Returns:
-            DataFrame ou None se falhar
+            Dicionário com estatísticas
+
+        Raises:
+            ProcessingException: Se job falhar
         """
-        filepath = self.input_path / filename
-        
-        if not filepath.exists():
-            logger.warning(f"Arquivo não encontrado: {filepath}")
-            return None
-        
-        logger.info(f"Lendo {filename}...")
-        
         try:
-            df = spark.read.csv(
-                str(filepath),
-                header=True,
-                schema=schema,
-                encoding='utf-8',
-                quote='"',
-                escape='"',
-                multiLine=True
+            logger.info(
+                "Starting GTFS to Bronze ingestion",
+                extra={"job_id": self.job_id, "force_download": force_download},
+            )
+
+            files_to_process = files_to_process or GTFS_FILES_TO_PROCESS
+
+            # 1. Download e extração
+            extract_dir = self._download_and_extract(force_download)
+            
+            # 2. Processar cada arquivo GTFS
+            results = {}
+            for file_type in files_to_process:
+                try:
+                    result = self._process_gtfs_file(file_type, extract_dir)
+                    results[file_type] = result
+                except Exception as e:
+                    logger.error(
+                        f"Error processing {file_type}: {e}",
+                        extra={"file_type": file_type, "error": str(e)},
+                    )
+                    results[file_type] = {"status": "error", "error": str(e)}
+
+            # 3. Compilar estatísticas
+            stats = self._compile_stats(results)
+            
+            logger.info(
+                "GTFS to Bronze ingestion completed",
+                extra={"job_id": self.job_id, "stats": stats},
             )
             
-            count = df.count()
-            logger.info(f"  {filename}: {count:,} registros")
-            
-            return df
-        
+            return stats
+
         except Exception as e:
-            logger.error(f"Erro ao ler {filename}: {e}")
-            self.stats['failed_files'].append(filename)
-            return None
-    
-    def _add_metadata_columns(self, df: DataFrame) -> DataFrame:
+            logger.error(
+                f"GTFS ingestion failed: {e}",
+                extra={"job_id": self.job_id, "error": str(e)},
+                exc_info=True,
+            )
+            raise ProcessingException(
+                transformation="gtfs_to_bronze",
+                reason=str(e)
+            )
+
+    def _download_and_extract(self, force: bool = False) -> Path:
         """
-        Adiciona colunas de metadados.
+        Download e extração do GTFS.
+
+        Args:
+            force: Forçar novo download
+
+        Returns:
+            Path do diretório extraído
+        """
+        logger.info(f"Downloading GTFS (force={force})")
         
+        # Download
+        zip_path = self.gtfs_downloader.download_gtfs(force=force)
+        
+        # Extração
+        extract_dir = self.gtfs_downloader.extract_gtfs(zip_path)
+        
+        logger.info(
+            "GTFS downloaded and extracted",
+            extra={"extract_dir": str(extract_dir)},
+        )
+        
+        return extract_dir
+
+    def _process_gtfs_file(
+        self, file_type: str, extract_dir: Path
+    ) -> Dict[str, any]:
+        """
+        Processa um arquivo GTFS específico.
+
+        Args:
+            file_type: Tipo do arquivo ('stops', 'routes', etc)
+            extract_dir: Diretório com arquivos extraídos
+
+        Returns:
+            Dicionário com estatísticas
+        """
+        logger.info(f"Processing GTFS file: {file_type}")
+
+        # 1. Ler arquivo CSV
+        df = self._read_gtfs_csv(file_type, extract_dir)
+        
+        # 2. Aplicar schema
+        df = self._apply_schema(df, file_type)
+        
+        # 3. Adicionar metadados
+        df = self._add_metadata(df, file_type)
+        
+        # 4. Salvar no Bronze
+        stats = self._save_to_bronze(df, file_type)
+        
+        return stats
+
+    def _read_gtfs_csv(self, file_type: str, extract_dir: Path) -> DataFrame:
+        """
+        Lê arquivo CSV do GTFS.
+
+        Args:
+            file_type: Tipo do arquivo
+            extract_dir: Diretório extraído
+
+        Returns:
+            DataFrame Spark
+        """
+        csv_path = extract_dir / f"{file_type}.txt"
+        
+        logger.info(f"Reading CSV: {csv_path}")
+
+        df = (
+            self.spark.read
+            .option("header", "true")
+            .option("inferSchema", "false")  # Vamos aplicar schema manualmente
+            .option("encoding", "UTF-8")
+            .csv(str(csv_path))
+        )
+
+        logger.info(
+            f"CSV read successfully",
+            extra={"file_type": file_type, "row_count": df.count()},
+        )
+
+        return df
+
+    def _apply_schema(self, df: DataFrame, file_type: str) -> DataFrame:
+        """
+        Aplica schema tipado ao DataFrame.
+
         Args:
             df: DataFrame original
+            file_type: Tipo do arquivo
+
+        Returns:
+            DataFrame com schema aplicado
+        """
+        logger.info(f"Applying schema for {file_type}")
+
+        schema = get_gtfs_schema(file_type)
         
+        # Criar DataFrame com schema correto
+        # Fazendo cast das colunas
+        for field in schema.fields:
+            if field.name in df.columns:
+                df = df.withColumn(field.name, F.col(field.name).cast(field.dataType))
+
+        return df
+
+    def _add_metadata(self, df: DataFrame, file_type: str) -> DataFrame:
+        """
+        Adiciona colunas de metadados.
+
+        Args:
+            df: DataFrame original
+            file_type: Tipo do arquivo
+
         Returns:
             DataFrame com metadados
         """
-        return df \
-            .withColumn('ingestion_timestamp', F.lit(datetime.now())) \
-            .withColumn('ingestion_date', F.lit(self.execution_date.date())) \
-            .withColumn('source_system', F.lit('sptrans_gtfs')) \
-            .withColumn('data_quality_flag', F.lit('raw'))
-    
-    def _write_to_bronze(self, df: DataFrame, table_name: str):
+        current_timestamp = datetime.now()
+
+        df = (
+            df.withColumn("gtfs_file_type", F.lit(file_type))
+            .withColumn("ingestion_timestamp", F.lit(current_timestamp))
+            .withColumn("ingestion_date", F.lit(current_timestamp.strftime("%Y-%m-%d")))
+        )
+
+        return df
+
+    def _save_to_bronze(
+        self, df: DataFrame, file_type: str
+    ) -> Dict[str, any]:
         """
-        Escreve DataFrame na camada Bronze.
-        
+        Salva DataFrame no Bronze.
+
         Args:
-            df: DataFrame para escrever
-            table_name: Nome da tabela (ex: 'routes')
-        """
-        if df is None or df.count() == 0:
-            logger.warning(f"DataFrame vazio para {table_name}, pulando escrita")
-            return
-        
-        # Adicionar metadados
-        df_with_metadata = self._add_metadata_columns(df)
-        
-        # Path de saída com partições
-        partition_path = self._get_partition_path()
-        output_full_path = f"{self.output_path}/{table_name}/{partition_path}"
-        
-        logger.info(f"Escrevendo {table_name} para {output_full_path}")
-        
-        try:
-            # Escrever em Parquet (formato colunar otimizado)
-            df_with_metadata.write \
-                .mode('overwrite') \
-                .parquet(output_full_path)
-            
-            record_count = df_with_metadata.count()
-            self.stats['total_records'] += record_count
-            self.stats['files_processed'] += 1
-            
-            logger.info(f"  ✓ {table_name}: {record_count:,} registros escritos")
-            
-            # Reportar métricas
-            reporter.report_processing_stats(
-                layer='bronze',
-                source=f'gtfs_{table_name}',
-                total=record_count,
-                invalid=0,
-                duplicated=0
-            )
-        
-        except Exception as e:
-            logger.error(f"Erro ao escrever {table_name}: {e}")
-            self.stats['failed_files'].append(table_name)
-            raise
-    
-    @track_job_execution('gtfs_to_bronze')
-    def run(self) -> Dict[str, Any]:
-        """
-        Executa job de ingestão.
-        
+            df: DataFrame a salvar
+            file_type: Tipo do arquivo
+
         Returns:
-            Dict com estatísticas da execução
+            Estatísticas do salvamento
         """
-        logger.info("=" * 80)
-        logger.info("INICIANDO GTFS TO BRONZE INGESTION JOB")
-        logger.info("=" * 80)
-        
-        spark = None
-        
         try:
-            # Criar sessão Spark
-            spark = self._create_spark_session()
+            output_path = get_s3_path(
+                bucket=self.bronze_bucket,
+                prefix=f"{self.bronze_prefix}/{file_type}",
+            )
+
+            logger.info(
+                f"Saving {file_type} to Bronze: {output_path}",
+            )
+
+            # Salvar (overwrite para dados estáticos)
+            (
+                df.write
+                .mode("overwrite")
+                .format(FORMAT_BRONZE)
+                .save(output_path)
+            )
+
+            record_count = df.count()
             
-            # Processar cada arquivo GTFS
-            gtfs_files = [
-                ('routes', 'routes.txt', self.schemas.routes_schema),
-                ('trips', 'trips.txt', self.schemas.trips_schema),
-                ('stops', 'stops.txt', self.schemas.stops_schema),
-                ('stop_times', 'stop_times.txt', self.schemas.stop_times_schema),
-                ('shapes', 'shapes.txt', self.schemas.shapes_schema),
-                ('calendar', 'calendar.txt', self.schemas.calendar_schema),
-                ('agency', 'agency.txt', self.schemas.agency_schema),
-            ]
-            
-            for table_name, filename, schema in gtfs_files:
-                logger.info(f"\nProcessando {table_name}...")
-                
-                # Ler arquivo
-                df = self._read_gtfs_file(spark, filename, schema)
-                
-                if df is not None:
-                    # Escrever na Bronze
-                    self._write_to_bronze(df, table_name)
-                else:
-                    logger.warning(f"Pulando {table_name} (arquivo não encontrado ou erro)")
-            
-            # Resultados
-            logger.info("\n" + "=" * 80)
-            logger.info("JOB CONCLUÍDO COM SUCESSO")
-            logger.info("=" * 80)
-            logger.info(f"Arquivos processados: {self.stats['files_processed']}")
-            logger.info(f"Total de registros: {self.stats['total_records']:,}")
-            
-            if self.stats['failed_files']:
-                logger.warning(f"Arquivos com falha: {self.stats['failed_files']}")
-            
-            result = {
-                'success': True,
-                'execution_date': self.execution_date.isoformat(),
-                'files_processed': self.stats['files_processed'],
-                'total_records': self.stats['total_records'],
-                'failed_files': self.stats['failed_files'],
-                'output_path': self.output_path,
-                'timestamp': datetime.now().isoformat()
+            stats = {
+                "status": "success",
+                "output_path": output_path,
+                "record_count": record_count,
+                "format": FORMAT_BRONZE,
             }
-            
-            return result
-        
+
+            logger.info(
+                f"{file_type} saved successfully",
+                extra=stats,
+            )
+
+            records_processed_total.labels(
+                stage="bronze", status="written"
+            ).inc(record_count)
+
+            return stats
+
         except Exception as e:
-            logger.error(f"Erro fatal no job: {e}")
-            raise
-        
-        finally:
-            if spark:
-                logger.info("Encerrando sessão Spark")
-                spark.stop()
+            raise StorageWriteException(
+                location=output_path,
+                reason=str(e)
+            )
+
+    def _compile_stats(self, results: Dict[str, Dict]) -> Dict[str, any]:
+        """
+        Compila estatísticas finais.
+
+        Args:
+            results: Resultados por arquivo
+
+        Returns:
+            Estatísticas compiladas
+        """
+        total_records = 0
+        successful_files = 0
+        failed_files = 0
+
+        for file_type, result in results.items():
+            if result.get("status") == "success":
+                successful_files += 1
+                total_records += result.get("record_count", 0)
+            else:
+                failed_files += 1
+
+        stats = {
+            "total_files_processed": len(results),
+            "successful_files": successful_files,
+            "failed_files": failed_files,
+            "total_records": total_records,
+            "results_by_file": results,
+        }
+
+        return stats
 
 
-def main():
-    """Entry point para execução standalone."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='GTFS to Bronze Ingestion Job')
-    parser.add_argument('--input-path', required=True, help='Path dos arquivos GTFS')
-    parser.add_argument('--output-path', required=True, help='Path de saída (S3/MinIO)')
-    parser.add_argument('--execution-date', help='Data de execução (YYYY-MM-DD)')
-    
-    args = parser.parse_args()
-    
-    # Parse execution date
-    execution_date = None
-    if args.execution_date:
-        execution_date = datetime.strptime(args.execution_date, '%Y-%m-%d')
-    
-    # Executar job
-    job = GTFSToBronzeJob(
-        input_path=args.input_path,
-        output_path=args.output_path,
-        execution_date=execution_date
-    )
-    
-    result = job.run()
-    
-    print(f"\n{'=' * 80}")
-    print("RESULTADO:")
-    print(f"{'=' * 80}")
-    for key, value in result.items():
-        print(f"{key}: {value}")
+# Função standalone para Airflow
+def run_gtfs_to_bronze_job(
+    force_download: bool = False,
+    **kwargs
+) -> Dict[str, any]:
+    """
+    Função standalone para executar job.
+
+    Args:
+        force_download: Forçar download
+        **kwargs: Argumentos adicionais
+
+    Returns:
+        Estatísticas do job
+    """
+    job = GTFSToBronzeJob()
+    stats = job.run(force_download=force_download)
+    return stats
 
 
+# Exemplo de uso
 if __name__ == "__main__":
-    main()
+    from ...common.logging_config import setup_logging
+
+    setup_logging(log_level="INFO", log_format="console")
+
+    # Executar job
+    job = GTFSToBronzeJob()
+    stats = job.run(force_download=False)
+
+    print(f"\nJob completed!")
+    print(f"Files processed: {stats['total_files_processed']}")
+    print(f"Total records: {stats['total_records']}")
+    print(f"Success: {stats['successful_files']}")
+    print(f"Failed: {stats['failed_files']}")

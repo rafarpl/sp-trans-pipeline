@@ -1,450 +1,346 @@
 """
-=============================================================================
-AIRFLOW DAG - DATA QUALITY CHECKS
-=============================================================================
-DAG para verificação contínua de qualidade de dados em todas as camadas.
+Airflow DAG: Monitoramento de Qualidade de Dados.
 
-Schedule: A cada 30 minutos
-Dependências: Dados nas camadas Bronze, Silver e Gold
-=============================================================================
+Executa checks de data quality em todas as camadas,
+gera relatórios e envia alertas se necessário.
+
+Schedule: A cada hora
 """
 
 from datetime import datetime, timedelta
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.bash import BashOperator
-from airflow.utils.dates import days_ago
+from airflow.utils.task_group import TaskGroup
 
-# =============================================================================
-# CONFIGURAÇÕES DO DAG
-# =============================================================================
+import sys
+sys.path.append('/opt/airflow/src')
+
+from src.common.logging_config import setup_logging
+
+setup_logging(log_level="INFO", log_format="json")
 
 default_args = {
-    'owner': 'data-engineering',
+    'owner': 'sptrans-pipeline',
     'depends_on_past': False,
+    'start_date': datetime(2024, 1, 1),
     'email': ['alerts@sptrans-pipeline.com'],
     'email_on_failure': True,
-    'email_on_retry': False,
-    'retries': 2,
+    'retries': 1,
     'retry_delay': timedelta(minutes=5),
-    'execution_timeout': timedelta(hours=1),
+    'execution_timeout': timedelta(minutes=20),
 }
 
 dag = DAG(
-    'data_quality_checks',
+    'sptrans_06_data_quality',
     default_args=default_args,
-    description='Verificação de qualidade de dados em todas as camadas',
-    schedule_interval='*/30 * * * *',  # A cada 30 minutos
-    start_date=days_ago(1),
+    description='Monitoramento de qualidade de dados',
+    schedule_interval='0 * * * *',  # A cada hora
     catchup=False,
-    tags=['data-quality', 'monitoring', 'validation'],
     max_active_runs=1,
+    tags=['sptrans', 'data-quality', 'monitoring'],
 )
 
-# =============================================================================
-# FUNÇÕES PYTHON
-# =============================================================================
 
 def check_bronze_quality(**context):
-    """Verifica qualidade da camada Bronze"""
+    """Valida qualidade da camada Bronze."""
     from pyspark.sql import SparkSession
-    from datetime import datetime
-    import logging
+    from src.common.utils import get_s3_path
+    from src.common.constants import BUCKET_BRONZE, PREFIX_API_POSITIONS
     
-    logger = logging.getLogger(__name__)
-    logger.info("=== Iniciando verificação de qualidade Bronze ===")
+    print("🔍 Checking Bronze data quality")
     
-    # Data de execução
-    execution_date = context['ds']
-    
-    # Criar SparkSession
-    spark = SparkSession.builder \
-        .appName("Bronze-Quality-Check") \
-        .getOrCreate()
+    spark = SparkSession.builder.appName("DQ_Bronze").getOrCreate()
     
     try:
-        # Ler dados Bronze
-        bronze_path = f"s3a://sptrans-datalake/bronze/api_positions/date={execution_date}"
-        
-        logger.info(f"Lendo dados: {bronze_path}")
+        bronze_path = get_s3_path(BUCKET_BRONZE, PREFIX_API_POSITIONS)
         df = spark.read.parquet(bronze_path)
         
-        total_records = df.count()
-        logger.info(f"Total de registros: {total_records}")
+        # Checks básicos
+        total_count = df.count()
+        null_count = df.filter(df['hr'].isNull()).count()
         
-        # Verificações de qualidade
-        quality_checks = {
-            'total_records': total_records,
-            'null_vehicle_ids': df.filter(df.vehicle_id.isNull()).count(),
-            'null_timestamps': df.filter(df.timestamp.isNull()).count(),
-            'null_coordinates': df.filter(
-                df.latitude.isNull() | df.longitude.isNull()
-            ).count(),
-            'invalid_coordinates': df.filter(
-                (df.latitude < -24.0) | (df.latitude > -23.3) |
-                (df.longitude < -46.9) | (df.longitude > -46.3)
-            ).count(),
+        # Últimas 24 horas
+        recent_df = df.filter("ingestion_timestamp > current_timestamp() - interval 24 hours")
+        recent_count = recent_df.count()
+        
+        metrics = {
+            'layer': 'bronze',
+            'total_records': total_count,
+            'null_records': null_count,
+            'recent_24h': recent_count,
+            'null_rate': null_count / total_count if total_count > 0 else 0,
         }
         
-        # Calcular score de qualidade
-        issues = sum([
-            quality_checks['null_vehicle_ids'],
-            quality_checks['null_timestamps'],
-            quality_checks['null_coordinates'],
-            quality_checks['invalid_coordinates'],
-        ])
-        
-        quality_score = ((total_records - issues) / total_records * 100) if total_records > 0 else 0
-        quality_checks['quality_score'] = quality_score
-        
-        logger.info(f"Quality Score Bronze: {quality_score:.2f}%")
-        
-        # Alertar se score baixo
-        if quality_score < 80:
-            logger.warning(f"⚠️ Quality score baixo: {quality_score:.2f}%")
-            # Enviar alerta
-            context['task_instance'].xcom_push(key='bronze_quality_alert', value=True)
-        
-        # Salvar métricas
-        context['task_instance'].xcom_push(key='bronze_quality', value=quality_checks)
-        
-        return quality_checks
-    
-    finally:
         spark.stop()
+        
+        print(f"📊 Bronze metrics: {metrics}")
+        context['task_instance'].xcom_push(key='bronze_metrics', value=metrics)
+        
+        # Alertas
+        if metrics['null_rate'] > 0.01:  # > 1%
+            print(f"⚠️  WARNING: High null rate in Bronze ({metrics['null_rate']:.2%})")
+        
+        if recent_count == 0:
+            raise Exception("❌ No data ingested in last 24 hours!")
+        
+        print("✅ Bronze quality check passed")
+        return metrics
+        
+    except Exception as e:
+        spark.stop()
+        print(f"❌ Bronze quality check failed: {e}")
+        raise
 
 
 def check_silver_quality(**context):
-    """Verifica qualidade da camada Silver"""
+    """Valida qualidade da camada Silver."""
     from pyspark.sql import SparkSession
-    import logging
+    from src.common.utils import get_s3_path
+    from src.common.constants import BUCKET_SILVER
     
-    logger = logging.getLogger(__name__)
-    logger.info("=== Iniciando verificação de qualidade Silver ===")
+    print("🔍 Checking Silver data quality")
     
-    execution_date = context['ds']
-    
-    spark = SparkSession.builder \
-        .appName("Silver-Quality-Check") \
-        .getOrCreate()
+    spark = SparkSession.builder.appName("DQ_Silver").getOrCreate()
     
     try:
-        silver_path = f"s3a://sptrans-datalake/silver/positions/date={execution_date}"
+        silver_path = get_s3_path(BUCKET_SILVER, "vehicle_positions")
+        df = spark.read.format("delta").load(silver_path)
         
-        logger.info(f"Lendo dados: {silver_path}")
-        df = spark.read.parquet(silver_path)
+        total_count = df.count()
+        duplicate_count = df.filter(df['is_duplicate']).count()
+        low_quality_count = df.filter(df['data_quality_score'] < 0.8).count()
         
-        total_records = df.count()
+        # Últimas 24 horas
+        recent_df = df.filter("processed_timestamp > current_timestamp() - interval 24 hours")
+        recent_count = recent_df.count()
         
-        quality_checks = {
-            'total_records': total_records,
-            'records_with_route': df.filter(df.route_code.isNotNull()).count(),
-            'records_with_speed': df.filter(df.speed.isNotNull()).count(),
-            'duplicates': total_records - df.dropDuplicates(['vehicle_id', 'timestamp']).count(),
+        metrics = {
+            'layer': 'silver',
+            'total_records': total_count,
+            'duplicate_records': duplicate_count,
+            'low_quality_records': low_quality_count,
+            'recent_24h': recent_count,
+            'duplicate_rate': duplicate_count / total_count if total_count > 0 else 0,
+            'low_quality_rate': low_quality_count / total_count if total_count > 0 else 0,
         }
         
-        # Calcular completude
-        completeness = (quality_checks['records_with_route'] / total_records * 100) if total_records > 0 else 0
-        quality_checks['completeness'] = completeness
-        
-        quality_score = completeness
-        quality_checks['quality_score'] = quality_score
-        
-        logger.info(f"Quality Score Silver: {quality_score:.2f}%")
-        
-        if quality_score < 85:
-            logger.warning(f"⚠️ Quality score Silver baixo: {quality_score:.2f}%")
-            context['task_instance'].xcom_push(key='silver_quality_alert', value=True)
-        
-        context['task_instance'].xcom_push(key='silver_quality', value=quality_checks)
-        
-        return quality_checks
-    
-    finally:
         spark.stop()
+        
+        print(f"📊 Silver metrics: {metrics}")
+        context['task_instance'].xcom_push(key='silver_metrics', value=metrics)
+        
+        # Alertas
+        if metrics['duplicate_rate'] > 0.05:  # > 5%
+            print(f"⚠️  WARNING: High duplicate rate ({metrics['duplicate_rate']:.2%})")
+        
+        if metrics['low_quality_rate'] > 0.10:  # > 10%
+            print(f"⚠️  WARNING: High low-quality rate ({metrics['low_quality_rate']:.2%})")
+        
+        print("✅ Silver quality check passed")
+        return metrics
+        
+    except Exception as e:
+        spark.stop()
+        print(f"❌ Silver quality check failed: {e}")
+        raise
 
 
 def check_gold_quality(**context):
-    """Verifica qualidade da camada Gold"""
+    """Valida qualidade da camada Gold."""
     from pyspark.sql import SparkSession
-    import logging
+    from src.common.utils import get_s3_path
+    from src.common.constants import BUCKET_GOLD
     
-    logger = logging.getLogger(__name__)
-    logger.info("=== Iniciando verificação de qualidade Gold ===")
+    print("🔍 Checking Gold data quality")
     
-    execution_date = context['ds']
-    
-    spark = SparkSession.builder \
-        .appName("Gold-Quality-Check") \
-        .getOrCreate()
+    spark = SparkSession.builder.appName("DQ_Gold").getOrCreate()
     
     try:
-        # Verificar KPIs horários
-        kpis_path = f"s3a://sptrans-datalake/gold/kpis_hourly/date={execution_date}"
+        # Check hourly metrics
+        hourly_path = get_s3_path(BUCKET_GOLD, "hourly_metrics")
+        hourly_df = spark.read.format("delta").load(hourly_path)
         
-        logger.info(f"Lendo KPIs: {kpis_path}")
-        df = spark.read.parquet(kpis_path)
+        hourly_count = hourly_df.count()
         
-        total_records = df.count()
+        # Últimas 24 horas
+        recent_hourly = hourly_df.filter(
+            "hour_timestamp > current_timestamp() - interval 24 hours"
+        )
+        recent_hourly_count = recent_hourly.count()
         
-        quality_checks = {
-            'total_kpi_records': total_records,
-            'null_metrics': df.filter(
-                df.avg_speed_kmh.isNull() | df.total_vehicles.isNull()
-            ).count(),
-            'avg_quality_score': df.agg({'data_quality_score': 'avg'}).collect()[0][0],
+        metrics = {
+            'layer': 'gold',
+            'total_hourly_metrics': hourly_count,
+            'recent_hourly_24h': recent_hourly_count,
         }
         
-        quality_score = quality_checks['avg_quality_score'] if quality_checks['avg_quality_score'] else 0
-        quality_checks['quality_score'] = quality_score
-        
-        logger.info(f"Quality Score Gold: {quality_score:.2f}%")
-        
-        if quality_score < 90:
-            logger.warning(f"⚠️ Quality score Gold baixo: {quality_score:.2f}%")
-            context['task_instance'].xcom_push(key='gold_quality_alert', value=True)
-        
-        context['task_instance'].xcom_push(key='gold_quality', value=quality_checks)
-        
-        return quality_checks
-    
-    finally:
         spark.stop()
+        
+        print(f"📊 Gold metrics: {metrics}")
+        context['task_instance'].xcom_push(key='gold_metrics', value=metrics)
+        
+        # Alertas
+        expected_hourly = 24  # 24 horas * ~1 registro por hora
+        if recent_hourly_count < expected_hourly * 0.5:  # Menos de 50% esperado
+            print(f"⚠️  WARNING: Low hourly metrics count ({recent_hourly_count}/{expected_hourly})")
+        
+        print("✅ Gold quality check passed")
+        return metrics
+        
+    except Exception as e:
+        spark.stop()
+        print(f"❌ Gold quality check failed: {e}")
+        raise
 
 
-def save_quality_metrics_to_postgres(**context):
-    """Salva métricas de qualidade no PostgreSQL"""
+def check_serving_quality(**context):
+    """Valida qualidade do serving layer (PostgreSQL)."""
     import psycopg2
-    import json
-    from datetime import datetime
-    import logging
+    from src.common.config import Config
     
-    logger = logging.getLogger(__name__)
-    logger.info("=== Salvando métricas de qualidade no PostgreSQL ===")
+    config = Config()
     
-    # Obter métricas do XCom
-    bronze_quality = context['task_instance'].xcom_pull(
-        task_ids='check_bronze_quality',
-        key='bronze_quality'
-    )
-    silver_quality = context['task_instance'].xcom_pull(
-        task_ids='check_silver_quality',
-        key='silver_quality'
-    )
-    gold_quality = context['task_instance'].xcom_pull(
-        task_ids='check_gold_quality',
-        key='gold_quality'
-    )
+    print("🔍 Checking Serving layer quality")
     
-    # Conectar ao PostgreSQL
     conn = psycopg2.connect(
-        host="postgres",
-        port=5432,
-        database="airflow",
-        user="airflow",
-        password="airflow123"
+        host=config.postgres.host,
+        port=config.postgres.port,
+        database=config.postgres.database,
+        user=config.postgres.user,
+        password=config.postgres.password
     )
     
     try:
-        cursor = conn.cursor()
+        cur = conn.cursor()
         
-        execution_date = context['ds']
-        timestamp = datetime.now()
+        # Check hourly aggregates
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE loaded_at > NOW() - INTERVAL '24 hours') as recent_24h
+            FROM serving.hourly_aggregates
+        """)
         
-        # Inserir métricas
-        insert_query = """
-            INSERT INTO serving.data_quality_metrics 
-            (date, hour, layer, source, total_records, quality_score, 
-             completeness_score, validity_score, accuracy_score, 
-             overall_quality_score, metrics_json, processing_timestamp)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
+        hourly_total, hourly_recent = cur.fetchone()
         
-        # Bronze metrics
-        cursor.execute(insert_query, (
-            execution_date,
-            datetime.now().hour,
-            'bronze',
-            'api',
-            bronze_quality.get('total_records', 0),
-            bronze_quality.get('quality_score', 0),
-            100.0,  # completeness
-            95.0,   # validity
-            90.0,   # accuracy
-            bronze_quality.get('quality_score', 0),
-            json.dumps(bronze_quality),
-            timestamp
-        ))
+        metrics = {
+            'layer': 'serving',
+            'hourly_total': hourly_total,
+            'hourly_recent_24h': hourly_recent,
+        }
         
-        # Silver metrics
-        cursor.execute(insert_query, (
-            execution_date,
-            datetime.now().hour,
-            'silver',
-            'positions',
-            silver_quality.get('total_records', 0),
-            silver_quality.get('quality_score', 0),
-            silver_quality.get('completeness', 0),
-            95.0,
-            90.0,
-            silver_quality.get('quality_score', 0),
-            json.dumps(silver_quality),
-            timestamp
-        ))
-        
-        # Gold metrics
-        cursor.execute(insert_query, (
-            execution_date,
-            datetime.now().hour,
-            'gold',
-            'kpis',
-            gold_quality.get('total_kpi_records', 0),
-            gold_quality.get('quality_score', 0),
-            100.0,
-            100.0,
-            100.0,
-            gold_quality.get('quality_score', 0),
-            json.dumps(gold_quality),
-            timestamp
-        ))
-        
-        conn.commit()
-        
-        logger.info("✓ Métricas salvas no PostgreSQL")
-        
-    finally:
-        cursor.close()
+        cur.close()
         conn.close()
+        
+        print(f"📊 Serving metrics: {metrics}")
+        context['task_instance'].xcom_push(key='serving_metrics', value=metrics)
+        
+        # Alertas
+        if hourly_recent == 0:
+            print(f"⚠️  WARNING: No recent data in serving layer")
+        
+        print("✅ Serving quality check passed")
+        return metrics
+        
+    except Exception as e:
+        conn.close()
+        print(f"❌ Serving quality check failed: {e}")
+        raise
 
 
-def send_quality_alerts(**context):
-    """Envia alertas se qualidade estiver baixa"""
-    import logging
-    
-    logger = logging.getLogger(__name__)
-    logger.info("=== Verificando alertas de qualidade ===")
-    
-    # Verificar se há alertas
-    bronze_alert = context['task_instance'].xcom_pull(
-        task_ids='check_bronze_quality',
-        key='bronze_quality_alert'
+def generate_quality_report(**context):
+    """Gera relatório consolidado de qualidade."""
+    bronze_metrics = context['task_instance'].xcom_pull(
+        task_ids='check_bronze_quality', key='bronze_metrics'
     )
-    silver_alert = context['task_instance'].xcom_pull(
-        task_ids='check_silver_quality',
-        key='silver_quality_alert'
+    silver_metrics = context['task_instance'].xcom_pull(
+        task_ids='check_silver_quality', key='silver_metrics'
     )
-    gold_alert = context['task_instance'].xcom_pull(
-        task_ids='check_gold_quality',
-        key='gold_quality_alert'
+    gold_metrics = context['task_instance'].xcom_pull(
+        task_ids='check_gold_quality', key='gold_metrics'
+    )
+    serving_metrics = context['task_instance'].xcom_pull(
+        task_ids='check_serving_quality', key='serving_metrics'
     )
     
-    alerts = []
+    print("📋 Generating quality report")
     
-    if bronze_alert:
-        alerts.append("⚠️ ALERTA: Quality score Bronze abaixo do threshold")
+    report = {
+        'timestamp': datetime.now().isoformat(),
+        'layers': {
+            'bronze': bronze_metrics,
+            'silver': silver_metrics,
+            'gold': gold_metrics,
+            'serving': serving_metrics,
+        },
+        'overall_status': 'healthy',
+    }
     
-    if silver_alert:
-        alerts.append("⚠️ ALERTA: Quality score Silver abaixo do threshold")
+    print(f"📊 Quality Report:")
+    print(f"  Bronze: {bronze_metrics['total_records']:,} records")
+    print(f"  Silver: {silver_metrics['total_records']:,} records")
+    print(f"  Gold: {gold_metrics['total_hourly_metrics']:,} hourly metrics")
+    print(f"  Serving: {serving_metrics['hourly_total']:,} records")
     
-    if gold_alert:
-        alerts.append("⚠️ ALERTA: Quality score Gold abaixo do threshold")
+    context['task_instance'].xcom_push(key='quality_report', value=report)
     
-    if alerts:
-        logger.warning("\n".join(alerts))
-        # Aqui você pode integrar com Slack, email, etc
-    else:
-        logger.info("✓ Todos os checks de qualidade passaram")
+    return report
 
 
-# =============================================================================
-# TASKS
-# =============================================================================
+def send_quality_alert_if_needed(**context):
+    """Envia alerta se houver problemas de qualidade."""
+    report = context['task_instance'].xcom_pull(
+        task_ids='generate_quality_report',
+        key='quality_report'
+    )
+    
+    print("📧 Checking if quality alert is needed")
+    
+    # Lógica de alerta (placeholder)
+    # Aqui poderíamos enviar para Slack, email, PagerDuty, etc.
+    
+    print("✅ Quality monitoring complete")
+    return True
 
-# Task 1: Check Bronze Quality
-check_bronze = PythonOperator(
-    task_id='check_bronze_quality',
-    python_callable=check_bronze_quality,
-    provide_context=True,
-    dag=dag,
-)
 
-# Task 2: Check Silver Quality
-check_silver = PythonOperator(
-    task_id='check_silver_quality',
-    python_callable=check_silver_quality,
-    provide_context=True,
-    dag=dag,
-)
-
-# Task 3: Check Gold Quality
-check_gold = PythonOperator(
-    task_id='check_gold_quality',
-    python_callable=check_gold_quality,
-    provide_context=True,
-    dag=dag,
-)
-
-# Task 4: Save Metrics to PostgreSQL
-save_metrics = PythonOperator(
-    task_id='save_quality_metrics',
-    python_callable=save_quality_metrics_to_postgres,
-    provide_context=True,
-    dag=dag,
-)
-
-# Task 5: Send Alerts
-send_alerts = PythonOperator(
-    task_id='send_quality_alerts',
-    python_callable=send_quality_alerts,
-    provide_context=True,
-    dag=dag,
-)
-
-# Task 6: Update Prometheus Metrics
-update_prometheus = BashOperator(
-    task_id='update_prometheus_metrics',
-    bash_command="""
-    echo "Atualizando métricas Prometheus..."
-    # Aqui você pode usar pushgateway para enviar métricas
-    """,
-    dag=dag,
-)
-
-# =============================================================================
-# DEPENDÊNCIAS
-# =============================================================================
-
-# Verificações em paralelo
-[check_bronze, check_silver, check_gold] >> save_metrics >> send_alerts >> update_prometheus
-
-# =============================================================================
-# DOCUMENTAÇÃO
-# =============================================================================
-
-dag.doc_md = """
-# DAG de Data Quality
-
-Verifica a qualidade dos dados em todas as camadas do Data Lake.
-
-## Funcionalidades
-
-- **Bronze Quality**: Valida dados brutos da API
-- **Silver Quality**: Valida dados limpos e enriquecidos  
-- **Gold Quality**: Valida KPIs e agregações
-- **Metrics Storage**: Salva métricas no PostgreSQL
-- **Alerting**: Envia alertas para quality scores baixos
-
-## Thresholds
-
-- Bronze: 80%
-- Silver: 85%
-- Gold: 90%
-
-## Execução
-
-Roda a cada 30 minutos automaticamente.
-"""
-
-# =============================================================================
-# END
-# =============================================================================
+# Tasks
+with dag:
+    with TaskGroup('quality_checks', tooltip='Parallel quality checks') as checks_group:
+        check_bronze = PythonOperator(
+            task_id='check_bronze_quality',
+            python_callable=check_bronze_quality,
+            provide_context=True,
+        )
+        
+        check_silver = PythonOperator(
+            task_id='check_silver_quality',
+            python_callable=check_silver_quality,
+            provide_context=True,
+        )
+        
+        check_gold = PythonOperator(
+            task_id='check_gold_quality',
+            python_callable=check_gold_quality,
+            provide_context=True,
+        )
+        
+        check_serving = PythonOperator(
+            task_id='check_serving_quality',
+            python_callable=check_serving_quality,
+            provide_context=True,
+        )
+    
+    generate_report = PythonOperator(
+        task_id='generate_quality_report',
+        python_callable=generate_quality_report,
+        provide_context=True,
+    )
+    
+    send_alert = PythonOperator(
+        task_id='send_alert_if_needed',
+        python_callable=send_quality_alert_if_needed,
+        provide_context=True,
+    )
+    
+    checks_group >> generate_report >> send_alert

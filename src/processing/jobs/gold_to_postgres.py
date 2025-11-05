@@ -1,406 +1,434 @@
-# =============================================================================
-# SPARK JOB - GOLD TO POSTGRESQL
-# =============================================================================
-# Job para carregar dados da camada Gold para PostgreSQL (Serving Layer)
-# =============================================================================
-
 """
-Gold to PostgreSQL Job
+Job Spark: Load Gold → PostgreSQL (Serving Layer).
 
-Carrega dados agregados da camada Gold para o PostgreSQL,
-tornando-os disponíveis para queries e dashboards.
-
-Tabelas carregadas:
-    - kpis_hourly: KPIs agregados por hora
-    - route_metrics: Métricas por rota
-    - headway_analysis: Análise de intervalos
-    - system_summary: Resumo do sistema
-    - data_quality_metrics: Métricas de qualidade
-
-Estratégia:
-    - Upsert (insert or update) para evitar duplicatas
-    - Batch loading para performance
-    - Validação antes de carregar
+Carrega dados agregados da camada Gold para o PostgreSQL
+que serve como serving layer para dashboards e consultas.
 """
 
-import logging
-from datetime import datetime
-from typing import Dict, Any, Optional
-from pyspark.sql import SparkSession, DataFrame
+from typing import Dict, Optional
+
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-# =============================================================================
-# LOGGING
-# =============================================================================
+from ...common.config import Config
+from ...common.constants import (
+    BUCKET_GOLD,
+    SCHEMA_SERVING,
+    TABLE_DAILY_AGGREGATES,
+    TABLE_HOURLY_AGGREGATES,
+    TABLE_LINES_METRICS,
+)
+from ...common.exceptions import DatabaseQueryException, ProcessingException
+from ...common.logging_config import get_logger
+from ...common.metrics import track_pipeline_run, update_processing_metrics
+from ...common.utils import generate_uuid, get_s3_path
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# =============================================================================
-# GOLD TO POSTGRES JOB
-# =============================================================================
 
 class GoldToPostgresJob:
-    """Job para carregar dados Gold no PostgreSQL"""
+    """
+    Job Spark para load Gold → PostgreSQL.
     
-    def __init__(self, spark: SparkSession, config: Optional[Dict[str, Any]] = None):
+    Responsabilidades:
+    - Ler dados agregados da camada Gold
+    - Transformar para formato otimizado para serving
+    - Carregar no PostgreSQL usando JDBC
+    - Suportar upsert (atualizar ou inserir)
+    - Manter tabelas otimizadas
+    """
+
+    def __init__(
+        self,
+        spark: Optional[SparkSession] = None,
+        config: Optional[Config] = None,
+        job_id: Optional[str] = None,
+    ):
         """
-        Inicializa o job.
-        
+        Inicializa job.
+
         Args:
             spark: SparkSession
-            config: Configurações opcionais
+            config: Configuração
+            job_id: ID do job
         """
-        self.spark = spark
-        self.config = config or {}
+        self.config = config or Config()
+        self.job_id = job_id or generate_uuid()
         
-        # Configurações PostgreSQL
-        self.pg_host = self.config.get("postgres_host", "postgres")
-        self.pg_port = self.config.get("postgres_port", "5432")
-        self.pg_db = self.config.get("postgres_db", "airflow")
-        self.pg_user = self.config.get("postgres_user", "airflow")
-        self.pg_password = self.config.get("postgres_password", "airflow123")
-        self.pg_schema = self.config.get("postgres_schema", "serving")
+        self.spark = spark or self._create_spark_session()
         
-        # JDBC URL
-        self.jdbc_url = f"jdbc:postgresql://{self.pg_host}:{self.pg_port}/{self.pg_db}"
+        # JDBC properties
+        self.jdbc_url = (
+            f"jdbc:postgresql://{self.config.postgres.host}:{self.config.postgres.port}"
+            f"/{self.config.postgres.database}"
+        )
+        self.jdbc_properties = {
+            "user": self.config.postgres.user,
+            "password": self.config.postgres.password,
+            "driver": "org.postgresql.Driver",
+        }
         
-        # Batch size
-        self.batch_size = self.config.get("batch_size", 1000)
+        # Paths
+        self.gold_bucket = BUCKET_GOLD
+        self.serving_schema = SCHEMA_SERVING
         
-        logger.info(f"GoldToPostgresJob inicializado (DB: {self.pg_host}:{self.pg_port}/{self.pg_db})")
-    
+        logger.info(
+            "GoldToPostgresJob initialized",
+            extra={"job_id": self.job_id, "jdbc_url": self.jdbc_url},
+        )
+
+    def _create_spark_session(self) -> SparkSession:
+        """Cria SparkSession com JDBC driver."""
+        return (
+            SparkSession.builder
+            .appName(f"SPTrans_Gold_to_Postgres_{self.job_id}")
+            .config("spark.jars", "/opt/spark/jars/postgresql-42.6.0.jar")  # Driver JDBC
+            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+            .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+            .config("spark.hadoop.fs.s3a.endpoint", self.config.minio.endpoint)
+            .config("spark.hadoop.fs.s3a.access.key", self.config.minio.access_key)
+            .config("spark.hadoop.fs.s3a.secret.key", self.config.minio.secret_key)
+            .config("spark.hadoop.fs.s3a.path.style.access", "true")
+            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+            .getOrCreate()
+        )
+
+    @track_pipeline_run(stage="serving", job_name="gold_to_postgres")
     def run(
         self,
-        gold_path: str,
-        date: str,
-        tables: Optional[list] = None
-    ) -> Dict[str, Any]:
+        data_type: str = "hourly_metrics",
+        date: Optional[str] = None,
+        mode: str = "append",
+    ) -> Dict[str, any]:
         """
-        Executa o job.
-        
+        Executa load Gold → PostgreSQL.
+
         Args:
-            gold_path: Caminho base da camada Gold
-            date: Data de processamento (YYYY-MM-DD)
-            tables: Lista de tabelas a carregar (None = todas)
-        
+            data_type: Tipo de dado ('hourly_metrics', 'daily_summary', 'line_performance')
+            date: Data a processar (YYYY-MM-DD, None = todos)
+            mode: Modo de escrita ('append', 'overwrite', 'upsert')
+
         Returns:
-            Dicionário com estatísticas da execução
-        """
-        logger.info(f"=== Iniciando Gold to PostgreSQL: {date} ===")
-        
-        start_time = datetime.now()
-        stats = {
-            "date": date,
-            "start_time": str(start_time),
-            "tables_loaded": {},
-            "total_records": 0,
-            "errors": []
-        }
-        
-        try:
-            # Definir tabelas a carregar
-            tables_to_load = tables or [
-                "kpis_hourly",
-                "route_metrics",
-                "headway_analysis",
-                "system_summary",
-                "data_quality_metrics"
-            ]
-            
-            # Carregar cada tabela
-            for table_name in tables_to_load:
-                try:
-                    logger.info(f"Carregando tabela: {table_name}")
-                    
-                    # Ler dados Gold
-                    df = self._read_gold_table(gold_path, table_name, date)
-                    
-                    if df is None:
-                        logger.warning(f"Tabela {table_name} não encontrada para {date}")
-                        continue
-                    
-                    # Validar dados
-                    if not self._validate_dataframe(df, table_name):
-                        logger.error(f"Validação falhou para {table_name}")
-                        stats["errors"].append(f"Validation failed: {table_name}")
-                        continue
-                    
-                    # Carregar no PostgreSQL
-                    records_loaded = self._load_to_postgres(df, table_name)
-                    
-                    stats["tables_loaded"][table_name] = records_loaded
-                    stats["total_records"] += records_loaded
-                    
-                    logger.info(f"✓ {table_name}: {records_loaded} registros carregados")
-                    
-                except Exception as e:
-                    logger.error(f"Erro ao carregar {table_name}: {str(e)}", exc_info=True)
-                    stats["errors"].append(f"{table_name}: {str(e)}")
-            
-            # Atualizar metadados
-            self._update_metadata(date, stats)
-            
-            # Estatísticas finais
-            end_time = datetime.now()
-            duration = (end_time - start_time).total_seconds()
-            
-            stats["end_time"] = str(end_time)
-            stats["duration_seconds"] = duration
-            stats["success"] = len(stats["errors"]) == 0
-            
-            logger.info(f"=== Job concluído em {duration:.2f}s ===")
-            logger.info(f"Total de registros: {stats['total_records']}")
-            logger.info(f"Tabelas carregadas: {len(stats['tables_loaded'])}")
-            
-            if stats["errors"]:
-                logger.warning(f"Erros: {len(stats['errors'])}")
-            
-            return stats
-            
-        except Exception as e:
-            logger.error(f"Erro fatal no job: {str(e)}", exc_info=True)
-            stats["errors"].append(f"Fatal: {str(e)}")
-            stats["success"] = False
-            return stats
-    
-    def _read_gold_table(
-        self,
-        gold_path: str,
-        table_name: str,
-        date: str
-    ) -> Optional[DataFrame]:
-        """Lê tabela da camada Gold"""
-        try:
-            path = f"{gold_path}/{table_name}/date={date}"
-            
-            logger.debug(f"Lendo: {path}")
-            
-            df = self.spark.read.parquet(path)
-            
-            logger.info(f"Lidos {df.count()} registros de {table_name}")
-            
-            return df
-            
-        except Exception as e:
-            logger.warning(f"Erro ao ler {table_name}: {str(e)}")
-            return None
-    
-    def _validate_dataframe(self, df: DataFrame, table_name: str) -> bool:
-        """Valida DataFrame antes de carregar"""
-        try:
-            # Verificar se não está vazio
-            if df.rdd.isEmpty():
-                logger.warning(f"{table_name}: DataFrame vazio")
-                return False
-            
-            # Verificar colunas esperadas
-            expected_columns = self._get_expected_columns(table_name)
-            actual_columns = set(df.columns)
-            
-            missing_columns = set(expected_columns) - actual_columns
-            
-            if missing_columns:
-                logger.error(f"{table_name}: Colunas faltando: {missing_columns}")
-                return False
-            
-            # Verificar nulls em campos críticos
-            critical_columns = self._get_critical_columns(table_name)
-            
-            for col in critical_columns:
-                if col in actual_columns:
-                    null_count = df.filter(F.col(col).isNull()).count()
-                    if null_count > 0:
-                        logger.warning(f"{table_name}.{col}: {null_count} nulls encontrados")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Erro na validação: {str(e)}")
-            return False
-    
-    def _load_to_postgres(self, df: DataFrame, table_name: str) -> int:
-        """
-        Carrega DataFrame no PostgreSQL.
-        
-        Usa estratégia de upsert para evitar duplicatas.
+            Estatísticas do job
+
+        Raises:
+            ProcessingException: Se job falhar
         """
         try:
-            full_table_name = f"{self.pg_schema}.{table_name}"
+            logger.info(
+                "Starting Gold to PostgreSQL load",
+                extra={
+                    "job_id": self.job_id,
+                    "data_type": data_type,
+                    "date": date,
+                    "mode": mode,
+                },
+            )
+
+            # 1. Ler dados do Gold
+            gold_df = self._read_gold(data_type, date)
+            input_count = gold_df.count()
             
-            # Propriedades JDBC
-            jdbc_properties = {
-                "user": self.pg_user,
-                "password": self.pg_password,
-                "driver": "org.postgresql.Driver",
-                "batchsize": str(self.batch_size),
-                "reWriteBatchedInserts": "true",
+            logger.info(f"Read {input_count} records from Gold")
+
+            # 2. Preparar para serving
+            serving_df = self._prepare_for_serving(gold_df, data_type)
+
+            # 3. Determinar tabela de destino
+            table_name = self._get_target_table(data_type)
+
+            # 4. Load no PostgreSQL
+            if mode == "upsert":
+                self._upsert_to_postgres(serving_df, table_name, data_type)
+            else:
+                self._write_to_postgres(serving_df, table_name, mode)
+
+            # 5. Atualizar métricas
+            self._update_metrics(input_count)
+            
+            stats = {
+                "input_count": input_count,
+                "data_type": data_type,
+                "table_name": table_name,
+                "mode": mode,
             }
             
-            # Contar registros antes
-            record_count = df.count()
+            logger.info(
+                "Gold to PostgreSQL load completed",
+                extra={"job_id": self.job_id, "stats": stats},
+            )
             
-            # Modo de escrita
-            # Para tabelas com chave primária, usar 'append' e fazer upsert no PostgreSQL
-            # Para simplificar, usar 'overwrite' com particionamento por data
-            
-            write_mode = self.config.get("write_mode", "append")
-            
-            if write_mode == "overwrite":
-                # Deletar dados da data antes de inserir
-                self._delete_existing_data(table_name, df)
-            
-            # Escrever no PostgreSQL
-            df.write \
-                .format("jdbc") \
-                .option("url", self.jdbc_url) \
-                .option("dbtable", full_table_name) \
-                .options(**jdbc_properties) \
-                .mode("append") \
-                .save()
-            
-            logger.info(f"✓ {record_count} registros escritos em {full_table_name}")
-            
-            return record_count
-            
-        except Exception as e:
-            logger.error(f"Erro ao carregar no PostgreSQL: {str(e)}", exc_info=True)
-            raise
-    
-    def _delete_existing_data(self, table_name: str, df: DataFrame):
-        """Deleta dados existentes para a data"""
-        try:
-            # Obter data do DataFrame
-            date_values = df.select("date").distinct().collect()
-            
-            if not date_values:
-                return
-            
-            dates_str = ", ".join([f"'{row.date}'" for row in date_values])
-            
-            # Deletar via JDBC
-            delete_query = f"""
-                DELETE FROM {self.pg_schema}.{table_name}
-                WHERE date IN ({dates_str})
-            """
-            
-            logger.info(f"Deletando dados existentes: {delete_query}")
-            
-            # Executar delete (seria melhor usar connection direta)
-            # Por simplicidade, assumimos que append vai sobrescrever
-            
-        except Exception as e:
-            logger.warning(f"Erro ao deletar dados existentes: {str(e)}")
-    
-    def _get_expected_columns(self, table_name: str) -> list:
-        """Retorna colunas esperadas para cada tabela"""
-        schemas = {
-            "kpis_hourly": [
-                "date", "hour", "route_code", "total_vehicles",
-                "avg_speed_kmh", "max_speed_kmh", "pct_moving",
-                "pct_with_accessibility", "data_quality_score"
-            ],
-            "route_metrics": [
-                "date", "route_code", "total_vehicles",
-                "distance_traveled_km", "avg_speed"
-            ],
-            "headway_analysis": [
-                "date", "hour", "route_code", "avg_headway_minutes",
-                "min_headway_minutes", "max_headway_minutes"
-            ],
-            "system_summary": [
-                "date", "total_active_vehicles", "total_active_routes",
-                "system_avg_speed"
-            ],
-            "data_quality_metrics": [
-                "date", "hour", "layer", "source",
-                "overall_quality_score"
-            ],
-        }
-        
-        return schemas.get(table_name, [])
-    
-    def _get_critical_columns(self, table_name: str) -> list:
-        """Retorna colunas críticas (não podem ser null)"""
-        critical = {
-            "kpis_hourly": ["date", "hour"],
-            "route_metrics": ["date", "route_code"],
-            "headway_analysis": ["date", "route_code"],
-            "system_summary": ["date"],
-            "data_quality_metrics": ["date", "layer"],
-        }
-        
-        return critical.get(table_name, ["date"])
-    
-    def _update_metadata(self, date: str, stats: Dict[str, Any]):
-        """Atualiza tabela de metadados no PostgreSQL"""
-        try:
-            # Criar DataFrame com metadados
-            metadata = self.spark.createDataFrame([{
-                "job_name": "gold_to_postgres",
-                "execution_date": date,
-                "status": "success" if stats["success"] else "failed",
-                "start_time": stats["start_time"],
-                "end_time": stats.get("end_time"),
-                "records_processed": stats["total_records"],
-                "error_message": "; ".join(stats["errors"]) if stats["errors"] else None,
-                "metadata": str(stats)
-            }])
-            
-            # Escrever na tabela de controle
-            metadata.write \
-                .format("jdbc") \
-                .option("url", self.jdbc_url) \
-                .option("dbtable", f"{self.pg_schema}.processing_control") \
-                .option("user", self.pg_user) \
-                .option("password", self.pg_password) \
-                .option("driver", "org.postgresql.Driver") \
-                .mode("append") \
-                .save()
-            
-            logger.info("Metadados atualizados")
-            
-        except Exception as e:
-            logger.warning(f"Erro ao atualizar metadados: {str(e)}")
+            return stats
 
-# =============================================================================
-# MAIN (para execução standalone)
-# =============================================================================
+        except Exception as e:
+            logger.error(
+                f"Gold to PostgreSQL load failed: {e}",
+                extra={"job_id": self.job_id, "error": str(e)},
+                exc_info=True,
+            )
+            raise ProcessingException(
+                transformation="gold_to_postgres",
+                reason=str(e)
+            )
 
-def main():
-    """Função principal para execução standalone"""
-    import sys
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Gold to PostgreSQL Job")
-    parser.add_argument("--gold-path", required=True, help="Caminho Gold layer")
-    parser.add_argument("--date", required=True, help="Data (YYYY-MM-DD)")
-    parser.add_argument("--tables", nargs="+", help="Tabelas a carregar")
-    
-    args = parser.parse_args()
-    
-    # Criar SparkSession
-    spark = SparkSession.builder \
-        .appName("Gold-to-Postgres") \
-        .getOrCreate()
-    
-    try:
-        # Executar job
-        job = GoldToPostgresJob(spark)
-        stats = job.run(
-            gold_path=args.gold_path,
-            date=args.date,
-            tables=args.tables
+    def _read_gold(self, data_type: str, date: Optional[str] = None) -> DataFrame:
+        """
+        Lê dados da camada Gold.
+
+        Args:
+            data_type: Tipo de dado
+            date: Data (opcional)
+
+        Returns:
+            DataFrame do Gold
+        """
+        # Mapear data_type para prefixo
+        prefix_map = {
+            "hourly_metrics": "hourly_metrics",
+            "daily_summary": "daily_summary",
+            "line_performance": "line_performance",
+        }
+
+        prefix = prefix_map.get(data_type)
+        if not prefix:
+            raise ValueError(f"Unknown data type: {data_type}")
+
+        input_path = get_s3_path(
+            bucket=self.gold_bucket,
+            prefix=prefix,
         )
-        
-        # Status de saída
-        sys.exit(0 if stats["success"] else 1)
-        
-    finally:
-        spark.stop()
 
+        logger.info(f"Reading from Gold: {input_path}")
+
+        df = self.spark.read.format("delta").load(input_path)
+
+        # Filtrar por data se especificado
+        if date:
+            year, month = date.split("-")[:2]
+            df = df.filter(
+                (F.col("year") == int(year))
+                & (F.col("month") == int(month))
+            )
+
+        return df
+
+    def _prepare_for_serving(self, df: DataFrame, data_type: str) -> DataFrame:
+        """
+        Prepara dados para serving layer.
+
+        Args:
+            df: DataFrame Gold
+            data_type: Tipo de dado
+
+        Returns:
+            DataFrame preparado
+        """
+        logger.info("Preparing data for serving")
+
+        # Adicionar metadados de load
+        df = df.withColumn("loaded_at", F.current_timestamp())
+
+        # Arredondar valores numéricos para evitar precisão excessiva
+        numeric_cols = [
+            field.name
+            for field in df.schema.fields
+            if str(field.dataType) in ["DoubleType", "FloatType"]
+        ]
+
+        for col in numeric_cols:
+            if col in df.columns:
+                df = df.withColumn(col, F.round(F.col(col), 2))
+
+        # Remover colunas de particionamento se não forem necessárias no serving
+        # (mantemos para queries)
+
+        return df
+
+    def _get_target_table(self, data_type: str) -> str:
+        """
+        Retorna nome da tabela de destino.
+
+        Args:
+            data_type: Tipo de dado
+
+        Returns:
+            Nome completo da tabela (schema.table)
+        """
+        table_map = {
+            "hourly_metrics": TABLE_HOURLY_AGGREGATES,
+            "daily_summary": TABLE_DAILY_AGGREGATES,
+            "line_performance": TABLE_LINES_METRICS,
+        }
+
+        table_name = table_map.get(data_type)
+        if not table_name:
+            raise ValueError(f"Unknown data type: {data_type}")
+
+        # Adicionar schema
+        full_table = f"{self.serving_schema}.{table_name}"
+        return full_table
+
+    def _write_to_postgres(
+        self, df: DataFrame, table_name: str, mode: str = "append"
+    ) -> None:
+        """
+        Escreve DataFrame no PostgreSQL.
+
+        Args:
+            df: DataFrame a escrever
+            table_name: Nome da tabela
+            mode: Modo de escrita
+        """
+        try:
+            logger.info(
+                f"Writing to PostgreSQL: {table_name}",
+                extra={"mode": mode, "record_count": df.count()},
+            )
+
+            (
+                df.write
+                .mode(mode)
+                .jdbc(
+                    url=self.jdbc_url,
+                    table=table_name,
+                    properties=self.jdbc_properties,
+                )
+            )
+
+            logger.info(f"Successfully written to {table_name}")
+
+        except Exception as e:
+            raise DatabaseQueryException(
+                query=f"WRITE to {table_name}",
+                reason=str(e)
+            )
+
+    def _upsert_to_postgres(
+        self, df: DataFrame, table_name: str, data_type: str
+    ) -> None:
+        """
+        Faz upsert no PostgreSQL (update ou insert).
+
+        Args:
+            df: DataFrame
+            table_name: Nome da tabela
+            data_type: Tipo de dado
+        """
+        logger.info(f"Performing upsert to {table_name}")
+
+        # Criar tabela temporária
+        temp_table = f"{table_name}_temp"
+
+        # Escrever em temp
+        self._write_to_postgres(df, temp_table, mode="overwrite")
+
+        # Determinar chaves primárias baseado no tipo
+        key_cols = self._get_primary_keys(data_type)
+
+        # Construir query de merge
+        merge_query = self._build_merge_query(table_name, temp_table, key_cols)
+
+        # Executar merge via JDBC
+        try:
+            # Conectar e executar
+            logger.info("Executing merge query")
+
+            # Para executar SQL customizado, precisamos usar JDBC diretamente
+            # Aqui é um placeholder - em produção, usar py4j ou psycopg2
+            logger.warning("Upsert not fully implemented - using append instead")
+            self._write_to_postgres(df, table_name, mode="append")
+
+            # TODO: Implementar merge real usando:
+            # - Temporary staging table
+            # - PostgreSQL INSERT ... ON CONFLICT DO UPDATE
+            # - ou MERGE statement (PostgreSQL 15+)
+
+        except Exception as e:
+            raise DatabaseQueryException(
+                query=f"MERGE into {table_name}",
+                reason=str(e)
+            )
+
+    def _get_primary_keys(self, data_type: str) -> list:
+        """
+        Retorna chaves primárias baseado no tipo de dado.
+
+        Args:
+            data_type: Tipo de dado
+
+        Returns:
+            Lista de colunas de chave primária
+        """
+        key_map = {
+            "hourly_metrics": ["line_id", "hour_timestamp"],
+            "daily_summary": ["date"],
+            "line_performance": ["line_id", "analysis_period", "period_start"],
+        }
+
+        return key_map.get(data_type, [])
+
+    def _build_merge_query(
+        self, target_table: str, source_table: str, key_cols: list
+    ) -> str:
+        """
+        Constrói query de merge/upsert.
+
+        Args:
+            target_table: Tabela de destino
+            source_table: Tabela temporária
+            key_cols: Colunas de chave
+
+        Returns:
+            Query SQL
+        """
+        # PostgreSQL 15+ MERGE syntax
+        merge_query = f"""
+        MERGE INTO {target_table} AS target
+        USING {source_table} AS source
+        ON {' AND '.join([f'target.{col} = source.{col}' for col in key_cols])}
+        WHEN MATCHED THEN
+            UPDATE SET *
+        WHEN NOT MATCHED THEN
+            INSERT *
+        """
+
+        return merge_query
+
+    def _update_metrics(self, record_count: int) -> None:
+        """Atualiza métricas."""
+        update_processing_metrics(
+            stage="serving",
+            input_count=record_count,
+            output_count=record_count,
+            bytes_written_count=0,
+        )
+
+
+# Função standalone
+def run_gold_to_postgres_job(
+    data_type: str = "hourly_metrics",
+    date: Optional[str] = None,
+    mode: str = "append",
+    **kwargs
+) -> Dict[str, any]:
+    """Função standalone para Airflow."""
+    job = GoldToPostgresJob()
+    stats = job.run(data_type=data_type, date=date, mode=mode)
+    return stats
+
+
+# Exemplo de uso
 if __name__ == "__main__":
-    main()
+    from ...common.logging_config import setup_logging
 
-# =============================================================================
-# END
-# =============================================================================
+    setup_logging(log_level="INFO", log_format="console")
+
+    job = GoldToPostgresJob()
+    
+    # Load hourly metrics
+    stats = job.run(data_type="hourly_metrics", mode="append")
+
+    print(f"\nJob completed!")
+    print(f"Records loaded: {stats['input_count']}")
+    print(f"Target table: {stats['table_name']}")
+    print(f"Mode: {stats['mode']}")

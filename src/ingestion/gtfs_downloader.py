@@ -1,428 +1,443 @@
 """
-GTFS Downloader Module
-======================
-Download e extração de arquivos GTFS da SPTrans.
+GTFS Downloader e Parser para SPTrans.
 
-GTFS (General Transit Feed Specification) contém dados estáticos sobre:
-- routes: Linhas de ônibus
-- trips: Viagens programadas
-- stops: Pontos de parada
-- stop_times: Horários de chegada/saída
-- shapes: Traçado geográfico das rotas
+Download, extração e parse de arquivos GTFS estáticos
+do sistema de transporte de São Paulo.
 """
 
-import os
-import zipfile
-import requests
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-from pathlib import Path
+import csv
+import io
 import shutil
+import zipfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
 
-from src.common.logging_config import get_logger
-from src.common.exceptions import DownloadError
-from src.common.metrics import track_api_call, metrics
+import requests
+
+from ..common.config import Config
+from ..common.constants import SPTRANS_GTFS_URL
+from ..common.exceptions import (
+    APIConnectionException,
+    APITimeoutException,
+    StorageReadException,
+    StorageWriteException,
+)
+from ..common.logging_config import get_logger
+from ..common.utils import ensure_dir, get_file_size
 
 logger = get_logger(__name__)
 
+# Arquivos GTFS suportados
+GTFS_FILES = [
+    "agency.txt",
+    "stops.txt",
+    "routes.txt",
+    "trips.txt",
+    "stop_times.txt",
+    "calendar.txt",
+    "calendar_dates.txt",
+    "shapes.txt",
+    "frequencies.txt",
+    "feed_info.txt",
+]
+
 
 class GTFSDownloader:
-    """Cliente para download de dados GTFS da SPTrans."""
+    """
+    Downloader e parser para arquivos GTFS.
     
-    # URL oficial do GTFS da SPTrans
-    DEFAULT_GTFS_URL = "https://www.sptrans.com.br/umbraco/surface/PerfilDesenvolvedor/BaixarGTFS"
-    
-    # Arquivos esperados no GTFS
-    REQUIRED_FILES = [
-        'routes.txt',
-        'trips.txt',
-        'stops.txt',
-        'stop_times.txt',
-        'shapes.txt',
-        'calendar.txt',
-        'agency.txt'
-    ]
-    
-    OPTIONAL_FILES = [
-        'calendar_dates.txt',
-        'fare_attributes.txt',
-        'fare_rules.txt',
-        'frequencies.txt',
-        'transfers.txt'
-    ]
-    
-    def __init__(self, 
-                 download_dir: str = './data/gtfs',
-                 gtfs_url: Optional[str] = None):
+    Faz download do feed GTFS da SPTrans, extrai os arquivos
+    e fornece métodos para parse dos dados.
+    """
+
+    def __init__(
+        self,
+        config: Optional[Config] = None,
+        download_url: str = SPTRANS_GTFS_URL,
+        cache_dir: Optional[Path] = None,
+    ):
         """
         Inicializa downloader.
-        
+
         Args:
-            download_dir: Diretório para salvar arquivos
-            gtfs_url: URL customizada do GTFS (usa default se None)
+            config: Configuração (opcional)
+            download_url: URL do feed GTFS
+            cache_dir: Diretório para cache (opcional)
         """
-        self.download_dir = Path(download_dir)
-        self.gtfs_url = gtfs_url or self.DEFAULT_GTFS_URL
-        
-        # Criar diretório se não existir
-        self.download_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Configurar sessão HTTP
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'SPTransPipeline/1.0'
-        })
-        
-        logger.info(f"GTFSDownloader inicializado: dir={download_dir}, url={self.gtfs_url}")
-    
-    @track_api_call('gtfs_download')
-    def download(self, output_filename: Optional[str] = None) -> str:
+        self.config = config or Config()
+        self.download_url = download_url
+        self.cache_dir = cache_dir or Path("/tmp/gtfs_cache")
+
+        ensure_dir(self.cache_dir)
+
+        logger.info(
+            "GTFSDownloader initialized",
+            extra={
+                "download_url": self.download_url,
+                "cache_dir": str(self.cache_dir),
+            },
+        )
+
+    def download_gtfs(
+        self, force: bool = False, timeout: int = 300
+    ) -> Path:
         """
-        Baixa arquivo ZIP do GTFS.
-        
+        Faz download do arquivo GTFS zip.
+
         Args:
-            output_filename: Nome do arquivo de saída (gera automático se None)
-        
+            force: Se True, força novo download mesmo se já existir
+            timeout: Timeout em segundos
+
         Returns:
-            Caminho do arquivo baixado
-        
+            Path do arquivo zip baixado
+
         Raises:
-            DownloadError: Se o download falhar
+            APIConnectionException: Se download falhar
+            StorageWriteException: Se não conseguir salvar arquivo
         """
-        if output_filename is None:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_filename = f'gtfs_{timestamp}.zip'
-        
-        output_path = self.download_dir / output_filename
-        
-        logger.info(f"Iniciando download do GTFS de {self.gtfs_url}")
-        
+        zip_path = self.cache_dir / "gtfs.zip"
+
+        # Se já existe e não é para forçar, retorna
+        if zip_path.exists() and not force:
+            logger.info(
+                "GTFS file already exists, skipping download",
+                extra={"path": str(zip_path), "size_bytes": get_file_size(zip_path)},
+            )
+            return zip_path
+
+        logger.info(f"Downloading GTFS from {self.download_url}")
+
         try:
-            # Download com streaming para não sobrecarregar memória
-            response = self.session.get(self.gtfs_url, stream=True, timeout=300)
+            response = requests.get(
+                self.download_url, timeout=timeout, stream=True
+            )
             response.raise_for_status()
-            
-            # Obter tamanho do arquivo
-            total_size = int(response.headers.get('content-length', 0))
-            logger.info(f"Tamanho do arquivo: {total_size / 1024 / 1024:.2f} MB")
-            
-            # Download com progresso
-            downloaded_size = 0
-            chunk_size = 8192
-            
-            with open(output_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded_size += len(chunk)
-                        
-                        # Log de progresso a cada 10%
-                        if total_size > 0:
-                            progress = (downloaded_size / total_size) * 100
-                            if int(progress) % 10 == 0:
-                                logger.info(f"Progresso: {progress:.0f}%")
-            
-            logger.info(f"Download concluído: {output_path}")
-            
-            # Validar arquivo ZIP
-            if not zipfile.is_zipfile(output_path):
-                raise DownloadError(f"Arquivo baixado não é um ZIP válido: {output_path}")
-            
-            # Reportar métricas
-            metrics.storage_size.labels(
-                layer='gtfs_raw',
-                format='zip'
-            ).set(output_path.stat().st_size)
-            
-            return str(output_path)
-        
-        except requests.RequestException as e:
-            error_msg = f"Erro ao baixar GTFS: {e}"
-            logger.error(error_msg)
-            raise DownloadError(error_msg) from e
-        
-        except Exception as e:
-            error_msg = f"Erro inesperado no download: {e}"
-            logger.error(error_msg)
-            raise DownloadError(error_msg) from e
-    
-    def extract(self, zip_path: str, extract_dir: Optional[str] = None) -> List[str]:
+
+            # Salvar arquivo
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            file_size = get_file_size(zip_path)
+            logger.info(
+                "GTFS downloaded successfully",
+                extra={"path": str(zip_path), "size_bytes": file_size},
+            )
+
+            return zip_path
+
+        except requests.exceptions.Timeout:
+            raise APITimeoutException(endpoint=self.download_url, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            raise APIConnectionException(endpoint=self.download_url, reason=str(e))
+        except IOError as e:
+            raise StorageWriteException(location=str(zip_path), reason=str(e))
+
+    def extract_gtfs(self, zip_path: Optional[Path] = None) -> Path:
         """
-        Extrai arquivos do ZIP.
-        
+        Extrai arquivos GTFS do zip.
+
         Args:
-            zip_path: Caminho do arquivo ZIP
-            extract_dir: Diretório de extração (usa download_dir se None)
-        
+            zip_path: Path do arquivo zip (opcional, usa cache se None)
+
         Returns:
-            Lista de arquivos extraídos
-        
+            Path do diretório com arquivos extraídos
+
         Raises:
-            DownloadError: Se a extração falhar
+            StorageReadException: Se não conseguir ler/extrair zip
+        """
+        if zip_path is None:
+            zip_path = self.cache_dir / "gtfs.zip"
+
+        extract_dir = self.cache_dir / "gtfs_extracted"
+
+        # Se já existe, limpar
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+
+        ensure_dir(extract_dir)
+
+        try:
+            logger.info(f"Extracting GTFS to {extract_dir}")
+
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                zip_ref.extractall(extract_dir)
+
+            # Contar arquivos extraídos
+            extracted_files = list(extract_dir.glob("*.txt"))
+            logger.info(
+                "GTFS extracted successfully",
+                extra={
+                    "extract_dir": str(extract_dir),
+                    "files_count": len(extracted_files),
+                },
+            )
+
+            return extract_dir
+
+        except zipfile.BadZipFile as e:
+            raise StorageReadException(location=str(zip_path), reason=f"Invalid zip: {e}")
+        except IOError as e:
+            raise StorageReadException(location=str(zip_path), reason=str(e))
+
+    def parse_gtfs_file(
+        self, filename: str, extract_dir: Optional[Path] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse um arquivo GTFS específico.
+
+        Args:
+            filename: Nome do arquivo (ex: 'stops.txt')
+            extract_dir: Diretório com arquivos extraídos (opcional)
+
+        Returns:
+            Lista de dicionários com dados
+
+        Raises:
+            StorageReadException: Se arquivo não existir ou erro ao ler
         """
         if extract_dir is None:
-            extract_dir = self.download_dir
-        else:
-            extract_dir = Path(extract_dir)
-        
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"Extraindo {zip_path} para {extract_dir}")
-        
+            extract_dir = self.cache_dir / "gtfs_extracted"
+
+        file_path = extract_dir / filename
+
+        if not file_path.exists():
+            raise StorageReadException(
+                location=str(file_path), reason="File not found"
+            )
+
         try:
-            extracted_files = []
-            
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                # Listar arquivos no ZIP
-                file_list = zip_ref.namelist()
-                logger.info(f"Arquivos no ZIP: {len(file_list)}")
-                
-                # Extrair todos os arquivos
-                for file_name in file_list:
-                    # Extrair apenas arquivos .txt (ignorar diretórios e outros arquivos)
-                    if file_name.endswith('.txt'):
-                        zip_ref.extract(file_name, extract_dir)
-                        extracted_path = extract_dir / file_name
-                        extracted_files.append(file_name)
-                        
-                        # Log do tamanho
-                        size_mb = extracted_path.stat().st_size / 1024 / 1024
-                        logger.info(f"Extraído: {file_name} ({size_mb:.2f} MB)")
-            
-            logger.info(f"Extração concluída: {len(extracted_files)} arquivos")
-            
-            # Validar arquivos obrigatórios
-            self._validate_extracted_files(extracted_files)
-            
-            return extracted_files
-        
-        except zipfile.BadZipFile as e:
-            error_msg = f"Arquivo ZIP corrompido: {e}"
-            logger.error(error_msg)
-            raise DownloadError(error_msg) from e
-        
+            logger.info(f"Parsing GTFS file: {filename}")
+
+            with open(file_path, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                data = list(reader)
+
+            logger.info(
+                f"Parsed {filename}",
+                extra={"filename": filename, "records": len(data)},
+            )
+
+            return data
+
         except Exception as e:
-            error_msg = f"Erro ao extrair ZIP: {e}"
-            logger.error(error_msg)
-            raise DownloadError(error_msg) from e
-    
-    def _validate_extracted_files(self, extracted_files: List[str]):
+            raise StorageReadException(location=str(file_path), reason=str(e))
+
+    def parse_stops(self, extract_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
         """
-        Valida se todos os arquivos obrigatórios foram extraídos.
-        
+        Parse arquivo stops.txt.
+
         Args:
-            extracted_files: Lista de arquivos extraídos
-        
-        Raises:
-            DownloadError: Se arquivos obrigatórios estiverem faltando
+            extract_dir: Diretório com arquivos extraídos (opcional)
+
+        Returns:
+            Lista de paradas
         """
-        missing_files = [
-            f for f in self.REQUIRED_FILES 
-            if f not in extracted_files
-        ]
-        
-        if missing_files:
-            error_msg = f"Arquivos obrigatórios faltando: {missing_files}"
-            logger.error(error_msg)
-            raise DownloadError(error_msg)
-        
-        logger.info("Todos os arquivos obrigatórios presentes ✓")
-        
-        # Log de arquivos opcionais presentes
-        optional_present = [
-            f for f in self.OPTIONAL_FILES 
-            if f in extracted_files
-        ]
-        if optional_present:
-            logger.info(f"Arquivos opcionais presentes: {optional_present}")
-    
-    def download_and_extract(self, cleanup_zip: bool = True) -> Dict[str, Any]:
+        return self.parse_gtfs_file("stops.txt", extract_dir)
+
+    def parse_routes(self, extract_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
         """
-        Download e extração em um único método.
-        
+        Parse arquivo routes.txt.
+
         Args:
-            cleanup_zip: Se deve remover o ZIP após extração
-        
+            extract_dir: Diretório com arquivos extraídos (opcional)
+
         Returns:
-            Dict com informações do download
+            Lista de rotas
         """
-        logger.info("Iniciando download e extração do GTFS")
-        
-        # Download
-        start_time = datetime.now()
-        zip_path = self.download()
-        download_duration = (datetime.now() - start_time).total_seconds()
-        
-        # Extração
-        start_time = datetime.now()
-        extracted_files = self.extract(zip_path)
-        extract_duration = (datetime.now() - start_time).total_seconds()
-        
-        # Cleanup
-        if cleanup_zip:
-            logger.info(f"Removendo arquivo ZIP: {zip_path}")
-            os.remove(zip_path)
-        
-        result = {
-            'success': True,
-            'download_duration_seconds': download_duration,
-            'extract_duration_seconds': extract_duration,
-            'total_duration_seconds': download_duration + extract_duration,
-            'extracted_files': extracted_files,
-            'file_count': len(extracted_files),
-            'extract_dir': str(self.download_dir),
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        logger.info(f"Download e extração concluídos: {result}")
-        
-        return result
-    
-    def get_file_path(self, filename: str) -> str:
+        return self.parse_gtfs_file("routes.txt", extract_dir)
+
+    def parse_trips(self, extract_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
         """
-        Retorna caminho completo de um arquivo GTFS.
-        
+        Parse arquivo trips.txt.
+
         Args:
-            filename: Nome do arquivo (ex: 'routes.txt')
-        
+            extract_dir: Diretório com arquivos extraídos (opcional)
+
         Returns:
-            Caminho completo do arquivo
+            Lista de viagens
         """
-        return str(self.download_dir / filename)
-    
-    def validate_gtfs_integrity(self) -> Dict[str, Any]:
+        return self.parse_gtfs_file("trips.txt", extract_dir)
+
+    def parse_stop_times(
+        self, extract_dir: Optional[Path] = None
+    ) -> List[Dict[str, Any]]:
         """
-        Valida integridade dos arquivos GTFS extraídos.
-        
+        Parse arquivo stop_times.txt.
+
+        Args:
+            extract_dir: Diretório com arquivos extraídos (opcional)
+
         Returns:
-            Dict com estatísticas de validação
+            Lista de horários de parada
         """
-        logger.info("Validando integridade do GTFS")
-        
-        validation = {
-            'required_files': {},
-            'optional_files': {},
-            'errors': [],
-            'warnings': []
-        }
-        
-        # Verificar arquivos obrigatórios
-        for filename in self.REQUIRED_FILES:
-            filepath = self.download_dir / filename
-            
-            if filepath.exists():
-                size = filepath.stat().st_size
-                # Contar linhas (excluindo header)
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    line_count = sum(1 for _ in f) - 1
-                
-                validation['required_files'][filename] = {
-                    'exists': True,
-                    'size_bytes': size,
-                    'size_mb': round(size / 1024 / 1024, 2),
-                    'line_count': line_count
-                }
-                
-                # Validação básica
-                if size == 0:
-                    validation['errors'].append(f"{filename} está vazio")
-                elif line_count == 0:
-                    validation['warnings'].append(f"{filename} não tem dados")
-            else:
-                validation['required_files'][filename] = {'exists': False}
-                validation['errors'].append(f"{filename} não encontrado")
-        
-        # Verificar arquivos opcionais
-        for filename in self.OPTIONAL_FILES:
-            filepath = self.download_dir / filename
-            
-            if filepath.exists():
-                size = filepath.stat().st_size
-                validation['optional_files'][filename] = {
-                    'exists': True,
-                    'size_mb': round(size / 1024 / 1024, 2)
-                }
-        
-        # Status geral
-        validation['is_valid'] = len(validation['errors']) == 0
-        validation['completeness'] = (
-            len([f for f in validation['required_files'].values() if f.get('exists')]) / 
-            len(self.REQUIRED_FILES) * 100
+        return self.parse_gtfs_file("stop_times.txt", extract_dir)
+
+    def parse_shapes(self, extract_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+        """
+        Parse arquivo shapes.txt.
+
+        Args:
+            extract_dir: Diretório com arquivos extraídos (opcional)
+
+        Returns:
+            Lista de formas/traçados
+        """
+        return self.parse_gtfs_file("shapes.txt", extract_dir)
+
+    def parse_all(self, extract_dir: Optional[Path] = None) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Parse todos os arquivos GTFS disponíveis.
+
+        Args:
+            extract_dir: Diretório com arquivos extraídos (opcional)
+
+        Returns:
+            Dicionário {filename: data}
+        """
+        if extract_dir is None:
+            extract_dir = self.cache_dir / "gtfs_extracted"
+
+        results = {}
+
+        for filename in GTFS_FILES:
+            file_path = extract_dir / filename
+
+            if not file_path.exists():
+                logger.warning(f"GTFS file not found, skipping: {filename}")
+                continue
+
+            try:
+                results[filename] = self.parse_gtfs_file(filename, extract_dir)
+            except Exception as e:
+                logger.error(
+                    f"Error parsing {filename}: {e}",
+                    extra={"filename": filename, "error": str(e)},
+                )
+                continue
+
+        logger.info(
+            "Parsed all GTFS files",
+            extra={"files_parsed": len(results), "total_files": len(GTFS_FILES)},
         )
-        
-        logger.info(f"Validação: {validation['completeness']:.1f}% completo, "
-                   f"{len(validation['errors'])} erros, "
-                   f"{len(validation['warnings'])} avisos")
-        
-        return validation
-    
-    def cleanup_old_files(self, keep_days: int = 7):
+
+        return results
+
+    def download_and_parse(
+        self, force_download: bool = False
+    ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Remove arquivos GTFS antigos.
-        
+        Faz download, extração e parse completo do GTFS.
+
         Args:
-            keep_days: Manter arquivos dos últimos N dias
+            force_download: Se True, força novo download
+
+        Returns:
+            Dicionário {filename: data}
         """
-        logger.info(f"Limpando arquivos GTFS com mais de {keep_days} dias")
-        
-        cutoff_time = datetime.now().timestamp() - (keep_days * 24 * 60 * 60)
-        removed_count = 0
-        
-        for filepath in self.download_dir.glob('*.txt'):
-            if filepath.stat().st_mtime < cutoff_time:
-                logger.info(f"Removendo arquivo antigo: {filepath}")
-                filepath.unlink()
-                removed_count += 1
-        
-        for filepath in self.download_dir.glob('*.zip'):
-            if filepath.stat().st_mtime < cutoff_time:
-                logger.info(f"Removendo ZIP antigo: {filepath}")
-                filepath.unlink()
-                removed_count += 1
-        
-        logger.info(f"Cleanup concluído: {removed_count} arquivos removidos")
+        # Download
+        zip_path = self.download_gtfs(force=force_download)
+
+        # Extração
+        extract_dir = self.extract_gtfs(zip_path)
+
+        # Parse
+        data = self.parse_all(extract_dir)
+
+        return data
+
+    def get_stats(
+        self, data: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    ) -> Dict[str, int]:
+        """
+        Retorna estatísticas dos dados GTFS.
+
+        Args:
+            data: Dados parseados (opcional, parse se None)
+
+        Returns:
+            Dicionário com contagens
+        """
+        if data is None:
+            data = self.parse_all()
+
+        stats = {}
+        for filename, records in data.items():
+            key = filename.replace(".txt", "")
+            stats[key] = len(records)
+
+        logger.info("GTFS stats", extra=stats)
+        return stats
+
+    def validate_gtfs(
+        self, data: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    ) -> Dict[str, Any]:
+        """
+        Valida dados GTFS básicos.
+
+        Args:
+            data: Dados parseados (opcional)
+
+        Returns:
+            Dicionário com resultados de validação
+        """
+        if data is None:
+            data = self.parse_all()
+
+        validation = {
+            "is_valid": True,
+            "errors": [],
+            "warnings": [],
+            "stats": self.get_stats(data),
+        }
+
+        # Arquivos obrigatórios
+        required_files = ["stops.txt", "routes.txt", "trips.txt", "stop_times.txt"]
+
+        for req_file in required_files:
+            if req_file not in data:
+                validation["is_valid"] = False
+                validation["errors"].append(f"Missing required file: {req_file}")
+
+        # Validar que não estão vazios
+        for filename, records in data.items():
+            if len(records) == 0:
+                validation["warnings"].append(f"Empty file: {filename}")
+
+        logger.info(
+            "GTFS validation complete",
+            extra={
+                "is_valid": validation["is_valid"],
+                "errors_count": len(validation["errors"]),
+                "warnings_count": len(validation["warnings"]),
+            },
+        )
+
+        return validation
 
 
-def download_gtfs(output_dir: str = './data/gtfs', 
-                  cleanup_zip: bool = True) -> Dict[str, Any]:
-    """
-    Função auxiliar para download rápido do GTFS.
-    
-    Args:
-        output_dir: Diretório de saída
-        cleanup_zip: Remover ZIP após extração
-    
-    Returns:
-        Dict com informações do download
-    """
-    downloader = GTFSDownloader(download_dir=output_dir)
-    return downloader.download_and_extract(cleanup_zip=cleanup_zip)
-
-
+# Exemplo de uso
 if __name__ == "__main__":
-    # Teste do módulo
-    print("=== Testando GTFSDownloader ===\n")
-    
+    from ..common.logging_config import setup_logging
+
+    setup_logging(log_level="INFO", log_format="console")
+
     # Criar downloader
-    downloader = GTFSDownloader(download_dir='./data/gtfs_test')
-    
-    print("1. Download e extração do GTFS...")
-    try:
-        result = downloader.download_and_extract(cleanup_zip=False)
-        print(f"   ✅ Sucesso: {result['file_count']} arquivos extraídos")
-        print(f"   ⏱️  Duração: {result['total_duration_seconds']:.2f}s")
-    except Exception as e:
-        print(f"   ❌ Erro: {e}")
-    
-    print("\n2. Validando integridade...")
-    validation = downloader.validate_gtfs_integrity()
-    print(f"   Completude: {validation['completeness']:.1f}%")
-    print(f"   Erros: {len(validation['errors'])}")
-    print(f"   Avisos: {len(validation['warnings'])}")
-    
-    if validation['errors']:
-        print(f"   ❌ Erros encontrados: {validation['errors']}")
-    else:
-        print("   ✅ GTFS válido")
-    
-    print("\n✅ Testes concluídos!")
+    downloader = GTFSDownloader()
+
+    # Download e parse completo
+    data = downloader.download_and_parse(force_download=False)
+
+    # Stats
+    stats = downloader.get_stats(data)
+    print(f"\nGTFS Stats:")
+    for key, count in stats.items():
+        print(f"  {key}: {count:,} records")
+
+    # Validação
+    validation = downloader.validate_gtfs(data)
+    print(f"\nValidation:")
+    print(f"  Valid: {validation['is_valid']}")
+    print(f"  Errors: {len(validation['errors'])}")
+    print(f"  Warnings: {len(validation['warnings'])}")

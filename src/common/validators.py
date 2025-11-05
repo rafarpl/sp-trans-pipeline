@@ -1,552 +1,630 @@
 """
-Data Validators Module
-======================
-Funções de validação para garantir qualidade dos dados do pipeline SPTrans.
+Validadores de Dados para SPTrans Pipeline.
 
-Inclui validações para:
-- Coordenadas geográficas
-- Timestamps
-- IDs de veículos
-- Códigos de linhas/rotas
-- Dados GTFS
+Fornece funções de validação para garantir qualidade e integridade
+dos dados em diferentes estágios do pipeline.
 """
 
-from typing import Optional, Tuple, List, Dict, Any
 from datetime import datetime, timedelta
-import re
+from typing import Any, Dict, List, Optional, Tuple
+
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import BooleanType
 
-from src.common.logging_config import get_logger
-from src.common.exceptions import ValidationError
+from .constants import (
+    DQ_LATITUDE_RANGE,
+    DQ_LONGITUDE_RANGE,
+    DQ_MAX_DUPLICATE_RATE,
+    DQ_MAX_NULL_RATE,
+    DQ_MIN_FRESHNESS_MINUTES,
+    DQ_MIN_SUCCESS_RATE,
+    DQ_REQUIRED_FIELDS_POSITION,
+    SPEED_MAX_REASONABLE,
+    SPEED_MIN_OPERATIONAL,
+)
+from .exceptions import (
+    DataFreshnessException,
+    DataValidationException,
+    DuplicateRecordsException,
+    SchemaValidationException,
+)
+from .logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
-class CoordinateValidator:
-    """Validador de coordenadas geográficas."""
-    
-    # Limites aproximados da cidade de São Paulo
-    SAO_PAULO_BOUNDS = {
-        'lat_min': -24.008,
-        'lat_max': -23.357,
-        'lon_min': -46.826,
-        'lon_max': -46.365
-    }
-    
-    # Limites mais amplos (região metropolitana)
-    METRO_SP_BOUNDS = {
-        'lat_min': -24.5,
-        'lat_max': -23.0,
-        'lon_min': -47.5,
-        'lon_max': -46.0
-    }
-    
-    @classmethod
-    def is_valid_latitude(cls, lat: float, strict: bool = True) -> bool:
-        """
-        Valida latitude.
-        
-        Args:
-            lat: Latitude para validar
-            strict: Se True, usa limites da cidade. Se False, usa limites da região metropolitana
-        
-        Returns:
-            True se válida, False caso contrário
-        """
-        if lat is None or not isinstance(lat, (int, float)):
-            return False
-        
-        bounds = cls.SAO_PAULO_BOUNDS if strict else cls.METRO_SP_BOUNDS
-        return bounds['lat_min'] <= lat <= bounds['lat_max']
-    
-    @classmethod
-    def is_valid_longitude(cls, lon: float, strict: bool = True) -> bool:
-        """
-        Valida longitude.
-        
-        Args:
-            lon: Longitude para validar
-            strict: Se True, usa limites da cidade. Se False, usa limites da região metropolitana
-        
-        Returns:
-            True se válida, False caso contrário
-        """
-        if lon is None or not isinstance(lon, (int, float)):
-            return False
-        
-        bounds = cls.SAO_PAULO_BOUNDS if strict else cls.METRO_SP_BOUNDS
-        return bounds['lon_min'] <= lon <= bounds['lon_max']
-    
-    @classmethod
-    def is_valid_coordinate(cls, lat: float, lon: float, strict: bool = True) -> bool:
-        """
-        Valida par de coordenadas.
-        
-        Args:
-            lat: Latitude
-            lon: Longitude
-            strict: Se True, usa limites da cidade
-        
-        Returns:
-            True se ambas coordenadas são válidas
-        """
-        return cls.is_valid_latitude(lat, strict) and cls.is_valid_longitude(lon, strict)
-    
-    @classmethod
-    def validate_coordinates_df(cls, df: DataFrame, lat_col: str = 'latitude', 
-                               lon_col: str = 'longitude', strict: bool = True) -> DataFrame:
-        """
-        Adiciona coluna de validação de coordenadas em DataFrame Spark.
-        
-        Args:
-            df: DataFrame Spark
-            lat_col: Nome da coluna de latitude
-            lon_col: Nome da coluna de longitude
-            strict: Se True, usa limites da cidade
-        
-        Returns:
-            DataFrame com coluna 'is_valid_coordinate'
-        """
-        bounds = cls.SAO_PAULO_BOUNDS if strict else cls.METRO_SP_BOUNDS
-        
-        df = df.withColumn(
-            'is_valid_coordinate',
-            (F.col(lat_col).between(bounds['lat_min'], bounds['lat_max'])) &
-            (F.col(lon_col).between(bounds['lon_min'], bounds['lon_max']))
-        )
-        
-        return df
+# =============================================================================
+# Schema Validators
+# =============================================================================
 
 
-class TimestampValidator:
-    """Validador de timestamps."""
-    
-    @staticmethod
-    def is_valid_timestamp(ts: datetime, max_future_seconds: int = 300,
-                          max_past_hours: int = 24) -> bool:
-        """
-        Valida se timestamp está em intervalo aceitável.
-        
-        Args:
-            ts: Timestamp para validar
-            max_future_seconds: Máximo de segundos no futuro permitido
-            max_past_hours: Máximo de horas no passado permitido
-        
-        Returns:
-            True se válido
-        """
-        if ts is None or not isinstance(ts, datetime):
-            return False
-        
-        now = datetime.now()
-        max_future = now + timedelta(seconds=max_future_seconds)
-        max_past = now - timedelta(hours=max_past_hours)
-        
-        return max_past <= ts <= max_future
-    
-    @staticmethod
-    def parse_sptrans_timestamp(ts_str: str) -> Optional[datetime]:
-        """
-        Parse timestamp do formato SPTrans (ex: "2024-01-20T18:45:30").
-        
-        Args:
-            ts_str: String de timestamp
-        
-        Returns:
-            datetime object ou None se inválido
-        """
-        if not ts_str:
-            return None
-        
-        try:
-            # Formato: "2024-01-20T18:45:30"
-            return datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S")
-        except ValueError:
-            try:
-                # Formato alternativo com milissegundos
-                return datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S.%f")
-            except ValueError:
-                logger.warning(f"Formato de timestamp inválido: {ts_str}")
-                return None
-    
-    @classmethod
-    def validate_timestamps_df(cls, df: DataFrame, ts_col: str = 'timestamp',
-                              max_future_seconds: int = 300,
-                              max_past_hours: int = 24) -> DataFrame:
-        """
-        Adiciona coluna de validação de timestamps em DataFrame Spark.
-        
-        Args:
-            df: DataFrame Spark
-            ts_col: Nome da coluna de timestamp
-            max_future_seconds: Máximo de segundos no futuro
-            max_past_hours: Máximo de horas no passado
-        
-        Returns:
-            DataFrame com coluna 'is_valid_timestamp'
-        """
-        now = F.current_timestamp()
-        max_future = F.expr(f"current_timestamp() + interval {max_future_seconds} seconds")
-        max_past = F.expr(f"current_timestamp() - interval {max_past_hours} hours")
-        
-        df = df.withColumn(
-            'is_valid_timestamp',
-            (F.col(ts_col).between(max_past, max_future)) & F.col(ts_col).isNotNull()
-        )
-        
-        return df
-
-
-class VehicleValidator:
-    """Validador de dados de veículos."""
-    
-    @staticmethod
-    def is_valid_vehicle_id(vehicle_id: Any) -> bool:
-        """
-        Valida ID de veículo (prefixo).
-        
-        Args:
-            vehicle_id: ID do veículo
-        
-        Returns:
-            True se válido
-        """
-        if vehicle_id is None:
-            return False
-        
-        # Converter para string e validar
-        vid_str = str(vehicle_id)
-        
-        # ID deve ser numérico e ter entre 1 e 10 dígitos
-        return vid_str.isdigit() and 1 <= len(vid_str) <= 10
-    
-    @staticmethod
-    def validate_vehicles_df(df: DataFrame, vehicle_col: str = 'vehicle_id') -> DataFrame:
-        """
-        Adiciona coluna de validação de IDs de veículos.
-        
-        Args:
-            df: DataFrame Spark
-            vehicle_col: Nome da coluna de vehicle ID
-        
-        Returns:
-            DataFrame com coluna 'is_valid_vehicle_id'
-        """
-        df = df.withColumn(
-            'is_valid_vehicle_id',
-            (F.col(vehicle_col).isNotNull()) &
-            (F.length(F.col(vehicle_col).cast('string')).between(1, 10)) &
-            (F.col(vehicle_col).cast('string').rlike('^[0-9]+$'))
-        )
-        
-        return df
-
-
-class RouteValidator:
-    """Validador de rotas/linhas."""
-    
-    @staticmethod
-    def is_valid_route_code(route_code: Any) -> bool:
-        """
-        Valida código de rota.
-        
-        Args:
-            route_code: Código da rota
-        
-        Returns:
-            True se válido
-        """
-        if route_code is None:
-            return False
-        
-        rc_str = str(route_code)
-        
-        # Código deve ser alfanumérico e ter entre 1 e 20 caracteres
-        return bool(re.match(r'^[A-Z0-9\-]+$', rc_str, re.IGNORECASE)) and 1 <= len(rc_str) <= 20
-    
-    @staticmethod
-    def is_valid_direction(direction: Any) -> bool:
-        """
-        Valida direção da linha (1 ou 2).
-        
-        Args:
-            direction: Direção da linha
-        
-        Returns:
-            True se válido
-        """
-        return direction in [1, 2, '1', '2']
-    
-    @staticmethod
-    def validate_routes_df(df: DataFrame, route_col: str = 'route_code',
-                          direction_col: str = 'direction') -> DataFrame:
-        """
-        Adiciona coluna de validação de rotas.
-        
-        Args:
-            df: DataFrame Spark
-            route_col: Nome da coluna de código da rota
-            direction_col: Nome da coluna de direção
-        
-        Returns:
-            DataFrame com coluna 'is_valid_route'
-        """
-        df = df.withColumn(
-            'is_valid_route',
-            (F.col(route_col).isNotNull()) &
-            (F.length(F.col(route_col).cast('string')).between(1, 20)) &
-            (F.col(direction_col).isin([1, 2]))
-        )
-        
-        return df
-
-
-class GTFSValidator:
-    """Validador de dados GTFS."""
-    
-    @staticmethod
-    def validate_gtfs_routes(df: DataFrame) -> Dict[str, Any]:
-        """
-        Valida arquivo routes.txt do GTFS.
-        
-        Args:
-            df: DataFrame Spark com dados de routes
-        
-        Returns:
-            Dict com estatísticas de validação
-        """
-        total = df.count()
-        
-        # Validações
-        valid_route_id = df.filter(F.col('route_id').isNotNull()).count()
-        valid_route_short_name = df.filter(F.col('route_short_name').isNotNull()).count()
-        valid_route_type = df.filter(F.col('route_type').isin([0, 1, 2, 3, 4, 5, 6, 7])).count()
-        
-        return {
-            'total_records': total,
-            'valid_route_id': valid_route_id,
-            'valid_route_short_name': valid_route_short_name,
-            'valid_route_type': valid_route_type,
-            'completeness_pct': (valid_route_id / total * 100) if total > 0 else 0
-        }
-    
-    @staticmethod
-    def validate_gtfs_stops(df: DataFrame) -> Dict[str, Any]:
-        """
-        Valida arquivo stops.txt do GTFS.
-        
-        Args:
-            df: DataFrame Spark com dados de stops
-        
-        Returns:
-            Dict com estatísticas de validação
-        """
-        total = df.count()
-        
-        # Validações
-        valid_stop_id = df.filter(F.col('stop_id').isNotNull()).count()
-        valid_stop_name = df.filter(F.col('stop_name').isNotNull()).count()
-        
-        # Validar coordenadas
-        df_with_validation = CoordinateValidator.validate_coordinates_df(
-            df, 'stop_lat', 'stop_lon', strict=False
-        )
-        valid_coordinates = df_with_validation.filter(F.col('is_valid_coordinate')).count()
-        
-        return {
-            'total_records': total,
-            'valid_stop_id': valid_stop_id,
-            'valid_stop_name': valid_stop_name,
-            'valid_coordinates': valid_coordinates,
-            'completeness_pct': (valid_stop_id / total * 100) if total > 0 else 0
-        }
-
-
-class DataQualityValidator:
-    """Validador geral de qualidade de dados."""
-    
-    @staticmethod
-    def check_nulls(df: DataFrame, columns: Optional[List[str]] = None) -> Dict[str, float]:
-        """
-        Verifica porcentagem de nulos por coluna.
-        
-        Args:
-            df: DataFrame Spark
-            columns: Lista de colunas para verificar (None = todas)
-        
-        Returns:
-            Dict com % de nulos por coluna
-        """
-        if columns is None:
-            columns = df.columns
-        
-        total = df.count()
-        null_counts = {}
-        
-        for col in columns:
-            null_count = df.filter(F.col(col).isNull()).count()
-            null_counts[col] = (null_count / total * 100) if total > 0 else 0
-        
-        return null_counts
-    
-    @staticmethod
-    def check_duplicates(df: DataFrame, key_columns: List[str]) -> Tuple[int, float]:
-        """
-        Verifica duplicatas baseado em colunas chave.
-        
-        Args:
-            df: DataFrame Spark
-            key_columns: Colunas que formam a chave única
-        
-        Returns:
-            Tupla (número de duplicatas, % de duplicatas)
-        """
-        total = df.count()
-        unique = df.dropDuplicates(key_columns).count()
-        duplicates = total - unique
-        
-        return duplicates, (duplicates / total * 100) if total > 0 else 0
-    
-    @staticmethod
-    def check_completeness(df: DataFrame, required_columns: List[str]) -> Dict[str, Any]:
-        """
-        Verifica completude dos dados.
-        
-        Args:
-            df: DataFrame Spark
-            required_columns: Colunas obrigatórias
-        
-        Returns:
-            Dict com estatísticas de completude
-        """
-        total = df.count()
-        
-        # Registros completos (sem nulos nas colunas obrigatórias)
-        complete_condition = None
-        for col in required_columns:
-            if complete_condition is None:
-                complete_condition = F.col(col).isNotNull()
-            else:
-                complete_condition = complete_condition & F.col(col).isNotNull()
-        
-        complete_records = df.filter(complete_condition).count() if complete_condition else total
-        
-        return {
-            'total_records': total,
-            'complete_records': complete_records,
-            'incomplete_records': total - complete_records,
-            'completeness_pct': (complete_records / total * 100) if total > 0 else 0
-        }
-    
-    @staticmethod
-    def validate_all(df: DataFrame, validation_rules: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Executa todas as validações configuradas.
-        
-        Args:
-            df: DataFrame Spark
-            validation_rules: Dict com regras de validação
-        
-        Returns:
-            Dict com resultados de todas validações
-        """
-        results = {}
-        
-        # Validar coordenadas se especificado
-        if 'coordinates' in validation_rules:
-            coord_rules = validation_rules['coordinates']
-            df = CoordinateValidator.validate_coordinates_df(
-                df, 
-                lat_col=coord_rules.get('lat_col', 'latitude'),
-                lon_col=coord_rules.get('lon_col', 'longitude'),
-                strict=coord_rules.get('strict', True)
-            )
-            valid_coords = df.filter(F.col('is_valid_coordinate')).count()
-            results['valid_coordinates'] = valid_coords
-            results['valid_coordinates_pct'] = (valid_coords / df.count() * 100) if df.count() > 0 else 0
-        
-        # Validar timestamps se especificado
-        if 'timestamps' in validation_rules:
-            ts_rules = validation_rules['timestamps']
-            df = TimestampValidator.validate_timestamps_df(
-                df,
-                ts_col=ts_rules.get('ts_col', 'timestamp')
-            )
-            valid_ts = df.filter(F.col('is_valid_timestamp')).count()
-            results['valid_timestamps'] = valid_ts
-            results['valid_timestamps_pct'] = (valid_ts / df.count() * 100) if df.count() > 0 else 0
-        
-        # Verificar nulos
-        if 'null_check_columns' in validation_rules:
-            results['null_percentages'] = DataQualityValidator.check_nulls(
-                df, validation_rules['null_check_columns']
-            )
-        
-        # Verificar duplicatas
-        if 'duplicate_key_columns' in validation_rules:
-            dup_count, dup_pct = DataQualityValidator.check_duplicates(
-                df, validation_rules['duplicate_key_columns']
-            )
-            results['duplicate_count'] = dup_count
-            results['duplicate_pct'] = dup_pct
-        
-        # Verificar completude
-        if 'required_columns' in validation_rules:
-            results['completeness'] = DataQualityValidator.check_completeness(
-                df, validation_rules['required_columns']
-            )
-        
-        return results
-
-
-# Funções auxiliares para uso direto
-def validate_sptrans_position_data(df: DataFrame) -> Dict[str, Any]:
+def validate_schema(
+    df: DataFrame, required_columns: List[str], stage: str = "unknown"
+) -> Tuple[bool, List[str]]:
     """
-    Valida dados de posição da API SPTrans.
-    
+    Valida se o DataFrame contém todas as colunas obrigatórias.
+
     Args:
-        df: DataFrame com dados de posição
-    
+        df: DataFrame Spark
+        required_columns: Lista de colunas obrigatórias
+        stage: Estágio do pipeline (para logging)
+
     Returns:
-        Dict com resultados de validação
+        Tuple (is_valid, missing_columns)
+
+    Raises:
+        SchemaValidationException: Se colunas obrigatórias estiverem faltando
     """
-    validation_rules = {
-        'coordinates': {
-            'lat_col': 'latitude',
-            'lon_col': 'longitude',
-            'strict': True
+    actual_columns = set(df.columns)
+    required_set = set(required_columns)
+    missing_columns = list(required_set - actual_columns)
+
+    if missing_columns:
+        logger.error(
+            f"Schema validation failed in {stage}",
+            extra={
+                "missing_columns": missing_columns,
+                "required_columns": required_columns,
+                "actual_columns": list(actual_columns),
+            },
+        )
+        raise SchemaValidationException(
+            expected_schema=str(required_columns),
+            actual_schema=str(list(actual_columns)),
+        )
+
+    logger.info(
+        f"Schema validation passed in {stage}",
+        extra={"columns_count": len(actual_columns)},
+    )
+    return True, []
+
+
+def validate_data_types(
+    df: DataFrame, expected_types: Dict[str, str], stage: str = "unknown"
+) -> Tuple[bool, List[str]]:
+    """
+    Valida se as colunas têm os tipos de dados esperados.
+
+    Args:
+        df: DataFrame Spark
+        expected_types: Dicionário {coluna: tipo_esperado}
+        stage: Estágio do pipeline
+
+    Returns:
+        Tuple (is_valid, type_mismatches)
+    """
+    type_mismatches = []
+
+    for col_name, expected_type in expected_types.items():
+        if col_name not in df.columns:
+            continue
+
+        actual_type = dict(df.dtypes)[col_name]
+        if actual_type != expected_type:
+            type_mismatches.append(f"{col_name}: expected {expected_type}, got {actual_type}")
+
+    if type_mismatches:
+        logger.warning(
+            f"Data type mismatches in {stage}",
+            extra={"mismatches": type_mismatches},
+        )
+        return False, type_mismatches
+
+    logger.info(f"Data type validation passed in {stage}")
+    return True, []
+
+
+# =============================================================================
+# Null Validators
+# =============================================================================
+
+
+def validate_null_rate(
+    df: DataFrame,
+    columns: Optional[List[str]] = None,
+    max_null_rate: float = DQ_MAX_NULL_RATE,
+    stage: str = "unknown",
+) -> Dict[str, float]:
+    """
+    Valida taxa de nulos em colunas específicas.
+
+    Args:
+        df: DataFrame Spark
+        columns: Colunas para validar (None = todas)
+        max_null_rate: Taxa máxima aceitável de nulos
+        stage: Estágio do pipeline
+
+    Returns:
+        Dicionário {coluna: null_rate}
+
+    Raises:
+        DataValidationException: Se taxa de nulos exceder threshold
+    """
+    if columns is None:
+        columns = df.columns
+
+    total_count = df.count()
+    null_rates = {}
+    failed_columns = []
+
+    for col in columns:
+        null_count = df.filter(F.col(col).isNull()).count()
+        null_rate = null_count / total_count if total_count > 0 else 0
+        null_rates[col] = null_rate
+
+        if null_rate > max_null_rate:
+            failed_columns.append(f"{col} ({null_rate:.2%})")
+
+    if failed_columns:
+        logger.error(
+            f"Null rate validation failed in {stage}",
+            extra={
+                "failed_columns": failed_columns,
+                "threshold": max_null_rate,
+            },
+        )
+        raise DataValidationException(
+            validation_rule="null_rate",
+            failed_records=len(failed_columns),
+            total_records=len(columns),
+        )
+
+    logger.info(
+        f"Null rate validation passed in {stage}",
+        extra={"max_null_rate": max(null_rates.values()) if null_rates else 0},
+    )
+    return null_rates
+
+
+def validate_required_fields(
+    df: DataFrame, required_fields: List[str] = DQ_REQUIRED_FIELDS_POSITION, stage: str = "unknown"
+) -> int:
+    """
+    Valida se campos obrigatórios não são nulos.
+
+    Args:
+        df: DataFrame Spark
+        required_fields: Lista de campos obrigatórios
+        stage: Estágio do pipeline
+
+    Returns:
+        Número de registros válidos
+
+    Raises:
+        DataValidationException: Se muitos registros tiverem campos nulos
+    """
+    total_count = df.count()
+
+    # Cria condição para verificar nulos em campos obrigatórios
+    null_condition = F.col(required_fields[0]).isNull()
+    for field in required_fields[1:]:
+        null_condition = null_condition | F.col(field).isNull()
+
+    invalid_count = df.filter(null_condition).count()
+    valid_count = total_count - invalid_count
+    valid_rate = valid_count / total_count if total_count > 0 else 0
+
+    if valid_rate < DQ_MIN_SUCCESS_RATE:
+        logger.error(
+            f"Required fields validation failed in {stage}",
+            extra={
+                "valid_rate": valid_rate,
+                "invalid_count": invalid_count,
+                "total_count": total_count,
+                "threshold": DQ_MIN_SUCCESS_RATE,
+            },
+        )
+        raise DataValidationException(
+            validation_rule="required_fields",
+            failed_records=invalid_count,
+            total_records=total_count,
+        )
+
+    logger.info(
+        f"Required fields validation passed in {stage}",
+        extra={"valid_count": valid_count, "valid_rate": valid_rate},
+    )
+    return valid_count
+
+
+# =============================================================================
+# Range Validators
+# =============================================================================
+
+
+def validate_coordinate_range(
+    df: DataFrame,
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    lat_range: Tuple[float, float] = DQ_LATITUDE_RANGE,
+    lon_range: Tuple[float, float] = DQ_LONGITUDE_RANGE,
+    stage: str = "unknown",
+) -> int:
+    """
+    Valida se coordenadas estão dentro do range esperado (São Paulo).
+
+    Args:
+        df: DataFrame Spark
+        lat_col: Nome da coluna de latitude
+        lon_col: Nome da coluna de longitude
+        lat_range: Range válido de latitude (min, max)
+        lon_range: Range válido de longitude (min, max)
+        stage: Estágio do pipeline
+
+    Returns:
+        Número de registros com coordenadas válidas
+
+    Raises:
+        DataValidationException: Se muitos registros tiverem coordenadas inválidas
+    """
+    total_count = df.count()
+
+    # Filtra coordenadas válidas
+    valid_df = df.filter(
+        (F.col(lat_col).between(lat_range[0], lat_range[1]))
+        & (F.col(lon_col).between(lon_range[0], lon_range[1]))
+    )
+
+    valid_count = valid_df.count()
+    invalid_count = total_count - valid_count
+    valid_rate = valid_count / total_count if total_count > 0 else 0
+
+    if valid_rate < DQ_MIN_SUCCESS_RATE:
+        logger.error(
+            f"Coordinate range validation failed in {stage}",
+            extra={
+                "valid_rate": valid_rate,
+                "invalid_count": invalid_count,
+                "total_count": total_count,
+                "lat_range": lat_range,
+                "lon_range": lon_range,
+            },
+        )
+        raise DataValidationException(
+            validation_rule="coordinate_range",
+            failed_records=invalid_count,
+            total_records=total_count,
+        )
+
+    logger.info(
+        f"Coordinate range validation passed in {stage}",
+        extra={"valid_count": valid_count, "valid_rate": valid_rate},
+    )
+    return valid_count
+
+
+def validate_speed_range(
+    df: DataFrame,
+    speed_col: str = "speed",
+    min_speed: float = SPEED_MIN_OPERATIONAL,
+    max_speed: float = SPEED_MAX_REASONABLE,
+    stage: str = "unknown",
+) -> int:
+    """
+    Valida se velocidade está dentro do range razoável.
+
+    Args:
+        df: DataFrame Spark
+        speed_col: Nome da coluna de velocidade
+        min_speed: Velocidade mínima operacional (km/h)
+        max_speed: Velocidade máxima razoável (km/h)
+        stage: Estágio do pipeline
+
+    Returns:
+        Número de registros com velocidade válida
+    """
+    total_count = df.count()
+
+    valid_count = df.filter(
+        (F.col(speed_col) >= min_speed) & (F.col(speed_col) <= max_speed)
+    ).count()
+
+    invalid_count = total_count - valid_count
+    valid_rate = valid_count / total_count if total_count > 0 else 0
+
+    if valid_rate < DQ_MIN_SUCCESS_RATE:
+        logger.warning(
+            f"Speed range validation warning in {stage}",
+            extra={
+                "valid_rate": valid_rate,
+                "invalid_count": invalid_count,
+                "speed_range": (min_speed, max_speed),
+            },
+        )
+
+    logger.info(
+        f"Speed range validation completed in {stage}",
+        extra={"valid_count": valid_count, "valid_rate": valid_rate},
+    )
+    return valid_count
+
+
+# =============================================================================
+# Duplicate Validators
+# =============================================================================
+
+
+def validate_duplicates(
+    df: DataFrame,
+    key_columns: List[str],
+    max_duplicate_rate: float = DQ_MAX_DUPLICATE_RATE,
+    stage: str = "unknown",
+) -> Tuple[int, int]:
+    """
+    Valida taxa de registros duplicados.
+
+    Args:
+        df: DataFrame Spark
+        key_columns: Colunas que definem duplicatas
+        max_duplicate_rate: Taxa máxima aceitável de duplicados
+        stage: Estágio do pipeline
+
+    Returns:
+        Tuple (unique_count, duplicate_count)
+
+    Raises:
+        DuplicateRecordsException: Se taxa de duplicados exceder threshold
+    """
+    total_count = df.count()
+    unique_count = df.dropDuplicates(key_columns).count()
+    duplicate_count = total_count - unique_count
+    duplicate_rate = duplicate_count / total_count if total_count > 0 else 0
+
+    if duplicate_rate > max_duplicate_rate:
+        logger.error(
+            f"Duplicate validation failed in {stage}",
+            extra={
+                "duplicate_rate": duplicate_rate,
+                "duplicate_count": duplicate_count,
+                "total_count": total_count,
+                "threshold": max_duplicate_rate,
+                "key_columns": key_columns,
+            },
+        )
+        raise DuplicateRecordsException(
+            duplicate_count=duplicate_count,
+            total_count=total_count,
+            threshold=max_duplicate_rate,
+        )
+
+    logger.info(
+        f"Duplicate validation passed in {stage}",
+        extra={
+            "unique_count": unique_count,
+            "duplicate_count": duplicate_count,
+            "duplicate_rate": duplicate_rate,
         },
-        'timestamps': {
-            'ts_col': 'timestamp'
+    )
+    return unique_count, duplicate_count
+
+
+# =============================================================================
+# Freshness Validators
+# =============================================================================
+
+
+def validate_data_freshness(
+    df: DataFrame,
+    timestamp_col: str = "timestamp",
+    max_delay_minutes: int = DQ_MIN_FRESHNESS_MINUTES,
+    stage: str = "unknown",
+) -> datetime:
+    """
+    Valida se os dados estão atualizados (freshness).
+
+    Args:
+        df: DataFrame Spark
+        timestamp_col: Coluna de timestamp
+        max_delay_minutes: Delay máximo aceitável em minutos
+        stage: Estágio do pipeline
+
+    Returns:
+        Timestamp mais recente nos dados
+
+    Raises:
+        DataFreshnessException: Se dados estiverem desatualizados
+    """
+    max_timestamp = df.agg(F.max(timestamp_col)).collect()[0][0]
+
+    if max_timestamp is None:
+        logger.error(f"No timestamp found in {stage}")
+        raise DataFreshnessException(
+            last_update_minutes=999999, threshold_minutes=max_delay_minutes
+        )
+
+    current_time = datetime.now()
+    delay = current_time - max_timestamp
+    delay_minutes = int(delay.total_seconds() / 60)
+
+    if delay_minutes > max_delay_minutes:
+        logger.error(
+            f"Data freshness validation failed in {stage}",
+            extra={
+                "delay_minutes": delay_minutes,
+                "max_timestamp": max_timestamp.isoformat(),
+                "current_time": current_time.isoformat(),
+                "threshold_minutes": max_delay_minutes,
+            },
+        )
+        raise DataFreshnessException(
+            last_update_minutes=delay_minutes, threshold_minutes=max_delay_minutes
+        )
+
+    logger.info(
+        f"Data freshness validation passed in {stage}",
+        extra={
+            "delay_minutes": delay_minutes,
+            "max_timestamp": max_timestamp.isoformat(),
         },
-        'required_columns': ['vehicle_id', 'route_code', 'latitude', 'longitude', 'timestamp'],
-        'duplicate_key_columns': ['vehicle_id', 'timestamp'],
-        'null_check_columns': ['vehicle_id', 'route_code', 'latitude', 'longitude']
+    )
+    return max_timestamp
+
+
+# =============================================================================
+# Completeness Validators
+# =============================================================================
+
+
+def validate_record_count(
+    df: DataFrame,
+    min_records: int,
+    max_records: Optional[int] = None,
+    stage: str = "unknown",
+) -> int:
+    """
+    Valida se o número de registros está dentro do esperado.
+
+    Args:
+        df: DataFrame Spark
+        min_records: Número mínimo de registros esperado
+        max_records: Número máximo de registros esperado (opcional)
+        stage: Estágio do pipeline
+
+    Returns:
+        Número de registros
+
+    Raises:
+        DataValidationException: Se contagem estiver fora do range
+    """
+    count = df.count()
+
+    if count < min_records:
+        logger.error(
+            f"Record count validation failed in {stage} - too few records",
+            extra={
+                "actual_count": count,
+                "min_records": min_records,
+            },
+        )
+        raise DataValidationException(
+            validation_rule="min_record_count",
+            failed_records=min_records - count,
+            total_records=min_records,
+        )
+
+    if max_records and count > max_records:
+        logger.error(
+            f"Record count validation failed in {stage} - too many records",
+            extra={
+                "actual_count": count,
+                "max_records": max_records,
+            },
+        )
+        raise DataValidationException(
+            validation_rule="max_record_count",
+            failed_records=count - max_records,
+            total_records=max_records,
+        )
+
+    logger.info(
+        f"Record count validation passed in {stage}",
+        extra={
+            "count": count,
+            "min_records": min_records,
+            "max_records": max_records,
+        },
+    )
+    return count
+
+
+# =============================================================================
+# Composite Validators
+# =============================================================================
+
+
+def run_all_validations(
+    df: DataFrame,
+    stage: str,
+    required_columns: List[str] = DQ_REQUIRED_FIELDS_POSITION,
+    key_columns: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Executa todas as validações em sequência.
+
+    Args:
+        df: DataFrame Spark
+        stage: Estágio do pipeline
+        required_columns: Colunas obrigatórias
+        key_columns: Colunas para detecção de duplicatas
+
+    Returns:
+        Dicionário com resultados de todas as validações
+    """
+    results = {
+        "stage": stage,
+        "timestamp": datetime.now().isoformat(),
+        "validations": {},
     }
-    
-    return DataQualityValidator.validate_all(df, validation_rules)
+
+    try:
+        # Schema
+        validate_schema(df, required_columns, stage)
+        results["validations"]["schema"] = "passed"
+
+        # Required fields
+        valid_count = validate_required_fields(df, required_columns, stage)
+        results["validations"]["required_fields"] = {
+            "status": "passed",
+            "valid_count": valid_count,
+        }
+
+        # Coordinates
+        coord_valid = validate_coordinate_range(df, stage=stage)
+        results["validations"]["coordinates"] = {
+            "status": "passed",
+            "valid_count": coord_valid,
+        }
+
+        # Duplicates (se key_columns fornecido)
+        if key_columns:
+            unique, dupes = validate_duplicates(df, key_columns, stage=stage)
+            results["validations"]["duplicates"] = {
+                "status": "passed",
+                "unique_count": unique,
+                "duplicate_count": dupes,
+            }
+
+        # Freshness
+        max_ts = validate_data_freshness(df, stage=stage)
+        results["validations"]["freshness"] = {
+            "status": "passed",
+            "max_timestamp": max_ts.isoformat(),
+        }
+
+        results["overall_status"] = "passed"
+        logger.info(f"All validations passed in {stage}")
+
+    except Exception as e:
+        results["overall_status"] = "failed"
+        results["error"] = str(e)
+        logger.error(f"Validation failed in {stage}: {e}")
+        raise
+
+    return results
 
 
+# Exemplo de uso
 if __name__ == "__main__":
-    # Testes básicos
-    print("=== Testando Validadores ===")
-    
-    # Testar coordenadas
-    print("\n1. Validando coordenadas:")
-    print(f"   São Paulo Centro (-23.5505, -46.6333): {CoordinateValidator.is_valid_coordinate(-23.5505, -46.6333)}")
-    print(f"   Coordenada inválida (0, 0): {CoordinateValidator.is_valid_coordinate(0, 0)}")
-    
-    # Testar timestamps
-    print("\n2. Validando timestamps:")
-    now = datetime.now()
-    print(f"   Timestamp atual: {TimestampValidator.is_valid_timestamp(now)}")
-    print(f"   Timestamp futuro (1 dia): {TimestampValidator.is_valid_timestamp(now + timedelta(days=1))}")
-    
-    # Testar vehicle IDs
-    print("\n3. Validando vehicle IDs:")
-    print(f"   ID válido (12345): {VehicleValidator.is_valid_vehicle_id(12345)}")
-    print(f"   ID inválido (abc): {VehicleValidator.is_valid_vehicle_id('abc')}")
-    
-    print("\n✅ Testes concluídos!")
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.builder.appName("ValidatorsTest").getOrCreate()
+
+    # Criar DataFrame de teste
+    data = [
+        (1, "2024-01-01 10:00:00", -23.5505, -46.6333, 20.0),
+        (2, "2024-01-01 10:01:00", -23.5600, -46.6400, 25.0),
+    ]
+    df = spark.createDataFrame(
+        data, ["vehicle_id", "timestamp", "latitude", "longitude", "speed"]
+    )
+
+    # Executar validações
+    results = run_all_validations(
+        df,
+        stage="bronze",
+        required_columns=["vehicle_id", "timestamp", "latitude", "longitude"],
+        key_columns=["vehicle_id", "timestamp"],
+    )
+
+    print(results)

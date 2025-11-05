@@ -1,517 +1,545 @@
 """
-Silver to Gold Transformation Job
-==================================
-Job Spark para agregação de dados Silver → Gold com cálculo de KPIs.
+Job Spark: Transformação Silver → Gold.
 
-Operações:
-- Agregações por hora/dia/rota
-- Cálculo de KPIs operacionais
-- Análise de headway
-- Métricas de performance
-
-Autor: Rafael - SPTrans Pipeline
+Agregações e cálculo de KPIs de negócio a partir dos dados
+limpos da camada Silver para métricas na camada Gold.
 """
 
-from typing import Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
+from typing import Dict, Optional
 
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark.sql.types import *
 
-from src.common.logging_config import get_logger
-from src.common.config import Config
-from src.common.metrics import track_job_execution, reporter
+from ...common.config import Config
+from ...common.constants import (
+    BUCKET_GOLD,
+    BUCKET_SILVER,
+    FORMAT_GOLD,
+    PARTITION_COLS_GOLD,
+)
+from ...common.exceptions import ProcessingException
+from ...common.logging_config import get_logger
+from ...common.metrics import track_pipeline_run, update_processing_metrics
+from ...common.utils import generate_uuid, get_s3_path
+from ...ingestion.schema_definitions import get_gold_schema
 
 logger = get_logger(__name__)
 
 
 class SilverToGoldJob:
-    """Job de agregação Silver → Gold."""
+    """
+    Job Spark para transformação Silver → Gold.
     
-    def __init__(self,
-                 silver_path: str,
-                 gold_path: str,
-                 execution_date: Optional[datetime] = None,
-                 aggregation_level: str = 'hourly'):
+    Responsabilidades:
+    - Ler dados da camada Silver
+    - Calcular métricas horárias por linha
+    - Calcular velocidades médias
+    - Detectar congestionamentos
+    - Calcular headway (intervalo entre veículos)
+    - Gerar sumarizações diárias
+    - Calcular KPIs de performance
+    - Salvar agregações em Delta Lake na Gold
+    """
+
+    def __init__(
+        self,
+        spark: Optional[SparkSession] = None,
+        config: Optional[Config] = None,
+        job_id: Optional[str] = None,
+    ):
         """
         Inicializa job.
-        
+
         Args:
-            silver_path: Caminho da camada Silver
-            gold_path: Caminho da camada Gold
-            execution_date: Data de execução
-            aggregation_level: 'hourly' ou 'daily'
+            spark: SparkSession
+            config: Configuração
+            job_id: ID do job
         """
-        self.silver_path = silver_path
-        self.gold_path = gold_path
-        self.execution_date = execution_date or datetime.now()
-        self.aggregation_level = aggregation_level
+        self.config = config or Config()
+        self.job_id = job_id or generate_uuid()
         
-        self.config = Config()
+        self.spark = spark or self._create_spark_session()
         
-        # Estatísticas
-        self.stats = {
-            'records_processed': 0,
-            'kpis_generated': 0,
-            'routes_processed': 0,
-            'headway_records': 0
-        }
+        # Paths
+        self.silver_bucket = BUCKET_SILVER
+        self.silver_prefix = "vehicle_positions"
+        self.gold_bucket = BUCKET_GOLD
         
-        logger.info(f"SilverToGoldJob inicializado: "
-                   f"silver={silver_path}, gold={gold_path}, "
-                   f"level={aggregation_level}")
-    
+        logger.info(
+            "SilverToGoldJob initialized",
+            extra={"job_id": self.job_id},
+        )
+
     def _create_spark_session(self) -> SparkSession:
-        """Cria sessão Spark."""
-        logger.info("Criando sessão Spark")
-        
-        spark = SparkSession.builder \
-            .appName("Silver_to_Gold_Aggregation") \
-            .config("spark.driver.memory", "4g") \
-            .config("spark.executor.memory", "4g") \
-            .config("spark.sql.adaptive.enabled", "true") \
-            .config("spark.sql.shuffle.partitions", "200") \
-            .config("spark.hadoop.fs.s3a.endpoint", self.config.MINIO_ENDPOINT) \
-            .config("spark.hadoop.fs.s3a.access.key", self.config.MINIO_ROOT_USER) \
-            .config("spark.hadoop.fs.s3a.secret.key", self.config.MINIO_ROOT_PASSWORD) \
-            .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-            .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
+        """Cria SparkSession com Delta Lake."""
+        return (
+            SparkSession.builder
+            .appName(f"SPTrans_Silver_to_Gold_{self.job_id}")
+            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+            .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+            .config("spark.hadoop.fs.s3a.endpoint", self.config.minio.endpoint)
+            .config("spark.hadoop.fs.s3a.access.key", self.config.minio.access_key)
+            .config("spark.hadoop.fs.s3a.secret.key", self.config.minio.secret_key)
+            .config("spark.hadoop.fs.s3a.path.style.access", "true")
+            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
             .getOrCreate()
-        
-        spark.sparkContext.setLogLevel("WARN")
-        
-        return spark
-    
-    def _read_silver_data(self, spark: SparkSession) -> DataFrame:
+        )
+
+    @track_pipeline_run(stage="gold", job_name="silver_to_gold")
+    def run(
+        self,
+        date: Optional[str] = None,
+        aggregation_type: str = "hourly",
+    ) -> Dict[str, any]:
+        """
+        Executa transformação Silver → Gold.
+
+        Args:
+            date: Data a processar (YYYY-MM-DD, None = hoje)
+            aggregation_type: Tipo de agregação ('hourly', 'daily', 'line_performance')
+
+        Returns:
+            Estatísticas do job
+
+        Raises:
+            ProcessingException: Se job falhar
+        """
+        try:
+            logger.info(
+                "Starting Silver to Gold transformation",
+                extra={
+                    "job_id": self.job_id,
+                    "date": date,
+                    "aggregation_type": aggregation_type,
+                },
+            )
+
+            # 1. Ler dados do Silver
+            silver_df = self._read_silver(date)
+            input_count = silver_df.count()
+            
+            logger.info(f"Read {input_count} records from Silver")
+
+            # 2. Calcular telemetria (velocidade, distância)
+            telemetry_df = self._calculate_telemetry(silver_df)
+
+            # 3. Executar agregação baseada no tipo
+            if aggregation_type == "hourly":
+                gold_df = self._aggregate_hourly_metrics(telemetry_df)
+                gold_prefix = "hourly_metrics"
+            elif aggregation_type == "daily":
+                gold_df = self._aggregate_daily_summary(telemetry_df)
+                gold_prefix = "daily_summary"
+            elif aggregation_type == "line_performance":
+                gold_df = self._aggregate_line_performance(telemetry_df)
+                gold_prefix = "line_performance"
+            else:
+                raise ValueError(f"Unknown aggregation type: {aggregation_type}")
+
+            # 4. Salvar na Gold
+            output_count = gold_df.count()
+            stats = self._save_to_gold(gold_df, gold_prefix)
+            
+            # 5. Atualizar métricas
+            self._update_metrics(input_count, output_count)
+            
+            stats.update({
+                "input_count": input_count,
+                "output_count": output_count,
+                "aggregation_type": aggregation_type,
+            })
+            
+            logger.info(
+                "Silver to Gold transformation completed",
+                extra={"job_id": self.job_id, "stats": stats},
+            )
+            
+            return stats
+
+        except Exception as e:
+            logger.error(
+                f"Silver to Gold transformation failed: {e}",
+                extra={"job_id": self.job_id, "error": str(e)},
+                exc_info=True,
+            )
+            raise ProcessingException(
+                transformation="silver_to_gold",
+                reason=str(e)
+            )
+
+    def _read_silver(self, date: Optional[str] = None) -> DataFrame:
         """
         Lê dados da camada Silver.
-        
+
         Args:
-            spark: Sessão Spark
-        
+            date: Data (YYYY-MM-DD)
+
         Returns:
-            DataFrame com dados enriquecidos
+            DataFrame do Silver
         """
-        logger.info(f"Lendo dados da Silver: {self.silver_path}")
-        
-        try:
-            df = spark.read.parquet(self.silver_path)
-            
-            # Filtrar por data
-            if self.aggregation_level == 'hourly':
-                # Última hora
-                df_filtered = df.filter(
-                    F.col('silver_processing_timestamp') >= 
-                    F.expr("current_timestamp() - interval 1 hour")
-                )
-            else:
-                # Dia completo
-                df_filtered = df.filter(
-                    F.col('date') == F.lit(self.execution_date.date())
-                )
-            
-            count = df_filtered.count()
-            self.stats['records_processed'] = count
-            
-            logger.info(f"Registros lidos: {count:,}")
-            
-            return df_filtered
-        
-        except Exception as e:
-            logger.error(f"Erro ao ler Silver: {e}")
-            raise
-    
-    def _calculate_hourly_kpis(self, df: DataFrame) -> DataFrame:
+        input_path = get_s3_path(
+            bucket=self.silver_bucket,
+            prefix=self.silver_prefix,
+        )
+
+        logger.info(f"Reading from Silver: {input_path}")
+
+        df = self.spark.read.format("delta").load(input_path)
+
+        # Filtrar por data se especificado
+        if date:
+            year, month, day = date.split("-")
+            df = df.filter(
+                (F.col("year") == int(year))
+                & (F.col("month") == int(month))
+                & (F.col("day") == int(day))
+            )
+
+        # Filtrar apenas registros não-duplicados
+        df = df.filter(~F.col("is_duplicate"))
+
+        return df
+
+    def _calculate_telemetry(self, df: DataFrame) -> DataFrame:
         """
-        Calcula KPIs por hora.
-        
+        Calcula telemetria: velocidade, distância, heading.
+
         Args:
             df: DataFrame Silver
-        
+
         Returns:
-            DataFrame com KPIs agregados
+            DataFrame com telemetria calculada
         """
-        logger.info("Calculando KPIs por hora...")
-        
-        # Agregações por data, hora e rota
-        kpis = df.groupBy(
-            'date',
-            'hour',
-            'route_code',
-            'route_short_name',
-            'route_long_name'
-        ).agg(
-            # Contagens
-            F.countDistinct('vehicle_id').alias('total_vehicles'),
-            F.count('*').alias('total_records'),
-            
-            # Veículos em movimento vs parados
-            F.sum(F.when(F.col('is_moving'), 1).otherwise(0)).alias('vehicles_moving'),
-            F.sum(F.when(~F.col('is_moving'), 1).otherwise(0)).alias('vehicles_stopped'),
-            
-            # Velocidades
-            F.avg('speed_kmh').alias('avg_speed_kmh'),
-            F.max('speed_kmh').alias('max_speed_kmh'),
-            F.min('speed_kmh').alias('min_speed_kmh'),
-            F.stddev('speed_kmh').alias('speed_stddev'),
-            
-            # Qualidade de dados
-            F.avg('data_quality_score').alias('data_quality_score'),
-            
-            # Acessibilidade
-            F.sum(F.when(F.col('has_accessibility'), 1).otherwise(0)).alias('vehicles_with_accessibility'),
-            
-            # Timestamps
-            F.min('timestamp').alias('first_observation'),
-            F.max('timestamp').alias('last_observation')
+        logger.info("Calculating telemetry")
+
+        # Window por veículo ordenado por timestamp
+        window = Window.partitionBy("vehicle_id").orderBy("position_timestamp")
+
+        # Posição anterior
+        df = df.withColumn("prev_latitude", F.lag("latitude").over(window))
+        df = df.withColumn("prev_longitude", F.lag("longitude").over(window))
+        df = df.withColumn("prev_timestamp", F.lag("position_timestamp").over(window))
+
+        # Calcular distância usando fórmula de Haversine
+        df = df.withColumn(
+            "distance_km",
+            self._haversine_distance(
+                F.col("prev_latitude"),
+                F.col("prev_longitude"),
+                F.col("latitude"),
+                F.col("longitude"),
+            ),
         )
-        
-        # Calcular métricas derivadas
-        kpis = kpis.withColumn(
-            'pct_moving',
-            F.round(F.col('vehicles_moving') / F.col('total_vehicles') * 100, 2)
-        ).withColumn(
-            'pct_with_accessibility',
-            F.round(F.col('vehicles_with_accessibility') / F.col('total_vehicles') * 100, 2)
-        ).withColumn(
-            'observations_per_vehicle',
-            F.round(F.col('total_records') / F.col('total_vehicles'), 2)
+
+        # Calcular tempo decorrido (segundos)
+        df = df.withColumn(
+            "time_diff_seconds",
+            (F.unix_timestamp("position_timestamp") - F.unix_timestamp("prev_timestamp")),
         )
-        
-        # Adicionar timestamp de processamento
-        kpis = kpis.withColumn('processing_timestamp', F.lit(datetime.now()))
-        
-        count = kpis.count()
-        self.stats['kpis_generated'] = count
-        
-        logger.info(f"KPIs calculados: {count:,} registros")
-        
-        return kpis
-    
-    def _calculate_daily_metrics(self, df: DataFrame) -> DataFrame:
+
+        # Calcular velocidade (km/h)
+        df = df.withColumn(
+            "speed_kmh",
+            F.when(
+                (F.col("time_diff_seconds") > 0) & (F.col("distance_km").isNotNull()),
+                (F.col("distance_km") / (F.col("time_diff_seconds") / 3600))
+            ).otherwise(None),
+        )
+
+        # Limpar velocidades irreais
+        df = df.withColumn(
+            "speed_kmh",
+            F.when(
+                (F.col("speed_kmh") >= 0) & (F.col("speed_kmh") <= 120),
+                F.col("speed_kmh")
+            ).otherwise(None),
+        )
+
+        return df
+
+    def _haversine_distance(self, lat1, lon1, lat2, lon2):
         """
-        Calcula métricas diárias por rota.
-        
+        Calcula distância Haversine entre dois pontos.
+
         Args:
-            df: DataFrame Silver
-        
+            lat1, lon1, lat2, lon2: Coordenadas
+
         Returns:
-            DataFrame com métricas diárias
+            Distância em km
         """
-        logger.info("Calculando métricas diárias...")
-        
-        # Window para cálculo de distância
-        window_vehicle = Window.partitionBy('vehicle_id', 'date').orderBy('timestamp')
-        
-        # Calcular distância entre pontos
-        df_with_distance = df.withColumn(
-            'prev_lat',
-            F.lag('latitude', 1).over(window_vehicle)
-        ).withColumn(
-            'prev_lon',
-            F.lag('longitude', 1).over(window_vehicle)
-        ).withColumn(
-            'prev_timestamp',
-            F.lag('timestamp', 1).over(window_vehicle)
+        # Raio da Terra em km
+        R = 6371.0
+
+        # Converter para radianos
+        lat1_rad = F.radians(lat1)
+        lon1_rad = F.radians(lon1)
+        lat2_rad = F.radians(lat2)
+        lon2_rad = F.radians(lon2)
+
+        # Diferenças
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+
+        # Fórmula de Haversine
+        a = (
+            F.sin(dlat / 2) ** 2
+            + F.cos(lat1_rad) * F.cos(lat2_rad) * F.sin(dlon / 2) ** 2
         )
-        
-        # Distância aproximada (Haversine simplificado)
-        df_with_distance = df_with_distance.withColumn(
-            'distance_km',
-            F.when(
-                F.col('prev_lat').isNotNull(),
-                F.sqrt(
-                    F.pow(F.col('latitude') - F.col('prev_lat'), 2) +
-                    F.pow(F.col('longitude') - F.col('prev_lon'), 2)
-                ) * 111  # Conversão aproximada para km
-            ).otherwise(0)
+        c = 2 * F.asin(F.sqrt(a))
+
+        return R * c
+
+    def _aggregate_hourly_metrics(self, df: DataFrame) -> DataFrame:
+        """
+        Agrega métricas horárias por linha.
+
+        Args:
+            df: DataFrame com telemetria
+
+        Returns:
+            DataFrame com métricas horárias
+        """
+        logger.info("Aggregating hourly metrics")
+
+        # Timestamp da hora (truncado)
+        df = df.withColumn(
+            "hour_timestamp",
+            F.date_trunc("hour", "position_timestamp")
         )
-        
-        # Tempo entre observações (em horas)
-        df_with_distance = df_with_distance.withColumn(
-            'time_diff_hours',
-            F.when(
-                F.col('prev_timestamp').isNotNull(),
-                (F.unix_timestamp('timestamp') - F.unix_timestamp('prev_timestamp')) / 3600.0
-            ).otherwise(0)
-        )
-        
-        # Agregar por data e rota
-        daily_metrics = df_with_distance.groupBy(
-            'date',
-            'route_code',
-            'route_short_name',
-            'route_long_name',
-            'route_type'
+
+        # Agregação
+        hourly = df.groupBy(
+            "line_id",
+            "line_name",
+            "hour_timestamp",
+            "year",
+            "month",
         ).agg(
-            # Contagens
-            F.countDistinct('vehicle_id').alias('total_vehicles'),
-            F.count('*').alias('total_observations'),
+            # Métricas de frota
+            F.countDistinct("vehicle_id").alias("vehicles_active"),
+            F.sum(F.when(F.col("accessible"), 1).otherwise(0)).alias("vehicles_accessible"),
             
-            # Velocidade
-            F.avg('speed_kmh').alias('avg_speed'),
-            F.max('speed_kmh').alias('max_speed'),
+            # Métricas de velocidade
+            F.avg("speed_kmh").alias("avg_speed_kmh"),
+            F.min("speed_kmh").alias("min_speed_kmh"),
+            F.max("speed_kmh").alias("max_speed_kmh"),
+            F.stddev("speed_kmh").alias("std_speed_kmh"),
             
-            # Distância total percorrida
-            F.sum('distance_km').alias('distance_traveled_km'),
-            
-            # Horas de operação
-            F.sum('time_diff_hours').alias('total_operation_hours'),
-            
-            # Horas únicas de operação (vehicle_id + hour)
-            F.countDistinct(
-                F.concat_ws('_', 'vehicle_id', 'hour')
-            ).alias('vehicle_hour_combinations'),
+            # Métricas de distância
+            F.sum("distance_km").alias("total_distance_km"),
             
             # Qualidade
-            F.avg('data_quality_score').alias('data_quality_score'),
-            
-            # Acessibilidade
-            F.avg(F.when(F.col('has_accessibility'), 1.0).otherwise(0.0)).alias('pct_accessibility')
+            F.avg("data_quality_score").alias("data_quality_score"),
+            F.count("*").alias("total_records"),
+            F.sum(F.when(F.col("data_quality_score") >= 0.9, 1).otherwise(0)).alias("valid_records"),
         )
-        
-        # Calcular horas de serviço por veículo
-        daily_metrics = daily_metrics.withColumn(
-            'service_hours_per_vehicle',
-            F.round(F.col('vehicle_hour_combinations') / F.col('total_vehicles'), 2)
+
+        # Calcular distância média por veículo
+        hourly = hourly.withColumn(
+            "avg_distance_per_vehicle_km",
+            F.col("total_distance_km") / F.col("vehicles_active")
         )
-        
-        # Adicionar timestamp
-        daily_metrics = daily_metrics.withColumn(
-            'processing_timestamp',
-            F.lit(datetime.now())
-        )
-        
-        count = daily_metrics.count()
-        self.stats['routes_processed'] = count
-        
-        logger.info(f"Métricas diárias calculadas: {count:,} rotas")
-        
-        return daily_metrics
-    
-    def _calculate_headway_analysis(self, df: DataFrame) -> DataFrame:
+
+        logger.info(f"Hourly aggregation complete: {hourly.count()} records")
+
+        return hourly
+
+    def _aggregate_daily_summary(self, df: DataFrame) -> DataFrame:
         """
-        Calcula análise de headway (intervalo entre ônibus).
-        
+        Agrega sumário diário.
+
         Args:
-            df: DataFrame Silver
-        
+            df: DataFrame com telemetria
+
         Returns:
-            DataFrame com análise de headway
+            DataFrame com sumário diário
         """
-        logger.info("Calculando análise de headway...")
-        
-        # Window para calcular tempo entre veículos da mesma rota
-        window_headway = Window.partitionBy('route_code', 'hour').orderBy('timestamp')
-        
-        # Adicionar timestamp e vehicle_id anteriores
-        df_headway = df.withColumn(
-            'prev_timestamp',
-            F.lag('timestamp', 1).over(window_headway)
-        ).withColumn(
-            'prev_vehicle_id',
-            F.lag('vehicle_id', 1).over(window_headway)
+        logger.info("Aggregating daily summary")
+
+        # Data
+        df = df.withColumn(
+            "date",
+            F.date_format("position_timestamp", "yyyy-MM-dd")
         )
-        
-        # Calcular headway apenas quando for veículo diferente
-        df_headway = df_headway.withColumn(
-            'headway_minutes',
-            F.when(
-                (F.col('prev_timestamp').isNotNull()) &
-                (F.col('vehicle_id') != F.col('prev_vehicle_id')),
-                (F.unix_timestamp('timestamp') - F.unix_timestamp('prev_timestamp')) / 60.0
-            )
-        ).filter(F.col('headway_minutes').isNotNull())
-        
-        # Filtrar headways anormais (< 1 min ou > 60 min)
-        df_headway_clean = df_headway.filter(
-            (F.col('headway_minutes') >= 1) &
-            (F.col('headway_minutes') <= 60)
+
+        # Agregação diária
+        daily = df.groupBy("date", "year", "month").agg(
+            F.countDistinct("vehicle_id").alias("total_vehicles"),
+            F.countDistinct("line_id").alias("total_lines"),
+            F.count("*").alias("total_trips"),
+            F.avg("speed_kmh").alias("avg_speed_kmh"),
+            F.sum("distance_km").alias("total_distance_km"),
+            F.avg("data_quality_score").alias("data_quality_score"),
         )
-        
-        # Agregar estatísticas de headway
-        headway_stats = df_headway_clean.groupBy(
-            'date',
-            'hour',
-            'route_code',
-            'route_short_name'
+
+        # Calcular hora de pico (mais veículos)
+        hourly_counts = df.groupBy(
+            "date", F.hour("position_timestamp").alias("hour")
         ).agg(
-            # Estatísticas básicas
-            F.avg('headway_minutes').alias('avg_headway_minutes'),
-            F.min('headway_minutes').alias('min_headway_minutes'),
-            F.max('headway_minutes').alias('max_headway_minutes'),
-            F.stddev('headway_minutes').alias('headway_std_dev'),
-            
-            # Percentis
-            F.expr('percentile_approx(headway_minutes, 0.5)').alias('median_headway_minutes'),
-            F.expr('percentile_approx(headway_minutes, 0.75)').alias('p75_headway_minutes'),
-            F.expr('percentile_approx(headway_minutes, 0.95)').alias('p95_headway_minutes'),
-            
-            # Contagens
-            F.count('*').alias('observations')
+            F.countDistinct("vehicle_id").alias("vehicle_count")
         )
-        
-        # Calcular coeficiente de variação (regularidade)
-        headway_stats = headway_stats.withColumn(
-            'headway_regularity_score',
-            F.round(
-                F.when(
-                    F.col('avg_headway_minutes') > 0,
-                    100 * (1 - F.col('headway_std_dev') / F.col('avg_headway_minutes'))
-                ).otherwise(0),
-                2
+
+        # Window para pegar hora de maior contagem
+        window = Window.partitionBy("date").orderBy(F.desc("vehicle_count"))
+        peak_hour_df = (
+            hourly_counts
+            .withColumn("rank", F.row_number().over(window))
+            .filter(F.col("rank") == 1)
+            .select(
+                "date",
+                F.col("vehicle_count").alias("peak_hour_vehicles"),
+                F.col("hour").alias("peak_hour"),
             )
         )
-        
-        # Classificar qualidade do serviço baseado no headway
-        headway_stats = headway_stats.withColumn(
-            'service_quality',
-            F.when(F.col('avg_headway_minutes') <= 10, 'Excellent')
-            .when(F.col('avg_headway_minutes') <= 15, 'Good')
-            .when(F.col('avg_headway_minutes') <= 20, 'Fair')
-            .otherwise('Poor')
-        )
-        
-        # Adicionar timestamp
-        headway_stats = headway_stats.withColumn(
-            'processing_timestamp',
-            F.lit(datetime.now())
-        )
-        
-        count = headway_stats.count()
-        self.stats['headway_records'] = count
-        
-        logger.info(f"Análise de headway concluída: {count:,} registros")
-        
-        return headway_stats
-    
-    def _write_to_gold(self, df: DataFrame, table_name: str):
+
+        # Join com agregação diária
+        daily = daily.join(peak_hour_df, on="date", how="left")
+
+        # Calcular uptime (simplificado)
+        daily = daily.withColumn("uptime_percentage", F.lit(0.98))  # TODO: calcular real
+
+        logger.info(f"Daily aggregation complete: {daily.count()} records")
+
+        return daily
+
+    def _aggregate_line_performance(self, df: DataFrame) -> DataFrame:
         """
-        Escreve dados na camada Gold.
-        
+        Agrega performance por linha.
+
         Args:
-            df: DataFrame para escrever
-            table_name: Nome da tabela (kpis_hourly, metrics_by_route, etc)
-        """
-        output_path = f"{self.gold_path}/{table_name}"
-        logger.info(f"Escrevendo dados em: {output_path}")
-        
-        # Particionar por data para otimizar queries
-        df.write \
-            .mode('append') \
-            .partitionBy('date') \
-            .parquet(output_path)
-        
-        logger.info(f"Dados escritos com sucesso: {table_name}")
-    
-    @track_job_execution('silver_to_gold')
-    def run(self) -> Dict[str, Any]:
-        """
-        Executa job de agregação.
-        
+            df: DataFrame com telemetria
+
         Returns:
-            Dict com estatísticas
+            DataFrame com performance por linha
         """
-        logger.info("=" * 80)
-        logger.info("INICIANDO SILVER TO GOLD AGGREGATION JOB")
-        logger.info("=" * 80)
-        
-        spark = None
-        
-        try:
-            # Criar sessão Spark
-            spark = self._create_spark_session()
+        logger.info("Aggregating line performance")
+
+        # Período de análise
+        period_start = df.agg(F.min("position_timestamp")).collect()[0][0]
+        period_end = df.agg(F.max("position_timestamp")).collect()[0][0]
+
+        # Agregação por linha
+        performance = df.groupBy("line_id", "line_name", "year", "month").agg(
+            # KPIs de velocidade
+            F.avg("speed_kmh").alias("avg_speed_kmh"),
             
-            # 1. Ler dados da Silver
-            df_silver = self._read_silver_data(spark)
+            # KPIs de frota
+            F.avg(F.countDistinct("vehicle_id")).alias("avg_vehicles_operating"),
             
-            # 2. Calcular KPIs por hora
-            df_kpis = self._calculate_hourly_kpis(df_silver)
-            self._write_to_gold(df_kpis, 'kpis_hourly')
-            
-            # 3. Calcular métricas diárias (se aggregation_level == 'daily')
-            if self.aggregation_level == 'daily':
-                df_daily = self._calculate_daily_metrics(df_silver)
-                self._write_to_gold(df_daily, 'metrics_by_route')
-            
-            # 4. Calcular análise de headway
-            df_headway = self._calculate_headway_analysis(df_silver)
-            self._write_to_gold(df_headway, 'headway_analysis')
-            
-            # Reportar métricas
-            reporter.report_processing_stats(
-                layer='gold',
-                source='aggregations',
-                total=self.stats['kpis_generated'] + self.stats['headway_records'],
-                invalid=0,
-                duplicated=0
-            )
-            
-            # Resultado
-            logger.info("\n" + "=" * 80)
-            logger.info("JOB CONCLUÍDO COM SUCESSO")
-            logger.info("=" * 80)
-            logger.info(f"Registros processados: {self.stats['records_processed']:,}")
-            logger.info(f"KPIs gerados: {self.stats['kpis_generated']:,}")
-            logger.info(f"Rotas processadas: {self.stats['routes_processed']:,}")
-            logger.info(f"Headway records: {self.stats['headway_records']:,}")
-            
-            return {
-                'success': True,
-                'execution_date': self.execution_date.isoformat(),
-                'aggregation_level': self.aggregation_level,
-                'statistics': self.stats,
-                'output_path': self.gold_path,
-                'timestamp': datetime.now().isoformat()
-            }
-        
-        except Exception as e:
-            logger.error(f"Erro fatal no job: {e}")
-            raise
-        
-        finally:
-            if spark:
-                logger.info("Encerrando sessão Spark")
-                spark.stop()
+            # Qualidade
+            F.avg("data_quality_score").alias("data_quality_score"),
+        )
+
+        # Adicionar informações do período
+        performance = (
+            performance
+            .withColumn("analysis_period", F.lit("daily"))
+            .withColumn("period_start", F.lit(period_start))
+            .withColumn("period_end", F.lit(period_end))
+        )
+
+        # Calcular índice de congestionamento (simplificado)
+        # 0-100, onde 100 = muito congestionado
+        performance = performance.withColumn(
+            "congestion_index",
+            F.when(F.col("avg_speed_kmh") < 10, 80)
+            .when(F.col("avg_speed_kmh") < 15, 50)
+            .when(F.col("avg_speed_kmh") < 20, 30)
+            .otherwise(10)
+        )
+
+        # Reliability score (simplificado)
+        performance = performance.withColumn(
+            "reliability_score",
+            F.col("data_quality_score") * 100
+        )
+
+        # Headway e utilização (placeholder - requer lógica mais complexa)
+        performance = (
+            performance
+            .withColumn("avg_headway_minutes", F.lit(None).cast("double"))
+            .withColumn("std_headway_minutes", F.lit(None).cast("double"))
+            .withColumn("utilization_rate", F.lit(None).cast("double"))
+        )
+
+        logger.info(f"Line performance aggregation complete: {performance.count()} records")
+
+        return performance
+
+    def _save_to_gold(self, df: DataFrame, prefix: str) -> Dict[str, any]:
+        """
+        Salva DataFrame na Gold usando Delta Lake.
+
+        Args:
+            df: DataFrame a salvar
+            prefix: Prefixo (subdiretório)
+
+        Returns:
+            Estatísticas
+        """
+        output_path = get_s3_path(
+            bucket=self.gold_bucket,
+            prefix=prefix,
+        )
+
+        logger.info(f"Saving to Gold (Delta Lake): {output_path}")
+
+        # Salvar com merge
+        (
+            df.write
+            .mode("append")
+            .partitionBy(*PARTITION_COLS_GOLD)
+            .format("delta")
+            .option("mergeSchema", "true")
+            .save(output_path)
+        )
+
+        stats = {
+            "output_path": output_path,
+            "record_count": df.count(),
+            "format": "delta",
+        }
+
+        logger.info("Saved to Gold successfully", extra=stats)
+
+        return stats
+
+    def _update_metrics(self, input_count: int, output_count: int) -> None:
+        """Atualiza métricas."""
+        update_processing_metrics(
+            stage="gold",
+            input_count=input_count,
+            output_count=output_count,
+            bytes_written_count=0,
+        )
 
 
-def main():
-    """Entry point para execução standalone."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Silver to Gold Aggregation Job')
-    parser.add_argument('--silver-path', required=True, help='Path da camada Silver')
-    parser.add_argument('--gold-path', required=True, help='Path da camada Gold')
-    parser.add_argument('--execution-date', help='Data de execução (YYYY-MM-DD)')
-    parser.add_argument('--level', choices=['hourly', 'daily'], default='hourly',
-                       help='Nível de agregação')
-    
-    args = parser.parse_args()
-    
-    # Parse execution date
-    execution_date = None
-    if args.execution_date:
-        execution_date = datetime.strptime(args.execution_date, '%Y-%m-%d')
-    
-    # Executar job
-    job = SilverToGoldJob(
-        silver_path=args.silver_path,
-        gold_path=args.gold_path,
-        execution_date=execution_date,
-        aggregation_level=args.level
-    )
-    
-    result = job.run()
-    
-    print(f"\n{'=' * 80}")
-    print("RESULTADO:")
-    print(f"{'=' * 80}")
-    for key, value in result.items():
-        print(f"{key}: {value}")
+# Função standalone
+def run_silver_to_gold_job(
+    date: Optional[str] = None,
+    aggregation_type: str = "hourly",
+    **kwargs
+) -> Dict[str, any]:
+    """Função standalone para Airflow."""
+    job = SilverToGoldJob()
+    stats = job.run(date=date, aggregation_type=aggregation_type)
+    return stats
 
 
+# Exemplo de uso
 if __name__ == "__main__":
-    main()
+    from ...common.logging_config import setup_logging
+
+    setup_logging(log_level="INFO", log_format="console")
+
+    job = SilverToGoldJob()
+    
+    # Executar agregação horária
+    stats = job.run(aggregation_type="hourly")
+
+    print(f"\nJob completed!")
+    print(f"Input: {stats['input_count']} records")
+    print(f"Output: {stats['output_count']} aggregated records")
+    print(f"Type: {stats['aggregation_type']}")

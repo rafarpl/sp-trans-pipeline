@@ -1,509 +1,467 @@
 """
-Bronze to Silver Transformation Job
-====================================
-Job Spark para transformação de dados Bronze → Silver.
+Job Spark: Transformação Bronze → Silver.
 
-Operações:
-- Limpeza e validação de dados
-- Deduplicação
-- Enriquecimento com GTFS
-- Aplicação de regras de qualidade
-- Cálculo de campos derivados
+Limpeza, normalização e enriquecimento de dados da camada Bronze
+para a camada Silver, aplicando regras de qualidade e transformações.
 """
 
-from typing import Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
+from typing import Dict, List, Optional
 
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark.sql.types import *
 
-from src.common.logging_config import get_logger
-from src.common.config import Config
-from src.common.validators import (
-    CoordinateValidator,
-    TimestampValidator,
-    VehicleValidator,
-    DataQualityValidator
+from ...common.config import Config
+from ...common.constants import (
+    BUCKET_BRONZE,
+    BUCKET_SILVER,
+    FORMAT_SILVER,
+    PARTITION_COLS_SILVER,
+    PREFIX_API_POSITIONS,
+    PipelineStage,
 )
-from src.common.metrics import track_job_execution, reporter
+from ...common.exceptions import ProcessingException
+from ...common.logging_config import get_logger
+from ...common.metrics import (
+    records_processed_total,
+    track_pipeline_run,
+    update_dq_metrics,
+    update_processing_metrics,
+)
+from ...common.utils import generate_uuid, get_s3_path
+from ...common.validators import (
+    run_all_validations,
+    validate_coordinate_range,
+    validate_required_fields,
+)
+from ...ingestion.schema_definitions import get_silver_schema
 
 logger = get_logger(__name__)
 
 
 class BronzeToSilverJob:
-    """Job de transformação Bronze → Silver."""
+    """
+    Job Spark para transformação Bronze → Silver.
     
-    def __init__(self, 
-                 bronze_path: str,
-                 silver_path: str,
-                 execution_date: Optional[datetime] = None,
-                 lookback_hours: int = 24):
+    Responsabilidades:
+    - Ler dados brutos da camada Bronze
+    - Explode arrays aninhados (linhas → veículos)
+    - Normalizar estrutura de dados
+    - Aplicar limpeza e validações
+    - Detectar e marcar duplicatas
+    - Calcular score de qualidade
+    - Salvar em formato Delta Lake na Silver
+    """
+
+    def __init__(
+        self,
+        spark: Optional[SparkSession] = None,
+        config: Optional[Config] = None,
+        job_id: Optional[str] = None,
+    ):
         """
         Inicializa job.
-        
+
         Args:
-            bronze_path: Caminho da camada Bronze
-            silver_path: Caminho da camada Silver
-            execution_date: Data de execução
-            lookback_hours: Horas para trás para processar
+            spark: SparkSession
+            config: Configuração
+            job_id: ID do job
         """
-        self.bronze_path = bronze_path
-        self.silver_path = silver_path
-        self.execution_date = execution_date or datetime.now()
-        self.lookback_hours = lookback_hours
+        self.config = config or Config()
+        self.job_id = job_id or generate_uuid()
         
-        self.config = Config()
+        self.spark = spark or self._create_spark_session()
         
-        # Estatísticas
-        self.stats = {
-            'initial_count': 0,
-            'after_dedup': 0,
-            'after_validation': 0,
-            'after_enrichment': 0,
-            'duplicates_removed': 0,
-            'invalid_removed': 0,
-            'quality_score': 0.0
-        }
+        # Paths
+        self.bronze_bucket = BUCKET_BRONZE
+        self.bronze_prefix = PREFIX_API_POSITIONS
+        self.silver_bucket = BUCKET_SILVER
+        self.silver_prefix = "vehicle_positions"
         
-        logger.info(f"BronzeToSilverJob inicializado: "
-                   f"bronze={bronze_path}, silver={silver_path}, "
-                   f"lookback={lookback_hours}h")
-    
+        logger.info(
+            "BronzeToSilverJob initialized",
+            extra={"job_id": self.job_id},
+        )
+
     def _create_spark_session(self) -> SparkSession:
-        """Cria sessão Spark."""
-        logger.info("Criando sessão Spark")
-        
-        spark = SparkSession.builder \
-            .appName("Bronze_to_Silver_Transformation") \
-            .config("spark.driver.memory", "4g") \
-            .config("spark.executor.memory", "4g") \
-            .config("spark.sql.adaptive.enabled", "true") \
-            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-            .config("spark.hadoop.fs.s3a.endpoint", self.config.MINIO_ENDPOINT) \
-            .config("spark.hadoop.fs.s3a.access.key", self.config.MINIO_ROOT_USER) \
-            .config("spark.hadoop.fs.s3a.secret.key", self.config.MINIO_ROOT_PASSWORD) \
-            .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-            .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
+        """Cria SparkSession com suporte a Delta Lake."""
+        return (
+            SparkSession.builder
+            .appName(f"SPTrans_Bronze_to_Silver_{self.job_id}")
+            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+            .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+            .config("spark.hadoop.fs.s3a.endpoint", self.config.minio.endpoint)
+            .config("spark.hadoop.fs.s3a.access.key", self.config.minio.access_key)
+            .config("spark.hadoop.fs.s3a.secret.key", self.config.minio.secret_key)
+            .config("spark.hadoop.fs.s3a.path.style.access", "true")
+            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
             .getOrCreate()
-        
-        spark.sparkContext.setLogLevel("WARN")
-        
-        return spark
-    
-    def _read_bronze_data(self, spark: SparkSession) -> DataFrame:
+        )
+
+    @track_pipeline_run(stage="silver", job_name="bronze_to_silver")
+    def run(
+        self,
+        date: Optional[str] = None,
+        hour: Optional[int] = None,
+    ) -> Dict[str, any]:
+        """
+        Executa transformação Bronze → Silver.
+
+        Args:
+            date: Data a processar (YYYY-MM-DD, None = hoje)
+            hour: Hora a processar (None = última hora)
+
+        Returns:
+            Estatísticas do job
+
+        Raises:
+            ProcessingException: Se job falhar
+        """
+        try:
+            logger.info(
+                "Starting Bronze to Silver transformation",
+                extra={"job_id": self.job_id, "date": date, "hour": hour},
+            )
+
+            # 1. Ler dados do Bronze
+            bronze_df = self._read_bronze(date, hour)
+            input_count = bronze_df.count()
+            
+            logger.info(f"Read {input_count} records from Bronze")
+
+            # 2. Explode e normalizar
+            normalized_df = self._explode_and_normalize(bronze_df)
+            
+            # 3. Limpeza e transformações
+            cleaned_df = self._clean_and_transform(normalized_df)
+            
+            # 4. Detectar duplicatas
+            deduped_df = self._detect_duplicates(cleaned_df)
+            
+            # 5. Calcular data quality score
+            scored_df = self._calculate_dq_score(deduped_df)
+            
+            # 6. Validações
+            dq_results = self._run_validations(scored_df)
+            
+            # 7. Salvar na Silver
+            output_count = scored_df.count()
+            stats = self._save_to_silver(scored_df)
+            
+            # 8. Atualizar métricas
+            self._update_metrics(input_count, output_count, dq_results)
+            
+            stats.update({
+                "input_count": input_count,
+                "output_count": output_count,
+                "dq_results": dq_results,
+            })
+            
+            logger.info(
+                "Bronze to Silver transformation completed",
+                extra={"job_id": self.job_id, "stats": stats},
+            )
+            
+            return stats
+
+        except Exception as e:
+            logger.error(
+                f"Bronze to Silver transformation failed: {e}",
+                extra={"job_id": self.job_id, "error": str(e)},
+                exc_info=True,
+            )
+            raise ProcessingException(
+                transformation="bronze_to_silver",
+                reason=str(e)
+            )
+
+    def _read_bronze(
+        self, date: Optional[str] = None, hour: Optional[int] = None
+    ) -> DataFrame:
         """
         Lê dados da camada Bronze.
-        
+
         Args:
-            spark: Sessão Spark
-        
+            date: Data (YYYY-MM-DD)
+            hour: Hora
+
         Returns:
-            DataFrame com dados brutos
+            DataFrame do Bronze
         """
-        logger.info(f"Lendo dados da Bronze: {self.bronze_path}")
-        
-        # Calcular intervalo de tempo
-        start_time = self.execution_date - timedelta(hours=self.lookback_hours)
-        
-        try:
-            df = spark.read.parquet(self.bronze_path)
-            
-            # Filtrar por intervalo de tempo
-            df_filtered = df.filter(
-                (F.col('ingestion_timestamp') >= F.lit(start_time)) &
-                (F.col('ingestion_timestamp') <= F.lit(self.execution_date))
-            )
-            
-            count = df_filtered.count()
-            self.stats['initial_count'] = count
-            
-            logger.info(f"Registros lidos: {count:,}")
-            
-            return df_filtered
-        
-        except Exception as e:
-            logger.error(f"Erro ao ler Bronze: {e}")
-            raise
-    
-    def _deduplicate(self, df: DataFrame) -> DataFrame:
-        """
-        Remove duplicatas.
-        
-        Args:
-            df: DataFrame com dados
-        
-        Returns:
-            DataFrame sem duplicatas
-        """
-        logger.info("Removendo duplicatas...")
-        
-        initial_count = df.count()
-        
-        # Criar window para selecionar registro mais recente por vehicle_id + timestamp
-        window_spec = Window.partitionBy('vehicle_id', 'timestamp') \
-            .orderBy(F.col('ingestion_timestamp').desc())
-        
-        # Adicionar rank
-        df_ranked = df.withColumn('rank', F.row_number().over(window_spec))
-        
-        # Manter apenas rank = 1 (mais recente)
-        df_dedup = df_ranked.filter(F.col('rank') == 1).drop('rank')
-        
-        final_count = df_dedup.count()
-        duplicates = initial_count - final_count
-        
-        self.stats['after_dedup'] = final_count
-        self.stats['duplicates_removed'] = duplicates
-        
-        logger.info(f"Duplicatas removidas: {duplicates:,} ({duplicates/initial_count*100:.2f}%)")
-        
-        return df_dedup
-    
-    def _validate_data(self, df: DataFrame) -> DataFrame:
-        """
-        Valida dados e adiciona flags de qualidade.
-        
-        Args:
-            df: DataFrame para validar
-        
-        Returns:
-            DataFrame com flags de validação
-        """
-        logger.info("Validando dados...")
-        
-        # 1. Validar coordenadas
-        df_validated = CoordinateValidator.validate_coordinates_df(
-            df,
-            lat_col='latitude',
-            lon_col='longitude',
-            strict=True
+        input_path = get_s3_path(
+            bucket=self.bronze_bucket,
+            prefix=self.bronze_prefix,
         )
-        
-        # 2. Validar timestamps
-        df_validated = TimestampValidator.validate_timestamps_df(
-            df_validated,
-            ts_col='timestamp',
-            max_future_seconds=300,
-            max_past_hours=self.lookback_hours
-        )
-        
-        # 3. Validar vehicle IDs
-        df_validated = VehicleValidator.validate_vehicles_df(
-            df_validated,
-            vehicle_col='vehicle_id'
-        )
-        
-        # 4. Criar flag de qualidade geral
-        df_validated = df_validated.withColumn(
-            'is_valid',
-            F.col('is_valid_coordinate') &
-            F.col('is_valid_timestamp') &
-            F.col('is_valid_vehicle_id')
-        )
-        
-        # Estatísticas de validação
-        total = df_validated.count()
-        valid = df_validated.filter(F.col('is_valid')).count()
-        invalid = total - valid
-        
-        self.stats['after_validation'] = valid
-        self.stats['invalid_removed'] = invalid
-        self.stats['quality_score'] = (valid / total * 100) if total > 0 else 0
-        
-        logger.info(f"Registros válidos: {valid:,} ({self.stats['quality_score']:.2f}%)")
-        logger.info(f"Registros inválidos: {invalid:,}")
-        
-        # Filtrar apenas válidos
-        df_clean = df_validated.filter(F.col('is_valid'))
-        
-        return df_clean
-    
-    def _calculate_derived_fields(self, df: DataFrame) -> DataFrame:
-        """
-        Calcula campos derivados.
-        
-        Args:
-            df: DataFrame
-        
-        Returns:
-            DataFrame com campos calculados
-        """
-        logger.info("Calculando campos derivados...")
-        
-        # 1. Extrair data/hora separadamente
-        df = df.withColumn('date', F.to_date('timestamp')) \
-               .withColumn('hour', F.hour('timestamp')) \
-               .withColumn('day_of_week', F.dayofweek('timestamp')) \
-               .withColumn('is_weekend', F.dayofweek('timestamp').isin([1, 7]))
-        
-        # 2. Calcular velocidade (se tiver dados anteriores)
-        window_speed = Window.partitionBy('vehicle_id').orderBy('timestamp')
-        
-        # Lag de coordenadas e timestamp
-        df = df.withColumn('prev_lat', F.lag('latitude', 1).over(window_speed)) \
-               .withColumn('prev_lon', F.lag('longitude', 1).over(window_speed)) \
-               .withColumn('prev_timestamp', F.lag('timestamp', 1).over(window_speed))
-        
-        # Calcular distância usando fórmula de Haversine (simplificada)
-        # Note: Para produção, usar biblioteca geoespacial completa
-        df = df.withColumn(
-            'distance_km',
-            F.when(
-                F.col('prev_lat').isNotNull(),
-                F.sqrt(
-                    F.pow(F.col('latitude') - F.col('prev_lat'), 2) +
-                    F.pow(F.col('longitude') - F.col('prev_lon'), 2)
-                ) * 111  # Conversão aproximada para km
-            ).otherwise(0)
-        )
-        
-        # Calcular tempo decorrido em segundos
-        df = df.withColumn(
-            'time_diff_seconds',
-            F.when(
-                F.col('prev_timestamp').isNotNull(),
-                (F.unix_timestamp('timestamp') - F.unix_timestamp('prev_timestamp'))
-            ).otherwise(0)
-        )
-        
-        # Calcular velocidade (km/h)
-        df = df.withColumn(
-            'speed_kmh',
-            F.when(
-                (F.col('time_diff_seconds') > 0) & (F.col('distance_km') > 0),
-                (F.col('distance_km') / F.col('time_diff_seconds')) * 3600
-            ).otherwise(0)
-        )
-        
-        # Limitar velocidade máxima (outliers)
-        df = df.withColumn(
-            'speed_kmh',
-            F.when(F.col('speed_kmh') > 120, 0).otherwise(F.col('speed_kmh'))
-        )
-        
-        # 3. Status do veículo (parado/movimento)
-        df = df.withColumn(
-            'is_moving',
-            F.col('speed_kmh') > 5  # Considerado parado se < 5 km/h
-        )
-        
-        # Remover colunas temporárias
-        df = df.drop('prev_lat', 'prev_lon', 'prev_timestamp', 'distance_km', 'time_diff_seconds')
-        
-        logger.info("Campos derivados calculados")
-        
+
+        logger.info(f"Reading from Bronze: {input_path}")
+
+        df = self.spark.read.parquet(input_path)
+
+        # Filtrar por data/hora se especificado
+        if date:
+            df = df.filter(F.col("ingestion_date") == date)
+        if hour is not None:
+            df = df.filter(F.col("hour") == hour)
+
         return df
-    
-    def _enrich_with_gtfs(self, df: DataFrame, spark: SparkSession) -> DataFrame:
+
+    def _explode_and_normalize(self, df: DataFrame) -> DataFrame:
         """
-        Enriquece com dados GTFS.
-        
+        Explode arrays aninhados e normaliza estrutura.
+
+        Estrutura Bronze: hr → l (array) → vs (array)
+        Estrutura Silver: uma linha por veículo
+
         Args:
-            df: DataFrame com posições
-            spark: Sessão Spark
-        
+            df: DataFrame Bronze
+
         Returns:
-            DataFrame enriquecido
+            DataFrame normalizado
         """
-        logger.info("Enriquecendo com dados GTFS...")
-        
-        try:
-            # Ler dados GTFS mais recentes
-            routes_path = f"{self.bronze_path.replace('api_positions', 'gtfs/routes')}"
+        logger.info("Exploding and normalizing nested structures")
+
+        # Explode array de linhas
+        df_lines = df.withColumn("line", F.explode("l"))
+
+        # Explode array de veículos
+        df_vehicles = df_lines.withColumn("vehicle", F.explode("line.vs"))
+
+        # Extrair campos
+        normalized = df_vehicles.select(
+            # Identificadores
+            F.col("vehicle.p").cast("string").alias("vehicle_id"),
+            F.col("line.cl").alias("line_id"),
+            F.col("line.sl").alias("line_direction"),
             
-            routes_df = spark.read.parquet(routes_path)
+            # Informações da linha
+            F.col("line.lt0").alias("line_name"),
+            F.col("line.lt1").alias("line_destination"),
             
-            # Selecionar versão mais recente do GTFS
-            latest_date = routes_df.agg(F.max('ingestion_date')).collect()[0][0]
-            routes_latest = routes_df.filter(F.col('ingestion_date') == latest_date)
+            # Posição
+            F.col("vehicle.py").alias("latitude"),
+            F.col("vehicle.px").alias("longitude"),
             
-            # Join com rotas
-            df_enriched = df.join(
-                routes_latest.select(
-                    F.col('route_id').alias('route_id_gtfs'),
-                    'route_short_name',
-                    'route_long_name',
-                    'route_type'
-                ),
-                df.route_code == routes_latest.route_id,
-                'left'
-            )
+            # Características
+            F.col("vehicle.a").alias("accessible"),
             
-            # Adicionar flag de enriquecimento
-            df_enriched = df_enriched.withColumn(
-                'has_route_info',
-                F.col('route_short_name').isNotNull()
-            )
+            # Timestamps
+            F.to_timestamp("vehicle.ta", "yyyy-MM-dd HH:mm:ss").alias("position_timestamp"),
+            F.col("ingestion_timestamp").alias("processed_timestamp"),
             
-            enriched_count = df_enriched.filter(F.col('has_route_info')).count()
-            total_count = df_enriched.count()
-            enrichment_rate = (enriched_count / total_count * 100) if total_count > 0 else 0
-            
-            logger.info(f"Registros enriquecidos: {enriched_count:,} ({enrichment_rate:.2f}%)")
-            
-            self.stats['after_enrichment'] = df_enriched.count()
-            
-            return df_enriched
-        
-        except Exception as e:
-            logger.warning(f"Erro ao enriquecer com GTFS: {e}")
-            logger.info("Continuando sem enriquecimento GTFS")
-            return df
-    
-    def _add_silver_metadata(self, df: DataFrame) -> DataFrame:
+            # Particionamento
+            F.col("year"),
+            F.col("month"),
+            F.col("day"),
+        )
+
+        logger.info(
+            "Normalization complete",
+            extra={"normalized_count": normalized.count()},
+        )
+
+        return normalized
+
+    def _clean_and_transform(self, df: DataFrame) -> DataFrame:
         """
-        Adiciona metadados da camada Silver.
+        Aplica limpeza e transformações.
+
+        Args:
+            df: DataFrame normalizado
+
+        Returns:
+            DataFrame limpo
+        """
+        logger.info("Applying cleaning and transformations")
+
+        # 1. Remover nulos em campos críticos
+        df = df.filter(
+            F.col("vehicle_id").isNotNull()
+            & F.col("line_id").isNotNull()
+            & F.col("latitude").isNotNull()
+            & F.col("longitude").isNotNull()
+            & F.col("position_timestamp").isNotNull()
+        )
+
+        # 2. Filtrar coordenadas válidas (São Paulo bounds)
+        df = df.filter(
+            F.col("latitude").between(-23.9, -23.3)
+            & F.col("longitude").between(-46.9, -46.3)
+        )
+
+        # 3. Limpar strings
+        df = (
+            df.withColumn("line_name", F.trim(F.col("line_name")))
+            .withColumn("line_destination", F.trim(F.col("line_destination")))
+        )
+
+        # 4. Garantir tipos corretos
+        df = (
+            df.withColumn("line_id", F.col("line_id").cast("int"))
+            .withColumn("line_direction", F.col("line_direction").cast("int"))
+            .withColumn("accessible", F.col("accessible").cast("boolean"))
+        )
+
+        logger.info("Cleaning complete")
+
+        return df
+
+    def _detect_duplicates(self, df: DataFrame) -> DataFrame:
+        """
+        Detecta duplicatas baseado em (vehicle_id, position_timestamp).
+
+        Args:
+            df: DataFrame limpo
+
+        Returns:
+            DataFrame com flag de duplicata
+        """
+        logger.info("Detecting duplicates")
+
+        # Window para detectar duplicatas
+        window = Window.partitionBy("vehicle_id", "position_timestamp").orderBy("processed_timestamp")
+
+        df = df.withColumn("_row_num", F.row_number().over(window))
         
+        # Marcar duplicatas (keep first)
+        df = df.withColumn(
+            "is_duplicate",
+            F.when(F.col("_row_num") > 1, True).otherwise(False)
+        )
+
+        df = df.drop("_row_num")
+
+        duplicate_count = df.filter(F.col("is_duplicate")).count()
+        logger.info(f"Detected {duplicate_count} duplicates")
+
+        return df
+
+    def _calculate_dq_score(self, df: DataFrame) -> DataFrame:
+        """
+        Calcula score de qualidade dos dados (0-1).
+
         Args:
             df: DataFrame
-        
+
         Returns:
-            DataFrame com metadados
+            DataFrame com DQ score
         """
-        return df \
-            .withColumn('silver_processing_timestamp', F.lit(datetime.now())) \
-            .withColumn('silver_processing_date', F.lit(self.execution_date.date())) \
-            .withColumn('data_quality_score', F.lit(self.stats['quality_score'])) \
-            .withColumn('layer', F.lit('silver'))
-    
-    def _write_to_silver(self, df: DataFrame):
+        logger.info("Calculating data quality scores")
+
+        # Score baseado em completude e validade
+        df = df.withColumn(
+            "data_quality_score",
+            # Penalidades
+            F.when(F.col("is_duplicate"), 0.5)  # Duplicata = -50%
+            .when(F.col("line_name").isNull(), 0.8)  # Sem nome = -20%
+            .when(F.col("line_destination").isNull(), 0.9)  # Sem destino = -10%
+            .otherwise(1.0)  # Perfeito = 100%
+        )
+
+        return df
+
+    def _run_validations(self, df: DataFrame) -> Dict[str, any]:
         """
-        Escreve dados na camada Silver.
-        
+        Executa validações de data quality.
+
         Args:
-            df: DataFrame para escrever
-        """
-        logger.info(f"Escrevendo dados na Silver: {self.silver_path}")
-        
-        # Particionar por data para facilitar queries
-        df.write \
-            .mode('append') \
-            .partitionBy('silver_processing_date') \
-            .parquet(self.silver_path)
-        
-        logger.info("Dados escritos com sucesso na Silver")
-    
-    @track_job_execution('bronze_to_silver')
-    def run(self) -> Dict[str, Any]:
-        """
-        Executa job de transformação.
-        
+            df: DataFrame a validar
+
         Returns:
-            Dict com estatísticas
+            Resultados das validações
         """
-        logger.info("=" * 80)
-        logger.info("INICIANDO BRONZE TO SILVER TRANSFORMATION JOB")
-        logger.info("=" * 80)
-        
-        spark = None
-        
+        logger.info("Running data quality validations")
+
         try:
-            # Criar sessão Spark
-            spark = self._create_spark_session()
-            
-            # 1. Ler dados da Bronze
-            df_bronze = self._read_bronze_data(spark)
-            
-            # 2. Deduplicar
-            df_dedup = self._deduplicate(df_bronze)
-            
-            # 3. Validar
-            df_validated = self._validate_data(df_dedup)
-            
-            # 4. Calcular campos derivados
-            df_derived = self._calculate_derived_fields(df_validated)
-            
-            # 5. Enriquecer com GTFS
-            df_enriched = self._enrich_with_gtfs(df_derived, spark)
-            
-            # 6. Adicionar metadados Silver
-            df_silver = self._add_silver_metadata(df_enriched)
-            
-            # 7. Escrever na Silver
-            self._write_to_silver(df_silver)
-            
-            # Reportar métricas
-            reporter.report_processing_stats(
-                layer='silver',
-                source='api_positions',
-                total=self.stats['after_enrichment'],
-                invalid=self.stats['invalid_removed'],
-                duplicated=self.stats['duplicates_removed']
+            dq_results = run_all_validations(
+                df,
+                stage="silver",
+                required_columns=["vehicle_id", "line_id", "latitude", "longitude"],
+                key_columns=["vehicle_id", "position_timestamp"],
             )
-            
-            reporter.report_data_quality(
-                layer='silver',
-                quality_metrics={
-                    'completeness': self.stats['quality_score'],
-                    'accuracy': self.stats['quality_score'],
-                    'validity': self.stats['quality_score']
-                }
-            )
-            
-            # Resultado
-            logger.info("\n" + "=" * 80)
-            logger.info("JOB CONCLUÍDO COM SUCESSO")
-            logger.info("=" * 80)
-            logger.info(f"Registros iniciais: {self.stats['initial_count']:,}")
-            logger.info(f"Após deduplicação: {self.stats['after_dedup']:,}")
-            logger.info(f"Após validação: {self.stats['after_validation']:,}")
-            logger.info(f"Final (Silver): {self.stats['after_enrichment']:,}")
-            logger.info(f"Score de qualidade: {self.stats['quality_score']:.2f}%")
-            
-            return {
-                'success': True,
-                'execution_date': self.execution_date.isoformat(),
-                'statistics': self.stats,
-                'output_path': self.silver_path,
-                'timestamp': datetime.now().isoformat()
-            }
-        
+            return dq_results
+
         except Exception as e:
-            logger.error(f"Erro fatal no job: {e}")
-            raise
-        
-        finally:
-            if spark:
-                logger.info("Encerrando sessão Spark")
-                spark.stop()
+            logger.warning(
+                f"Validation error (non-blocking): {e}",
+                extra={"error": str(e)},
+            )
+            return {"overall_status": "warning", "error": str(e)}
+
+    def _save_to_silver(self, df: DataFrame) -> Dict[str, any]:
+        """
+        Salva DataFrame na Silver usando Delta Lake.
+
+        Args:
+            df: DataFrame a salvar
+
+        Returns:
+            Estatísticas
+        """
+        output_path = get_s3_path(
+            bucket=self.silver_bucket,
+            prefix=self.silver_prefix,
+        )
+
+        logger.info(f"Saving to Silver (Delta Lake): {output_path}")
+
+        # Salvar como Delta com merge
+        (
+            df.write
+            .mode("append")
+            .partitionBy(*PARTITION_COLS_SILVER)
+            .format("delta")
+            .option("mergeSchema", "true")
+            .save(output_path)
+        )
+
+        stats = {
+            "output_path": output_path,
+            "record_count": df.count(),
+            "format": "delta",
+            "partition_cols": PARTITION_COLS_SILVER,
+        }
+
+        logger.info("Saved to Silver successfully", extra=stats)
+
+        return stats
+
+    def _update_metrics(
+        self, input_count: int, output_count: int, dq_results: Dict
+    ) -> None:
+        """Atualiza métricas."""
+        update_processing_metrics(
+            stage="silver",
+            input_count=input_count,
+            output_count=output_count,
+            bytes_written_count=0,
+        )
+
+        update_dq_metrics(stage="silver", dq_results=dq_results)
 
 
-def main():
-    """Entry point para execução standalone."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Bronze to Silver Transformation Job')
-    parser.add_argument('--bronze-path', required=True, help='Path da camada Bronze')
-    parser.add_argument('--silver-path', required=True, help='Path da camada Silver')
-    parser.add_argument('--execution-date', help='Data de execução (YYYY-MM-DD)')
-    parser.add_argument('--lookback-hours', type=int, default=24, help='Horas para trás')
-    
-    args = parser.parse_args()
-    
-    # Parse execution date
-    execution_date = None
-    if args.execution_date:
-        execution_date = datetime.strptime(args.execution_date, '%Y-%m-%d')
-    
-    # Executar job
-    job = BronzeToSilverJob(
-        bronze_path=args.bronze_path,
-        silver_path=args.silver_path,
-        execution_date=execution_date,
-        lookback_hours=args.lookback_hours
-    )
-    
-    result = job.run()
-    
-    print(f"\n{'=' * 80}")
-    print("RESULTADO:")
-    print(f"{'=' * 80}")
-    for key, value in result.items():
-        print(f"{key}: {value}")
+# Função standalone
+def run_bronze_to_silver_job(
+    date: Optional[str] = None,
+    hour: Optional[int] = None,
+    **kwargs
+) -> Dict[str, any]:
+    """Função standalone para Airflow."""
+    job = BronzeToSilverJob()
+    stats = job.run(date=date, hour=hour)
+    return stats
 
 
+# Exemplo de uso
 if __name__ == "__main__":
-    main()
+    from ...common.logging_config import setup_logging
+
+    setup_logging(log_level="INFO", log_format="console")
+
+    job = BronzeToSilverJob()
+    stats = job.run()
+
+    print(f"\nJob completed!")
+    print(f"Input: {stats['input_count']} records")
+    print(f"Output: {stats['output_count']} records")
+    print(f"DQ Status: {stats['dq_results']['overall_status']}")

@@ -1,405 +1,634 @@
 """
-Funções utilitárias gerais do projeto.
+Funções Utilitárias para SPTrans Pipeline.
+
+Fornece funções helper para manipulação de dados, formatação,
+conversões e operações comuns em todo o pipeline.
 """
-import math
+
+import hashlib
+import json
+import os
+import re
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlencode, urljoin
+
 import pytz
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType, StructType
+
+from .constants import (
+    PARTITION_COLS_BRONZE,
+    PARTITION_COLS_GOLD,
+    PARTITION_COLS_SILVER,
+    PipelineStage,
+)
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
+
+# Timezone de São Paulo
+SP_TZ = pytz.timezone("America/Sao_Paulo")
 
 
-def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+# =============================================================================
+# Date & Time Utilities
+# =============================================================================
+
+
+def get_current_datetime_sp() -> datetime:
     """
-    Calcula distância entre dois pontos usando fórmula de Haversine.
-    
-    Args:
-        lat1: Latitude do ponto 1 (graus)
-        lon1: Longitude do ponto 1 (graus)
-        lat2: Latitude do ponto 2 (graus)
-        lon2: Longitude do ponto 2 (graus)
-    
+    Retorna datetime atual no timezone de São Paulo.
+
     Returns:
-        Distância em metros
-    
-    Example:
-        >>> dist = haversine_distance(-23.5505, -46.6333, -23.5489, -46.6388)
-        >>> print(f"{dist:.2f} metros")
+        Datetime atual em SP timezone
     """
-    # Raio da Terra em metros
-    R = 6371000
-    
-    # Converter para radianos
-    lat1_rad = math.radians(lat1)
-    lon1_rad = math.radians(lon1)
-    lat2_rad = math.radians(lat2)
-    lon2_rad = math.radians(lon2)
-    
-    # Diferenças
-    dlat = lat2_rad - lat1_rad
-    dlon = lon2_rad - lon1_rad
-    
-    # Fórmula de Haversine
-    a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    
-    distance = R * c
-    return distance
+    return datetime.now(SP_TZ)
 
 
-def calculate_speed(
-    lat1: float, 
-    lon1: float, 
-    lat2: float, 
-    lon2: float,
-    time1: datetime,
-    time2: datetime
-) -> Optional[float]:
+def to_utc(dt: datetime) -> datetime:
     """
-    Calcula velocidade entre dois pontos.
-    
+    Converte datetime para UTC.
+
     Args:
-        lat1, lon1: Coordenadas do ponto 1
-        lat2, lon2: Coordenadas do ponto 2
-        time1: Timestamp do ponto 1
-        time2: Timestamp do ponto 2
-    
+        dt: Datetime a converter
+
     Returns:
-        Velocidade em km/h, ou None se tempo for zero
-    
-    Example:
-        >>> t1 = datetime(2025, 10, 20, 14, 0, 0)
-        >>> t2 = datetime(2025, 10, 20, 14, 5, 0)
-        >>> speed = calculate_speed(-23.5505, -46.6333, -23.5489, -46.6388, t1, t2)
+        Datetime em UTC
     """
-    # Calcular distância em metros
-    distance_m = haversine_distance(lat1, lon1, lat2, lon2)
-    
-    # Calcular tempo em segundos
-    time_diff_s = (time2 - time1).total_seconds()
-    
-    if time_diff_s == 0:
-        return None
-    
-    # Velocidade em m/s, converter para km/h
-    speed_ms = distance_m / time_diff_s
-    speed_kmh = speed_ms * 3.6
-    
-    return speed_kmh
+    if dt.tzinfo is None:
+        dt = SP_TZ.localize(dt)
+    return dt.astimezone(pytz.UTC)
 
 
-def calculate_heading(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+def from_utc(dt: datetime) -> datetime:
     """
-    Calcula direção (bearing) entre dois pontos.
-    
+    Converte datetime de UTC para SP timezone.
+
     Args:
-        lat1, lon1: Coordenadas do ponto 1
-        lat2, lon2: Coordenadas do ponto 2
-    
+        dt: Datetime em UTC
+
     Returns:
-        Direção em graus (0-360), onde 0=Norte, 90=Leste, 180=Sul, 270=Oeste
-    
-    Example:
-        >>> heading = calculate_heading(-23.5505, -46.6333, -23.5489, -46.6388)
-        >>> print(f"Direção: {heading:.1f}°")
+        Datetime em SP timezone
     """
-    # Converter para radianos
-    lat1_rad = math.radians(lat1)
-    lat2_rad = math.radians(lat2)
-    dlon_rad = math.radians(lon2 - lon1)
-    
-    # Calcular bearing
-    x = math.sin(dlon_rad) * math.cos(lat2_rad)
-    y = math.cos(lat1_rad) * math.sin(lat2_rad) - \
-        math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon_rad)
-    
-    bearing_rad = math.atan2(x, y)
-    bearing_deg = math.degrees(bearing_rad)
-    
-    # Normalizar para 0-360
-    bearing_deg = (bearing_deg + 360) % 360
-    
-    return bearing_deg
+    if dt.tzinfo is None:
+        dt = pytz.UTC.localize(dt)
+    return dt.astimezone(SP_TZ)
 
 
-def is_coordinate_valid(lat: float, lon: float, strict: bool = False) -> bool:
+def parse_datetime(dt_string: str, format: str = "%Y-%m-%d %H:%M:%S") -> datetime:
+    """
+    Parse string para datetime.
+
+    Args:
+        dt_string: String de datetime
+        format: Formato da string
+
+    Returns:
+        Datetime parseado
+    """
+    return datetime.strptime(dt_string, format)
+
+
+def get_date_range(
+    start_date: Union[str, datetime],
+    end_date: Union[str, datetime],
+    date_format: str = "%Y-%m-%d",
+) -> List[datetime]:
+    """
+    Gera lista de datas entre start e end.
+
+    Args:
+        start_date: Data inicial
+        end_date: Data final
+        date_format: Formato das datas se strings
+
+    Returns:
+        Lista de datetimes
+    """
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date, date_format)
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, date_format)
+
+    dates = []
+    current = start_date
+    while current <= end_date:
+        dates.append(current)
+        current += timedelta(days=1)
+
+    return dates
+
+
+def get_partition_path(dt: datetime, stage: PipelineStage) -> str:
+    """
+    Gera path de partição baseado no estágio.
+
+    Args:
+        dt: Datetime para particionamento
+        stage: Estágio do pipeline
+
+    Returns:
+        String de path de partição (ex: year=2024/month=01/day=15/hour=10)
+    """
+    partition_cols = {
+        PipelineStage.BRONZE: PARTITION_COLS_BRONZE,
+        PipelineStage.SILVER: PARTITION_COLS_SILVER,
+        PipelineStage.GOLD: PARTITION_COLS_GOLD,
+    }.get(stage, PARTITION_COLS_SILVER)
+
+    parts = []
+    for col in partition_cols:
+        if col == "year":
+            parts.append(f"year={dt.year}")
+        elif col == "month":
+            parts.append(f"month={dt.month:02d}")
+        elif col == "day":
+            parts.append(f"day={dt.day:02d}")
+        elif col == "hour":
+            parts.append(f"hour={dt.hour:02d}")
+
+    return "/".join(parts)
+
+
+# =============================================================================
+# String Utilities
+# =============================================================================
+
+
+def sanitize_column_name(name: str) -> str:
+    """
+    Sanitiza nome de coluna para uso em Spark/SQL.
+
+    Args:
+        name: Nome original
+
+    Returns:
+        Nome sanitizado (lowercase, sem espaços/caracteres especiais)
+    """
+    # Remove acentos
+    import unicodedata
+
+    name = "".join(
+        c
+        for c in unicodedata.normalize("NFKD", name)
+        if not unicodedata.combining(c)
+    )
+
+    # Lowercase e substitui espaços/caracteres especiais
+    name = re.sub(r"[^\w\s]", "", name.lower())
+    name = re.sub(r"\s+", "_", name)
+
+    return name
+
+
+def generate_hash(data: Union[str, Dict, List]) -> str:
+    """
+    Gera hash MD5 de dados.
+
+    Args:
+        data: Dados para hash (string, dict ou list)
+
+    Returns:
+        Hash MD5 em hexadecimal
+    """
+    if isinstance(data, (dict, list)):
+        data = json.dumps(data, sort_keys=True)
+
+    return hashlib.md5(data.encode()).hexdigest()
+
+
+def generate_uuid() -> str:
+    """
+    Gera UUID v4.
+
+    Returns:
+        UUID como string
+    """
+    import uuid
+
+    return str(uuid.uuid4())
+
+
+def truncate_string(text: str, max_length: int = 100, suffix: str = "...") -> str:
+    """
+    Trunca string se exceder max_length.
+
+    Args:
+        text: Texto a truncar
+        max_length: Comprimento máximo
+        suffix: Sufixo para indicar truncamento
+
+    Returns:
+        String truncada
+    """
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - len(suffix)] + suffix
+
+
+# =============================================================================
+# DataFrame Utilities
+# =============================================================================
+
+
+def add_partition_columns(df: DataFrame, dt_col: str = "timestamp") -> DataFrame:
+    """
+    Adiciona colunas de particionamento ao DataFrame.
+
+    Args:
+        df: DataFrame Spark
+        dt_col: Nome da coluna de timestamp
+
+    Returns:
+        DataFrame com colunas year, month, day, hour
+    """
+    return (
+        df.withColumn("year", F.year(dt_col))
+        .withColumn("month", F.month(dt_col))
+        .withColumn("day", F.dayofmonth(dt_col))
+        .withColumn("hour", F.hour(dt_col))
+    )
+
+
+def add_processing_metadata(df: DataFrame, stage: str, job_id: str) -> DataFrame:
+    """
+    Adiciona colunas de metadados de processamento.
+
+    Args:
+        df: DataFrame Spark
+        stage: Estágio do pipeline
+        job_id: ID do job
+
+    Returns:
+        DataFrame com colunas de metadata
+    """
+    return df.withColumn(
+        "processed_at", F.current_timestamp()
+    ).withColumn("processing_stage", F.lit(stage)).withColumn("job_id", F.lit(job_id))
+
+
+def remove_duplicates(
+    df: DataFrame,
+    key_columns: List[str],
+    order_by: Optional[str] = None,
+    keep: str = "last",
+) -> DataFrame:
+    """
+    Remove duplicatas mantendo registro mais recente/antigo.
+
+    Args:
+        df: DataFrame Spark
+        key_columns: Colunas que definem duplicatas
+        order_by: Coluna para ordenação (timestamp)
+        keep: 'first' ou 'last'
+
+    Returns:
+        DataFrame sem duplicatas
+    """
+    if order_by:
+        from pyspark.sql.window import Window
+
+        if keep == "last":
+            window = Window.partitionBy(key_columns).orderBy(F.desc(order_by))
+        else:
+            window = Window.partitionBy(key_columns).orderBy(F.asc(order_by))
+
+        df = df.withColumn("_row_num", F.row_number().over(window))
+        df = df.filter(F.col("_row_num") == 1).drop("_row_num")
+    else:
+        df = df.dropDuplicates(key_columns)
+
+    return df
+
+
+def fill_nulls(df: DataFrame, fill_values: Dict[str, Any]) -> DataFrame:
+    """
+    Preenche valores nulos com valores específicos.
+
+    Args:
+        df: DataFrame Spark
+        fill_values: Dicionário {coluna: valor_default}
+
+    Returns:
+        DataFrame com nulos preenchidos
+    """
+    return df.fillna(fill_values)
+
+
+def cast_columns(df: DataFrame, schema: Dict[str, str]) -> DataFrame:
+    """
+    Faz cast de colunas para tipos específicos.
+
+    Args:
+        df: DataFrame Spark
+        schema: Dicionário {coluna: tipo}
+
+    Returns:
+        DataFrame com tipos convertidos
+    """
+    for col, dtype in schema.items():
+        if col in df.columns:
+            df = df.withColumn(col, F.col(col).cast(dtype))
+
+    return df
+
+
+def get_dataframe_stats(df: DataFrame) -> Dict[str, Any]:
+    """
+    Coleta estatísticas do DataFrame.
+
+    Args:
+        df: DataFrame Spark
+
+    Returns:
+        Dicionário com estatísticas
+    """
+    count = df.count()
+    columns = df.columns
+    dtypes = df.dtypes
+
+    # Estimativa de tamanho (não precisa se o DataFrame for muito grande)
+    size_estimate = None
+    if count < 100000:  # Só estima se for pequeno
+        try:
+            size_estimate = df.rdd.map(lambda x: len(str(x))).sum()
+        except:
+            pass
+
+    return {
+        "count": count,
+        "columns": columns,
+        "column_count": len(columns),
+        "dtypes": dict(dtypes),
+        "size_bytes": size_estimate,
+    }
+
+
+# =============================================================================
+# File & Path Utilities
+# =============================================================================
+
+
+def ensure_dir(path: Union[str, Path]) -> Path:
+    """
+    Garante que diretório existe, criando se necessário.
+
+    Args:
+        path: Caminho do diretório
+
+    Returns:
+        Path do diretório
+    """
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_file_size(path: Union[str, Path]) -> int:
+    """
+    Retorna tamanho do arquivo em bytes.
+
+    Args:
+        path: Caminho do arquivo
+
+    Returns:
+        Tamanho em bytes
+    """
+    return Path(path).stat().st_size
+
+
+def list_files(
+    directory: Union[str, Path], pattern: str = "*", recursive: bool = False
+) -> List[Path]:
+    """
+    Lista arquivos em diretório.
+
+    Args:
+        directory: Diretório
+        pattern: Pattern de busca (glob)
+        recursive: Se True, busca recursivamente
+
+    Returns:
+        Lista de Paths
+    """
+    directory = Path(directory)
+
+    if recursive:
+        return list(directory.rglob(pattern))
+    else:
+        return list(directory.glob(pattern))
+
+
+def read_json_file(path: Union[str, Path]) -> Dict[str, Any]:
+    """
+    Lê arquivo JSON.
+
+    Args:
+        path: Caminho do arquivo
+
+    Returns:
+        Dicionário com conteúdo
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json_file(data: Dict[str, Any], path: Union[str, Path]) -> None:
+    """
+    Escreve dados em arquivo JSON.
+
+    Args:
+        data: Dados a escrever
+        path: Caminho do arquivo
+    """
+    ensure_dir(Path(path).parent)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# =============================================================================
+# URL & API Utilities
+# =============================================================================
+
+
+def build_url(base_url: str, path: str, params: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Constrói URL com query parameters.
+
+    Args:
+        base_url: URL base
+        path: Path relativo
+        params: Query parameters
+
+    Returns:
+        URL completa
+    """
+    url = urljoin(base_url, path)
+
+    if params:
+        # Remove parâmetros None
+        params = {k: v for k, v in params.items() if v is not None}
+        query_string = urlencode(params)
+        url = f"{url}?{query_string}"
+
+    return url
+
+
+def parse_query_params(url: str) -> Dict[str, str]:
+    """
+    Parse query parameters de URL.
+
+    Args:
+        url: URL completa
+
+    Returns:
+        Dicionário com parâmetros
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+
+    # Converte listas de 1 elemento em valores simples
+    return {k: v[0] if len(v) == 1 else v for k, v in params.items()}
+
+
+# =============================================================================
+# Validation Utilities
+# =============================================================================
+
+
+def is_valid_coordinate(lat: float, lon: float) -> bool:
     """
     Valida se coordenadas são válidas.
-    
+
     Args:
         lat: Latitude
         lon: Longitude
-        strict: Se True, valida também se está dentro de São Paulo
-    
+
+    Returns:
+        True se válidas
+    """
+    return -90 <= lat <= 90 and -180 <= lon <= 180
+
+
+def is_valid_email(email: str) -> bool:
+    """
+    Valida formato de email.
+
+    Args:
+        email: Email a validar
+
     Returns:
         True se válido
-    
-    Example:
-        >>> is_coordinate_valid(-23.5505, -46.6333)
-        True
-        >>> is_coordinate_valid(100, 200)
-        False
     """
-    # Validação básica
-    if not (-90 <= lat <= 90):
-        return False
-    if not (-180 <= lon <= 180):
-        return False
-    
-    # Validação estrita (São Paulo)
-    if strict:
-        if not (-24.0 <= lat <= -23.0):
-            return False
-        if not (-47.0 <= lon <= -46.0):
-            return False
-    
-    return True
+    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+    return bool(re.match(pattern, email))
 
 
-def get_current_timestamp(timezone: str = 'America/Sao_Paulo') -> datetime:
+def is_valid_phone(phone: str) -> bool:
     """
-    Retorna timestamp atual com timezone.
-    
+    Valida formato de telefone brasileiro.
+
     Args:
-        timezone: Timezone (padrão: America/Sao_Paulo)
-    
+        phone: Telefone a validar
+
     Returns:
-        Datetime com timezone
-    
-    Example:
-        >>> now = get_current_timestamp()
-        >>> print(now.strftime('%Y-%m-%d %H:%M:%S %Z'))
+        True se válido
     """
-    tz = pytz.timezone(timezone)
-    return datetime.now(tz)
+    # Remove caracteres não numéricos
+    digits = re.sub(r"\D", "", phone)
+
+    # Valida formato: (DD) 9XXXX-XXXX ou (DD) XXXX-XXXX
+    return len(digits) in [10, 11] and digits[0:2].isdigit()
 
 
-def parse_timestamp(timestamp_str: str, timezone: str = 'America/Sao_Paulo') -> datetime:
+# =============================================================================
+# Retry & Backoff
+# =============================================================================
+
+
+def exponential_backoff(attempt: int, base_delay: float = 1.0, max_delay: float = 60.0) -> float:
     """
-    Faz parse de timestamp string.
-    
+    Calcula delay com backoff exponencial.
+
     Args:
-        timestamp_str: String no formato "YYYY-MM-DD HH:MM:SS"
-        timezone: Timezone para localizar
-    
+        attempt: Número da tentativa (0-indexed)
+        base_delay: Delay base em segundos
+        max_delay: Delay máximo
+
     Returns:
-        Datetime com timezone
-    
-    Example:
-        >>> dt = parse_timestamp("2025-10-20 14:30:00")
+        Delay em segundos
     """
-    # Parse sem timezone
-    dt_naive = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
-    
-    # Adicionar timezone
-    tz = pytz.timezone(timezone)
-    dt_aware = tz.localize(dt_naive)
-    
-    return dt_aware
+    delay = min(base_delay * (2**attempt), max_delay)
+    return delay
 
 
-def get_partition_path(base_path: str, dt: datetime) -> str:
+# =============================================================================
+# Environment Utilities
+# =============================================================================
+
+
+def get_env(key: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
     """
-    Gera caminho particionado por data/hora (Hive-style).
-    
+    Obtém variável de ambiente.
+
     Args:
-        base_path: Caminho base
-        dt: Datetime para particionar
-    
+        key: Nome da variável
+        default: Valor default
+        required: Se True, levanta exceção se não encontrada
+
     Returns:
-        Caminho com partições
-    
-    Example:
-        >>> path = get_partition_path("s3a://bronze/positions/", datetime(2025, 10, 20, 14, 30))
-        >>> print(path)
-        s3a://bronze/positions/year=2025/month=10/day=20/hour=14/
+        Valor da variável
+
+    Raises:
+        ValueError: Se required=True e variável não existe
     """
-    return (
-        f"{base_path}"
-        f"year={dt.year}/"
-        f"month={dt.month:02d}/"
-        f"day={dt.day:02d}/"
-        f"hour={dt.hour:02d}/"
+    value = os.getenv(key, default)
+
+    if required and value is None:
+        raise ValueError(f"Required environment variable not set: {key}")
+
+    return value
+
+
+def is_production() -> bool:
+    """
+    Verifica se está em ambiente de produção.
+
+    Returns:
+        True se produção
+    """
+    env = get_env("ENVIRONMENT", "development").lower()
+    return env in ["production", "prod"]
+
+
+# Exemplo de uso
+if __name__ == "__main__":
+    # Date utilities
+    now_sp = get_current_datetime_sp()
+    print(f"Current time in SP: {now_sp}")
+    print(f"Partition path: {get_partition_path(now_sp, PipelineStage.BRONZE)}")
+
+    # String utilities
+    print(f"Sanitized: {sanitize_column_name('Nome do Usuário')}")
+    print(f"Hash: {generate_hash({'key': 'value'})}")
+    print(f"UUID: {generate_uuid()}")
+
+    # URL utilities
+    url = build_url(
+        "https://api.example.com", "/v1/users", {"id": 123, "active": True}
     )
+    print(f"Built URL: {url}")
 
+    # Validation
+    print(f"Valid coord: {is_valid_coordinate(-23.5505, -46.6333)}")
+    print(f"Valid email: {is_valid_email('user@example.com')}")
+    print(f"Valid phone: {is_valid_phone('(11) 98765-4321')}")
 
-def round_to_nearest_minute(dt: datetime, minutes: int = 15) -> datetime:
-    """
-    Arredonda datetime para o minuto mais próximo.
-    
-    Args:
-        dt: Datetime para arredondar
-        minutes: Minutos para arredondar (ex: 15 para quarters)
-    
-    Returns:
-        Datetime arredondado
-    
-    Example:
-        >>> dt = datetime(2025, 10, 20, 14, 37, 30)
-        >>> rounded = round_to_nearest_minute(dt, 15)
-        >>> print(rounded)  # 2025-10-20 14:30:00
-    """
-    # Calcular minutos desde meia-noite
-    total_minutes = dt.hour * 60 + dt.minute
-    
-    # Arredondar
-    rounded_minutes = (total_minutes // minutes) * minutes
-    
-    # Criar novo datetime
-    return dt.replace(
-        hour=rounded_minutes // 60,
-        minute=rounded_minutes % 60,
-        second=0,
-        microsecond=0
-    )
-
-
-def format_size(size_bytes: int) -> str:
-    """
-    Formata tamanho em bytes para formato legível.
-    
-    Args:
-        size_bytes: Tamanho em bytes
-    
-    Returns:
-        String formatada (ex: "1.5 GB")
-    
-    Example:
-        >>> print(format_size(1536000000))
-        1.43 GB
-    """
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.2f} PB"
-
-
-def format_duration(seconds: float) -> str:
-    """
-    Formata duração em segundos para formato legível.
-    
-    Args:
-        seconds: Duração em segundos
-    
-    Returns:
-        String formatada (ex: "1h 23m 45s")
-    
-    Example:
-        >>> print(format_duration(5025))
-        1h 23m 45s
-    """
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    
-    minutes = int(seconds // 60)
-    remaining_seconds = seconds % 60
-    
-    if minutes < 60:
-        return f"{minutes}m {remaining_seconds:.1f}s"
-    
-    hours = minutes // 60
-    remaining_minutes = minutes % 60
-    
-    return f"{hours}h {remaining_minutes}m {remaining_seconds:.1f}s"
-
-
-def sanitize_string(s: str, max_length: int = 100) -> str:
-    """
-    Sanitiza string para uso seguro.
-    
-    Args:
-        s: String para sanitizar
-        max_length: Comprimento máximo
-    
-    Returns:
-        String sanitizada
-    
-    Example:
-        >>> sanitize_string("Hello\nWorld\t!")
-        'Hello World !'
-    """
-    if not s:
-        return ""
-    
-    # Remover caracteres de controle
-    s = s.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
-    
-    # Remover espaços múltiplos
-    s = ' '.join(s.split())
-    
-    # Truncar
-    if len(s) > max_length:
-        s = s[:max_length] + "..."
-    
-    return s.strip()
-
-
-def retry_with_backoff(
-    func,
-    max_retries: int = 3,
-    initial_delay: float = 1.0,
-    backoff_factor: float = 2.0,
-    exceptions: Tuple = (Exception,)
-):
-    """
-    Executa função com retry e exponential backoff.
-    
-    Args:
-        func: Função para executar
-        max_retries: Número máximo de tentativas
-        initial_delay: Delay inicial em segundos
-        backoff_factor: Fator de multiplicação do delay
-        exceptions: Tupla de exceções para capturar
-    
-    Returns:
-        Resultado da função
-    
-    Example:
-        >>> result = retry_with_backoff(lambda: api_call(), max_retries=3)
-    """
-    import time
-    
-    delay = initial_delay
-    last_exception = None
-    
-    for attempt in range(max_retries):
-        try:
-            return func()
-        except exceptions as e:
-            last_exception = e
-            if attempt < max_retries - 1:
-                time.sleep(delay)
-                delay *= backoff_factor
-            else:
-                raise last_exception
-
-
-if __name__ == '__main__':
-    # Testes
-    print("=== Testes de Utilidades ===\n")
-    
-    # Distância
-    dist = haversine_distance(-23.5505, -46.6333, -23.5489, -46.6388)
-    print(f"Distância Haversine: {dist:.2f} metros")
-    
-    # Velocidade
-    t1 = datetime(2025, 10, 20, 14, 0, 0)
-    t2 = datetime(2025, 10, 20, 14, 5, 0)
-    speed = calculate_speed(-23.5505, -46.6333, -23.5489, -46.6388, t1, t2)
-    print(f"Velocidade: {speed:.2f} km/h")
-    
-    # Direção
-    heading = calculate_heading(-23.5505, -46.6333, -23.5489, -46.6388)
-    print(f"Direção: {heading:.1f}°")
-    
-    # Validação
-    print(f"Coordenada válida: {is_coordinate_valid(-23.5505, -46.6333)}")
-    print(f"Coordenada inválida: {is_coordinate_valid(100, 200)}")
-    
-    # Formatação
-    print(f"Tamanho: {format_size(1536000000)}")
-    print(f"Duração: {format_duration(5025)}")
-    
-    # Partição
-    now = datetime(2025, 10, 20, 14, 30)
-    path = get_partition_path("s3a://bronze/positions/", now)
-    print(f"Path particionado: {path}")
+    # Backoff
+    for i in range(5):
+        print(f"Attempt {i}: wait {exponential_backoff(i):.2f}s")

@@ -1,16 +1,9 @@
-# ============================================================================
-# GRAFANA DATASOURCES CONFIGURATION
-# ============================================================================
-# Localização: config/grafana/datasources.yml
-# Provisiona datasources automaticamente no Grafana
-# ============================================================================
+# Grafana Datasources Configuration
 
 apiVersion: 1
 
 datasources:
-  # ==========================================================================
-  # PROMETHEUS (Metrics)
-  # ==========================================================================
+  # Prometheus
   - name: Prometheus
     type: prometheus
     access: proxy
@@ -18,43 +11,35 @@ datasources:
     isDefault: true
     editable: true
     jsonData:
+      timeInterval: "15s"
+      queryTimeout: "60s"
       httpMethod: POST
-      timeInterval: 15s
 
-  # ==========================================================================
-  # POSTGRESQL - SPTrans Database
-  # ==========================================================================
-  - name: PostgreSQL-SPTrans
+  # PostgreSQL - Raw Data
+  - name: PostgreSQL - Raw
     type: postgres
     access: proxy
     url: postgres:5432
     database: sptrans
-    user: airflow
+    user: sptrans
     secureJsonData:
-      password: airflow123
+      password: sptrans123
     jsonData:
-      sslmode: 'disable'
-      postgresVersion: 1600
-      timescaledb: false
-    editable: true
+      sslmode: disable
+      maxOpenConns: 10
+      maxIdleConns: 2
+      connMaxLifetime: 14400
 
-  # ==========================================================================
-  # POSTGRESQL - Airflow Database
-  # ==========================================================================
-  - name: PostgreSQL-Airflow
+  # PostgreSQL - Analytics
+  - name: PostgreSQL - Analytics
     type: postgres
     access: proxy
     url: postgres:5432
-    database: airflow
-    user: airflow
+    database: sptrans
+    user: sptrans
     secureJsonData:
-      password: airflow123
+      password: sptrans123
     jsonData:
-      sslmode: 'disable'
-      postgresVersion: 1600
+      sslmode: disable
+      postgresVersion: 1500
       timescaledb: false
-    editable: true
-
-# ============================================================================
-# FIM DO ARQUIVO
-# ============================================================================
