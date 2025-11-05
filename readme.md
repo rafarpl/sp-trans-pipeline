@@ -263,7 +263,7 @@ make clean-all           # Reset completo
 
 **Rafael** (rafarpl)  
 Pós-Graduação em Engenharia de Dados  
-FIA/LABDATA - 2024
+FIA/LABDATA - 2025
 
 ---
 
@@ -285,7 +285,6 @@ MIT License - Veja [LICENSE](LICENSE) para detalhes
 ## 📞 Suporte
 
 - 🐛 **Issues**: [GitHub Issues](https://github.com/rafarpl/sp-trans-pipeline/issues)
-- 📧 **Email**: contato@exemplo.com
 - 💬 **Discussions**: [GitHub Discussions](https://github.com/rafarpl/sp-trans-pipeline/discussions)
 
 ---
