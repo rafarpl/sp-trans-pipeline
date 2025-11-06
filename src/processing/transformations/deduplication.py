@@ -1,354 +1,360 @@
-# =============================================================================
-# DEDUPLICATION
-# =============================================================================
-# Remoção de registros duplicados
-# =============================================================================
-
 """
 Deduplication Module
 
-Estratégias para remover duplicatas:
-    - Dedup exato: Remove registros idênticos
-    - Dedup por chave: Remove duplicatas baseado em colunas específicas
-    - Dedup temporal: Mantém registro mais recente
-    - Dedup espacial: Remove posições muito próximas
+Responsável por remover registros duplicados:
+- Deduplicação por chave primária
+- Deduplicação por janela temporal
+- Estratégias de resolução de conflitos
 """
 
-import logging
 from typing import List, Optional
-from pyspark.sql import DataFrame, Window
+from enum import Enum
+
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
-# =============================================================================
-# LOGGING
-# =============================================================================
+from src.common.logging_config import get_logger
+from src.common.metrics import MetricsCollector
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# =============================================================================
-# DEDUPLICATION FUNCTIONS
-# =============================================================================
 
-def dedup_positions(
-    df: DataFrame,
-    key_columns: Optional[List[str]] = None,
-    timestamp_column: str = "timestamp",
-    keep: str = "last"
-) -> DataFrame:
+class DeduplicationStrategy(Enum):
+    """Estratégias de deduplicação."""
+    KEEP_FIRST = "first"  # Mantém o primeiro registro
+    KEEP_LAST = "last"    # Mantém o último registro (mais recente)
+    KEEP_BEST_QUALITY = "best_quality"  # Mantém o de melhor qualidade
+
+
+class Deduplicator:
     """
-    Remove duplicatas de posições de veículos.
+    Classe para deduplicação de registros.
     
-    Args:
-        df: DataFrame com posições
-        key_columns: Colunas que identificam unicidade (default: vehicle_id + timestamp)
-        timestamp_column: Coluna de timestamp
-        keep: 'first' ou 'last' - qual registro manter
-    
-    Returns:
-        DataFrame sem duplicatas
-    
-    Example:
-        >>> df_clean = dedup_positions(df, keep='last')
+    Remove duplicatas usando diferentes estratégias:
+    - Por chave única (vehicle_id + timestamp)
+    - Por janela temporal
+    - Por qualidade dos dados
     """
-    logger.info("Iniciando deduplicação de posições...")
     
-    initial_count = df.count()
-    
-    # Colunas padrão para dedup
-    if key_columns is None:
-        key_columns = ["vehicle_id", timestamp_column]
-    
-    # Verificar se colunas existem
-    missing_cols = [col for col in key_columns if col not in df.columns]
-    if missing_cols:
-        logger.error(f"Colunas faltando: {missing_cols}")
-        return df
-    
-    # Estratégia: Ordenar por timestamp e manter primeiro/último
-    window_spec = Window.partitionBy(key_columns).orderBy(
-        F.col(timestamp_column).desc() if keep == "last" else F.col(timestamp_column).asc()
-    )
-    
-    # Adicionar row number
-    df_with_row = df.withColumn("row_num", F.row_number().over(window_spec))
-    
-    # Manter apenas row_num = 1
-    df_deduped = df_with_row.filter(F.col("row_num") == 1).drop("row_num")
-    
-    final_count = df_deduped.count()
-    duplicates_removed = initial_count - final_count
-    
-    logger.info(f"Duplicatas removidas: {duplicates_removed} ({(duplicates_removed/initial_count*100):.2f}%)")
-    logger.info(f"Registros finais: {final_count}")
-    
-    return df_deduped
-
-
-def remove_duplicates(
-    df: DataFrame,
-    subset: Optional[List[str]] = None,
-    keep: str = "first"
-) -> DataFrame:
-    """
-    Remove duplicatas exatas do DataFrame.
-    
-    Args:
-        df: DataFrame
-        subset: Colunas a considerar (None = todas)
-        keep: 'first' ou 'last'
-    
-    Returns:
-        DataFrame sem duplicatas
-    
-    Example:
-        >>> df_unique = remove_duplicates(df, subset=['vehicle_id', 'timestamp'])
-    """
-    logger.info("Removendo duplicatas exatas...")
-    
-    initial_count = df.count()
-    
-    if subset:
-        # Verificar se colunas existem
-        missing_cols = [col for col in subset if col not in df.columns]
-        if missing_cols:
-            logger.error(f"Colunas faltando: {missing_cols}")
-            return df
+    def __init__(
+        self,
+        spark: SparkSession,
+        strategy: DeduplicationStrategy = DeduplicationStrategy.KEEP_LAST
+    ):
+        """
+        Inicializa o Deduplicator.
         
-        # Drop duplicates baseado em subset
-        df_unique = df.dropDuplicates(subset)
-    else:
-        # Drop duplicates em todas as colunas
-        df_unique = df.dropDuplicates()
+        Args:
+            spark: SparkSession ativa
+            strategy: Estratégia de deduplicação
+        """
+        self.spark = spark
+        self.strategy = strategy
+        self.metrics = MetricsCollector()
+        self.logger = get_logger(self.__class__.__name__)
     
-    final_count = df_unique.count()
-    duplicates_removed = initial_count - final_count
-    
-    logger.info(f"Duplicatas removidas: {duplicates_removed}")
-    
-    return df_unique
-
-
-def deduplicate_by_key(
-    df: DataFrame,
-    key_columns: List[str],
-    order_column: str,
-    ascending: bool = False
-) -> DataFrame:
-    """
-    Remove duplicatas mantendo registro baseado em ordenação.
-    
-    Args:
-        df: DataFrame
-        key_columns: Colunas que definem chave única
-        order_column: Coluna para ordenar
-        ascending: Ordem crescente ou decrescente
-    
-    Returns:
-        DataFrame deduplicado
-    
-    Example:
-        >>> # Manter posição mais recente de cada veículo
-        >>> df_clean = deduplicate_by_key(
-        ...     df,
-        ...     key_columns=['vehicle_id'],
-        ...     order_column='timestamp',
-        ...     ascending=False
-        ... )
-    """
-    logger.info(f"Deduplicando por chave: {key_columns}")
-    
-    initial_count = df.count()
-    
-    # Window spec
-    window_spec = Window.partitionBy(key_columns).orderBy(
-        F.col(order_column).asc() if ascending else F.col(order_column).desc()
-    )
-    
-    # Adicionar rank
-    df_ranked = df.withColumn("rank", F.rank().over(window_spec))
-    
-    # Manter apenas rank = 1
-    df_deduped = df_ranked.filter(F.col("rank") == 1).drop("rank")
-    
-    final_count = df_deduped.count()
-    
-    logger.info(f"Registros removidos: {initial_count - final_count}")
-    
-    return df_deduped
-
-
-def remove_spatial_duplicates(
-    df: DataFrame,
-    vehicle_id_col: str = "vehicle_id",
-    lat_col: str = "latitude",
-    lon_col: str = "longitude",
-    timestamp_col: str = "timestamp",
-    distance_threshold_meters: float = 10.0,
-    time_threshold_seconds: int = 60
-) -> DataFrame:
-    """
-    Remove duplicatas espaciais (posições muito próximas no espaço e tempo).
-    
-    Args:
-        df: DataFrame
-        vehicle_id_col: Coluna de ID do veículo
-        lat_col: Coluna de latitude
-        lon_col: Coluna de longitude
-        timestamp_col: Coluna de timestamp
-        distance_threshold_meters: Distância mínima em metros
-        time_threshold_seconds: Tempo mínimo em segundos
-    
-    Returns:
-        DataFrame sem duplicatas espaciais
-    """
-    logger.info("Removendo duplicatas espaciais...")
-    
-    initial_count = df.count()
-    
-    # Window para acessar registro anterior
-    window_spec = Window.partitionBy(vehicle_id_col).orderBy(timestamp_col)
-    
-    # Adicionar lat/lon e timestamp do registro anterior
-    df_with_prev = df.withColumn("prev_lat", F.lag(lat_col).over(window_spec)) \
-                     .withColumn("prev_lon", F.lag(lon_col).over(window_spec)) \
-                     .withColumn("prev_timestamp", F.lag(timestamp_col).over(window_spec))
-    
-    # Calcular distância e diferença de tempo
-    # Fórmula simplificada de distância (haversine aproximada)
-    df_with_distance = df_with_prev.withColumn(
-        "distance_meters",
-        F.when(
-            F.col("prev_lat").isNotNull(),
-            # Aproximação simples: 111km por grau
-            F.sqrt(
-                F.pow((F.col(lat_col) - F.col("prev_lat")) * 111000, 2) +
-                F.pow((F.col(lon_col) - F.col("prev_lon")) * 111000 * 
-                      F.cos(F.radians(F.col(lat_col))), 2)
+    def deduplicate_by_key(
+        self,
+        df: DataFrame,
+        key_columns: List[str]
+    ) -> DataFrame:
+        """
+        Remove duplicatas por chave composta.
+        
+        Args:
+            df: DataFrame de entrada
+            key_columns: Lista de colunas que formam a chave
+            
+        Returns:
+            DataFrame sem duplicatas
+        """
+        self.logger.info(f"Deduplicating by key: {key_columns}")
+        
+        original_count = df.count()
+        
+        # Remover duplicatas exatas
+        df_dedup = df.dropDuplicates(key_columns)
+        
+        dedup_count = df_dedup.count()
+        removed_count = original_count - dedup_count
+        
+        if removed_count > 0:
+            self.logger.warning(
+                f"Removed {removed_count} duplicate records "
+                f"({(removed_count/original_count)*100:.2f}%)"
             )
-        ).otherwise(999999)
-    )
+            self.metrics.counter("deduplication.removed_records", removed_count)
+        else:
+            self.logger.info("No duplicates found")
+        
+        return df_dedup
     
-    # Calcular diferença de tempo em segundos
-    df_with_time_diff = df_with_distance.withColumn(
-        "time_diff_seconds",
-        F.when(
-            F.col("prev_timestamp").isNotNull(),
-            F.unix_timestamp(timestamp_col) - F.unix_timestamp("prev_timestamp")
-        ).otherwise(999999)
-    )
+    def deduplicate_by_window(
+        self,
+        df: DataFrame,
+        partition_columns: List[str],
+        order_column: str = "timestamp",
+        ascending: bool = False
+    ) -> DataFrame:
+        """
+        Remove duplicatas usando window function.
+        
+        Mantém apenas um registro por partição, ordenado por ordem especificada.
+        
+        Args:
+            df: DataFrame de entrada
+            partition_columns: Colunas para particionar (ex: vehicle_id)
+            order_column: Coluna para ordenar (ex: timestamp)
+            ascending: Se True, mantém o primeiro; se False, mantém o último
+            
+        Returns:
+            DataFrame dedupli cado
+        """
+        self.logger.info(
+            f"Deduplicating by window: partition={partition_columns}, "
+            f"order={order_column}, ascending={ascending}"
+        )
+        
+        original_count = df.count()
+        
+        # Criar window spec
+        window_spec = Window.partitionBy(*partition_columns).orderBy(
+            F.col(order_column).asc() if ascending else F.col(order_column).desc()
+        )
+        
+        # Adicionar row number
+        df_with_row_num = df.withColumn("row_num", F.row_number().over(window_spec))
+        
+        # Manter apenas o primeiro registro de cada partição
+        df_dedup = df_with_row_num.filter(F.col("row_num") == 1).drop("row_num")
+        
+        dedup_count = df_dedup.count()
+        removed_count = original_count - dedup_count
+        
+        if removed_count > 0:
+            self.logger.warning(
+                f"Removed {removed_count} duplicate records by window "
+                f"({(removed_count/original_count)*100:.2f}%)"
+            )
+            self.metrics.counter("deduplication.removed_by_window", removed_count)
+        else:
+            self.logger.info("No duplicates found by window")
+        
+        return df_dedup
     
-    # Filtrar apenas registros que NÃO são duplicatas espaciais
-    df_filtered = df_with_time_diff.filter(
-        (F.col("distance_meters") > distance_threshold_meters) |
-        (F.col("time_diff_seconds") > time_threshold_seconds)
-    )
+    def deduplicate_vehicles_by_time_window(
+        self,
+        df: DataFrame,
+        time_window_seconds: int = 60
+    ) -> DataFrame:
+        """
+        Remove duplicatas de veículos dentro de uma janela de tempo.
+        
+        Para cada veículo, mantém apenas uma posição a cada X segundos.
+        
+        Args:
+            df: DataFrame com colunas vehicle_id, timestamp, latitude, longitude
+            time_window_seconds: Janela de tempo em segundos
+            
+        Returns:
+            DataFrame dedupli cado
+        """
+        self.logger.info(
+            f"Deduplicating vehicles with {time_window_seconds}s time window"
+        )
+        
+        original_count = df.count()
+        
+        # Criar timestamp truncado (arredondado para a janela)
+        df_with_window = df.withColumn(
+            "time_window",
+            F.floor(F.unix_timestamp("timestamp") / time_window_seconds) * time_window_seconds
+        )
+        
+        # Window spec por veículo e janela de tempo
+        window_spec = Window.partitionBy("vehicle_id", "time_window").orderBy(
+            F.col("timestamp").desc()
+        )
+        
+        # Manter apenas o registro mais recente de cada janela
+        df_dedup = (
+            df_with_window
+            .withColumn("row_num", F.row_number().over(window_spec))
+            .filter(F.col("row_num") == 1)
+            .drop("row_num", "time_window")
+        )
+        
+        dedup_count = df_dedup.count()
+        removed_count = original_count - dedup_count
+        
+        if removed_count > 0:
+            self.logger.warning(
+                f"Removed {removed_count} duplicate records within time window "
+                f"({(removed_count/original_count)*100:.2f}%)"
+            )
+            self.metrics.counter("deduplication.removed_by_time_window", removed_count)
+        else:
+            self.logger.info("No duplicates found within time window")
+        
+        return df_dedup
     
-    # Remover colunas auxiliares
-    df_clean = df_filtered.drop("prev_lat", "prev_lon", "prev_timestamp", 
-                                 "distance_meters", "time_diff_seconds")
+    def deduplicate_by_quality(
+        self,
+        df: DataFrame,
+        partition_columns: List[str],
+        quality_column: str = "quality_score"
+    ) -> DataFrame:
+        """
+        Remove duplicatas mantendo o registro de melhor qualidade.
+        
+        Args:
+            df: DataFrame com coluna de qualidade
+            partition_columns: Colunas para particionar
+            quality_column: Nome da coluna de qualidade
+            
+        Returns:
+            DataFrame dedupli cado
+        """
+        self.logger.info(
+            f"Deduplicating by quality: partition={partition_columns}, "
+            f"quality_col={quality_column}"
+        )
+        
+        original_count = df.count()
+        
+        # Window spec ordenado por qualidade (maior = melhor)
+        window_spec = Window.partitionBy(*partition_columns).orderBy(
+            F.col(quality_column).desc()
+        )
+        
+        # Manter apenas o registro de melhor qualidade
+        df_dedup = (
+            df.withColumn("row_num", F.row_number().over(window_spec))
+            .filter(F.col("row_num") == 1)
+            .drop("row_num")
+        )
+        
+        dedup_count = df_dedup.count()
+        removed_count = original_count - dedup_count
+        
+        if removed_count > 0:
+            self.logger.warning(
+                f"Removed {removed_count} duplicate records by quality "
+                f"({(removed_count/original_count)*100:.2f}%)"
+            )
+            self.metrics.counter("deduplication.removed_by_quality", removed_count)
+        else:
+            self.logger.info("No duplicates found by quality")
+        
+        return df_dedup
     
-    final_count = df_clean.count()
-    spatial_duplicates = initial_count - final_count
+    def detect_duplicates(
+        self,
+        df: DataFrame,
+        key_columns: List[str]
+    ) -> DataFrame:
+        """
+        Detecta e marca registros duplicados sem removê-los.
+        
+        Args:
+            df: DataFrame de entrada
+            key_columns: Colunas que formam a chave
+            
+        Returns:
+            DataFrame com coluna 'is_duplicate' adicionada
+        """
+        self.logger.info(f"Detecting duplicates by key: {key_columns}")
+        
+        # Contar ocorrências de cada chave
+        window_spec = Window.partitionBy(*key_columns)
+        
+        df_with_flag = (
+            df.withColumn("duplicate_count", F.count("*").over(window_spec))
+            .withColumn("is_duplicate", F.col("duplicate_count") > 1)
+        )
+        
+        duplicate_count = df_with_flag.filter(F.col("is_duplicate")).count()
+        total_count = df.count()
+        
+        if duplicate_count > 0:
+            self.logger.warning(
+                f"Found {duplicate_count} duplicate records "
+                f"({(duplicate_count/total_count)*100:.2f}%)"
+            )
+            self.metrics.gauge("deduplication.duplicate_records", duplicate_count)
+        else:
+            self.logger.info("No duplicates detected")
+        
+        return df_with_flag
     
-    logger.info(f"Duplicatas espaciais removidas: {spatial_duplicates}")
-    
-    return df_clean
+    def remove_exact_duplicates(self, df: DataFrame) -> DataFrame:
+        """
+        Remove registros 100% idênticos (todas as colunas iguais).
+        
+        Args:
+            df: DataFrame de entrada
+            
+        Returns:
+            DataFrame sem duplicatas exatas
+        """
+        self.logger.info("Removing exact duplicates (all columns)")
+        
+        original_count = df.count()
+        
+        df_dedup = df.dropDuplicates()
+        
+        dedup_count = df_dedup.count()
+        removed_count = original_count - dedup_count
+        
+        if removed_count > 0:
+            self.logger.warning(
+                f"Removed {removed_count} exact duplicate records "
+                f"({(removed_count/original_count)*100:.2f}%)"
+            )
+            self.metrics.counter("deduplication.removed_exact", removed_count)
+        else:
+            self.logger.info("No exact duplicates found")
+        
+        return df_dedup
 
 
-def remove_consecutive_duplicates(
+def deduplicate_vehicles(
     df: DataFrame,
-    partition_cols: List[str],
-    compare_cols: List[str],
-    order_col: str = "timestamp"
+    strategy: str = "last",
+    time_window_seconds: int = 60
 ) -> DataFrame:
     """
-    Remove registros consecutivos idênticos.
-    
-    Útil para remover posições onde o veículo não se moveu.
+    Função utilitária para deduplicar posições de veículos.
     
     Args:
-        df: DataFrame
-        partition_cols: Colunas de partição (ex: vehicle_id)
-        compare_cols: Colunas a comparar (ex: latitude, longitude)
-        order_col: Coluna de ordenação
-    
+        df: DataFrame com vehicle_id e timestamp
+        strategy: 'first', 'last', ou 'time_window'
+        time_window_seconds: Janela de tempo (se strategy='time_window')
+        
     Returns:
-        DataFrame sem consecutivos duplicados
-    
-    Example:
-        >>> # Remover posições consecutivas com mesma lat/lon
-        >>> df_clean = remove_consecutive_duplicates(
-        ...     df,
-        ...     partition_cols=['vehicle_id'],
-        ...     compare_cols=['latitude', 'longitude']
-        ... )
+        DataFrame dedupli cado
     """
-    logger.info("Removendo duplicatas consecutivas...")
+    spark = df.sparkSession
+    deduplicator = Deduplicator(spark)
     
-    initial_count = df.count()
-    
-    window_spec = Window.partitionBy(partition_cols).orderBy(order_col)
-    
-    # Criar flag de mudança
-    # Se qualquer coluna mudou, não é duplicata
-    is_different = F.lit(False)
-    
-    for col in compare_cols:
-        prev_col = f"prev_{col}"
-        df = df.withColumn(prev_col, F.lag(col).over(window_spec))
-        
-        is_different = is_different | (F.col(col) != F.col(prev_col)) | F.col(prev_col).isNull()
-        
-        df = df.drop(prev_col)
-    
-    # Manter apenas registros diferentes
-    df_filtered = df.filter(is_different)
-    
-    final_count = df_filtered.count()
-    
-    logger.info(f"Duplicatas consecutivas removidas: {initial_count - final_count}")
-    
-    return df_filtered
-
-
-def get_duplicate_stats(df: DataFrame, key_columns: List[str]) -> DataFrame:
-    """
-    Retorna estatísticas sobre duplicatas.
-    
-    Args:
-        df: DataFrame
-        key_columns: Colunas que definem chave
-    
-    Returns:
-        DataFrame com estatísticas de duplicatas
-    
-    Example:
-        >>> stats = get_duplicate_stats(df, ['vehicle_id', 'timestamp'])
-        >>> stats.show()
-    """
-    logger.info("Calculando estatísticas de duplicatas...")
-    
-    # Contar ocorrências de cada chave
-    duplicate_counts = df.groupBy(key_columns) \
-        .agg(F.count("*").alias("count")) \
-        .filter(F.col("count") > 1) \
-        .orderBy(F.col("count").desc())
-    
-    # Estatísticas gerais
-    total_duplicates = duplicate_counts.count()
-    
-    if total_duplicates > 0:
-        max_duplicates = duplicate_counts.agg(F.max("count")).collect()[0][0]
-        avg_duplicates = duplicate_counts.agg(F.avg("count")).collect()[0][0]
-        
-        logger.info(f"Total de chaves duplicadas: {total_duplicates}")
-        logger.info(f"Máximo de duplicatas: {max_duplicates}")
-        logger.info(f"Média de duplicatas: {avg_duplicates:.2f}")
+    if strategy == "time_window":
+        return deduplicator.deduplicate_vehicles_by_time_window(
+            df,
+            time_window_seconds
+        )
+    elif strategy == "first":
+        return deduplicator.deduplicate_by_window(
+            df,
+            partition_columns=["vehicle_id"],
+            order_column="timestamp",
+            ascending=True
+        )
+    elif strategy == "last":
+        return deduplicator.deduplicate_by_window(
+            df,
+            partition_columns=["vehicle_id"],
+            order_column="timestamp",
+            ascending=False
+        )
     else:
-        logger.info("Nenhuma duplicata encontrada")
-    
-    return duplicate_counts
-
-# =============================================================================
-# END
-# =============================================================================
+        raise ValueError(f"Invalid strategy: {strategy}")

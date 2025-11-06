@@ -1,0 +1,26 @@
+{
+  "dashboard": {
+    "title": "SPTrans – KPIs Operacionais",
+    "panels": [
+      {
+        "type": "graph",
+        "title": "Velocidade Média por Linha",
+        "targets": [
+          {
+            "rawSql": "SELECT timestamp, avg_speed FROM gold_kpi_operational"
+          }
+        ]
+      },
+      {
+        "type": "stat",
+        "title": "Ônibus Ativos",
+        "targets": [
+          {
+            "rawSql": "SELECT COUNT(DISTINCT vehicle_id) FROM silver_positions"
+          }
+        ]
+      }
+    ],
+    "refresh": "2m"
+  }
+}

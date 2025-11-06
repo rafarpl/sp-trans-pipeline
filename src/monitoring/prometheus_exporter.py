@@ -1,482 +1,403 @@
-# =============================================================================
-# PROMETHEUS METRICS
-# =============================================================================
-# Exposição de métricas Prometheus para observabilidade
-# =============================================================================
-
 """
-Prometheus Metrics Exporter
+Prometheus Exporter Module
 
-Coleta e expõe métricas para Prometheus:
-    - Counters: Contadores incrementais
-    - Gauges: Valores que sobem e descem
-    - Histograms: Distribuições de valores
-    - Summaries: Estatísticas de valores
-
-Métricas coletadas:
-    - Pipeline: jobs executados, erros, duração
-    - Dados: registros processados, qualidade
-    - Infraestrutura: CPU, memória, disco
-    - Negócio: veículos ativos, rotas, KPIs
+Responsável por exportar métricas para Prometheus:
+- Métricas técnicas (latência, throughput)
+- Métricas de negócio (KPIs)
+- Métricas de sistema (CPU, memória)
+- HTTP endpoint para scraping
 """
 
-import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, List, Optional
 from datetime import datetime
+import time
 
-try:
-    from prometheus_client import (
-        Counter,
-        Gauge,
-        Histogram,
-        Summary,
-        Info,
-        start_http_server,
-        CollectorRegistry,
-        REGISTRY,
-    )
-    PROMETHEUS_AVAILABLE = True
-except ImportError:
-    PROMETHEUS_AVAILABLE = False
-    Counter = Gauge = Histogram = Summary = Info = None
+from prometheus_client import (
+    Counter,
+    Gauge,
+    Histogram,
+    Summary,
+    Info,
+    CollectorRegistry,
+    generate_latest,
+    CONTENT_TYPE_LATEST
+)
+from flask import Flask, Response
 
-# =============================================================================
-# LOGGING
-# =============================================================================
+from src.common.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# =============================================================================
-# METRICS EXPORTER
-# =============================================================================
 
-class MetricsExporter:
-    """Exportador de métricas Prometheus"""
+class PrometheusExporter:
+    """
+    Classe para exportar métricas para Prometheus.
+    
+    Gerencia diferentes tipos de métricas e expõe endpoint HTTP.
+    """
     
     def __init__(
         self,
-        port: int = 9090,
-        registry: Optional[Any] = None,
-        config: Optional[Dict[str, Any]] = None
+        registry: Optional[CollectorRegistry] = None,
+        namespace: str = "sptrans"
     ):
         """
-        Inicializa exportador de métricas.
+        Inicializa o exportador.
         
         Args:
-            port: Porta para expor métricas
-            registry: Registry do Prometheus (default: REGISTRY)
-            config: Configurações adicionais
-        
-        Raises:
-            ImportError: Se prometheus_client não estiver instalado
+            registry: Registry customizado (usa padrão se None)
+            namespace: Namespace para métricas
         """
-        if not PROMETHEUS_AVAILABLE:
-            raise ImportError(
-                "prometheus_client não instalado. "
-                "Instale com: pip install prometheus-client"
-            )
-        
-        self.port = port
-        self.registry = registry or REGISTRY
-        self.config = config or {}
-        self.server_started = False
+        self.registry = registry or CollectorRegistry()
+        self.namespace = namespace
+        self.logger = get_logger(self.__class__.__name__)
         
         # Inicializar métricas
-        self._init_metrics()
-        
-        logger.info(f"MetricsExporter inicializado (porta: {port})")
+        self._init_pipeline_metrics()
+        self._init_data_quality_metrics()
+        self._init_business_metrics()
+        self._init_system_metrics()
     
-    def _init_metrics(self):
-        """Inicializa todas as métricas"""
+    def _init_pipeline_metrics(self) -> None:
+        """Inicializa métricas do pipeline."""
         
-        # ===== PIPELINE METRICS =====
-        
-        # Jobs executados
-        self.jobs_total = Counter(
-            'sptrans_jobs_total',
-            'Total de jobs executados',
-            ['job_name', 'status'],
+        # Contadores
+        self.records_ingested = Counter(
+            "records_ingested_total",
+            "Total records ingested from API",
+            ["source"],
+            namespace=self.namespace,
             registry=self.registry
         )
         
-        # Duração dos jobs
-        self.job_duration = Histogram(
-            'sptrans_job_duration_seconds',
-            'Duração dos jobs em segundos',
-            ['job_name'],
-            registry=self.registry,
-            buckets=(10, 30, 60, 120, 300, 600, 1800, 3600)
-        )
-        
-        # Erros
-        self.errors_total = Counter(
-            'sptrans_errors_total',
-            'Total de erros',
-            ['error_type', 'component'],
-            registry=self.registry
-        )
-        
-        # ===== DATA METRICS =====
-        
-        # Registros processados
         self.records_processed = Counter(
-            'sptrans_records_processed_total',
-            'Total de registros processados',
-            ['layer', 'source'],
+            "records_processed_total",
+            "Total records processed through pipeline",
+            ["stage", "status"],
+            namespace=self.namespace,
             registry=self.registry
         )
         
-        # Qualidade de dados
-        self.data_quality_score = Gauge(
-            'sptrans_data_quality_score',
-            'Score de qualidade de dados (0-100)',
-            ['layer', 'metric'],
+        self.pipeline_errors = Counter(
+            "pipeline_errors_total",
+            "Total pipeline errors",
+            ["stage", "error_type"],
+            namespace=self.namespace,
             registry=self.registry
         )
         
-        # ===== BUSINESS METRICS =====
-        
-        # Veículos ativos
-        self.active_vehicles = Gauge(
-            'sptrans_active_vehicles',
-            'Número de veículos ativos',
-            ['route_code'],
-            registry=self.registry
-        )
-        
-        # Rotas ativas
-        self.active_routes = Gauge(
-            'sptrans_active_routes',
-            'Número de rotas ativas',
-            registry=self.registry
-        )
-        
-        # Velocidade média
-        self.avg_speed = Gauge(
-            'sptrans_avg_speed_kmh',
-            'Velocidade média em km/h',
-            ['route_code'],
-            registry=self.registry
-        )
-        
-        # Headway
-        self.headway_minutes = Gauge(
-            'sptrans_headway_minutes',
-            'Intervalo entre ônibus em minutos',
-            ['route_code'],
-            registry=self.registry
-        )
-        
-        # ===== API METRICS =====
-        
-        # Requisições API
-        self.api_requests = Counter(
-            'sptrans_api_requests_total',
-            'Total de requisições à API SPTrans',
-            ['endpoint', 'status'],
-            registry=self.registry
-        )
-        
-        # Latência API
-        self.api_latency = Histogram(
-            'sptrans_api_latency_seconds',
-            'Latência de requisições à API',
-            ['endpoint'],
+        # Histogramas (latência)
+        self.ingestion_duration = Histogram(
+            "ingestion_duration_seconds",
+            "Time spent ingesting data",
+            ["source"],
+            namespace=self.namespace,
             registry=self.registry,
-            buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0)
+            buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
         )
         
-        # ===== INFRASTRUCTURE METRICS =====
+        self.processing_duration = Histogram(
+            "processing_duration_seconds",
+            "Time spent processing data",
+            ["stage"],
+            namespace=self.namespace,
+            registry=self.registry,
+            buckets=(1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0)
+        )
         
-        # Uso de memória
-        self.memory_usage = Gauge(
-            'sptrans_memory_usage_bytes',
-            'Uso de memória em bytes',
-            ['component'],
+        # Gauges
+        self.last_ingestion_timestamp = Gauge(
+            "last_ingestion_timestamp",
+            "Timestamp of last successful ingestion",
+            ["source"],
+            namespace=self.namespace,
             registry=self.registry
         )
         
-        # Conexões ativas
-        self.active_connections = Gauge(
-            'sptrans_active_connections',
-            'Número de conexões ativas',
-            ['service'],
+        self.pipeline_lag_seconds = Gauge(
+            "pipeline_lag_seconds",
+            "Lag between data timestamp and processing time",
+            ["stage"],
+            namespace=self.namespace,
+            registry=self.registry
+        )
+    
+    def _init_data_quality_metrics(self) -> None:
+        """Inicializa métricas de qualidade de dados."""
+        
+        self.quality_score = Gauge(
+            "data_quality_score",
+            "Overall data quality score (0-100)",
+            ["layer"],
+            namespace=self.namespace,
             registry=self.registry
         )
         
-        # Cache hit rate
-        self.cache_hit_rate = Gauge(
-            'sptrans_cache_hit_rate',
-            'Taxa de acerto do cache (%)',
-            ['cache_type'],
+        self.invalid_records = Counter(
+            "invalid_records_total",
+            "Total invalid records detected",
+            ["layer", "reason"],
+            namespace=self.namespace,
             registry=self.registry
         )
         
-        # ===== SYSTEM INFO =====
-        
-        # Info do pipeline
-        self.pipeline_info = Info(
-            'sptrans_pipeline',
-            'Informações do pipeline',
+        self.duplicate_records = Counter(
+            "duplicate_records_total",
+            "Total duplicate records detected",
+            ["layer"],
+            namespace=self.namespace,
             registry=self.registry
         )
         
-        self.pipeline_info.info({
-            'version': '1.0.0',
-            'environment': 'production',
-        })
+        self.quality_alerts = Counter(
+            "quality_alerts_total",
+            "Total data quality alerts",
+            ["severity"],
+            namespace=self.namespace,
+            registry=self.registry
+        )
+    
+    def _init_business_metrics(self) -> None:
+        """Inicializa métricas de negócio (KPIs)."""
         
-        logger.debug("Métricas inicializadas")
-    
-    def start(self):
-        """Inicia servidor HTTP para expor métricas"""
-        if self.server_started:
-            logger.warning("Servidor já está rodando")
-            return
+        self.fleet_coverage = Gauge(
+            "fleet_coverage_percent",
+            "Percentage of active fleet",
+            namespace=self.namespace,
+            registry=self.registry
+        )
         
-        try:
-            start_http_server(self.port, registry=self.registry)
-            self.server_started = True
-            logger.info(f"✓ Prometheus metrics server iniciado na porta {self.port}")
-            logger.info(f"Métricas disponíveis em: http://localhost:{self.port}/metrics")
+        self.active_vehicles = Gauge(
+            "active_vehicles",
+            "Number of active vehicles",
+            namespace=self.namespace,
+            registry=self.registry
+        )
         
-        except Exception as e:
-            logger.error(f"Erro ao iniciar servidor de métricas: {e}")
-            raise
+        self.average_speed = Gauge(
+            "average_speed_kmh",
+            "Average vehicle speed in km/h",
+            ["line_id"],
+            namespace=self.namespace,
+            registry=self.registry
+        )
+        
+        self.headway_minutes = Gauge(
+            "headway_minutes",
+            "Average headway between vehicles in minutes",
+            ["line_id", "stop_id"],
+            namespace=self.namespace,
+            registry=self.registry
+        )
+        
+        self.on_time_performance = Gauge(
+            "on_time_performance_percent",
+            "Percentage of on-time arrivals",
+            ["line_id"],
+            namespace=self.namespace,
+            registry=self.registry
+        )
     
-    # ===== HELPER METHODS =====
+    def _init_system_metrics(self) -> None:
+        """Inicializa métricas de sistema."""
+        
+        self.service_health = Gauge(
+            "service_health",
+            "Health status of services (1=healthy, 0=unhealthy)",
+            ["service"],
+            namespace=self.namespace,
+            registry=self.registry
+        )
+        
+        self.component_uptime_seconds = Gauge(
+            "component_uptime_seconds",
+            "Uptime of components in seconds",
+            ["component"],
+            namespace=self.namespace,
+            registry=self.registry
+        )
     
-    def increment_job_counter(self, job_name: str, status: str = "success"):
-        """Incrementa contador de jobs"""
-        self.jobs_total.labels(job_name=job_name, status=status).inc()
+    # === Métodos para atualizar métricas ===
     
-    def record_job_duration(self, job_name: str, duration_seconds: float):
-        """Registra duração de job"""
-        self.job_duration.labels(job_name=job_name).observe(duration_seconds)
+    def record_ingestion(
+        self,
+        source: str,
+        record_count: int,
+        duration_seconds: float
+    ) -> None:
+        """
+        Registra ingestão de dados.
+        
+        Args:
+            source: Fonte dos dados (api, gtfs, etc)
+            record_count: Número de registros
+            duration_seconds: Duração em segundos
+        """
+        self.records_ingested.labels(source=source).inc(record_count)
+        self.ingestion_duration.labels(source=source).observe(duration_seconds)
+        self.last_ingestion_timestamp.labels(source=source).set(time.time())
     
-    def increment_error_counter(self, error_type: str, component: str):
-        """Incrementa contador de erros"""
-        self.errors_total.labels(error_type=error_type, component=component).inc()
+    def record_processing(
+        self,
+        stage: str,
+        record_count: int,
+        duration_seconds: float,
+        status: str = "success"
+    ) -> None:
+        """
+        Registra processamento de dados.
+        
+        Args:
+            stage: Estágio do pipeline (bronze, silver, gold)
+            record_count: Número de registros processados
+            duration_seconds: Duração em segundos
+            status: Status (success, failure)
+        """
+        self.records_processed.labels(stage=stage, status=status).inc(record_count)
+        self.processing_duration.labels(stage=stage).observe(duration_seconds)
     
-    def increment_records_processed(self, layer: str, source: str, count: int = 1):
-        """Incrementa contador de registros processados"""
-        self.records_processed.labels(layer=layer, source=source).inc(count)
+    def record_error(
+        self,
+        stage: str,
+        error_type: str,
+        count: int = 1
+    ) -> None:
+        """
+        Registra erro no pipeline.
+        
+        Args:
+            stage: Estágio onde ocorreu o erro
+            error_type: Tipo de erro
+            count: Número de erros
+        """
+        self.pipeline_errors.labels(stage=stage, error_type=error_type).inc(count)
     
-    def set_data_quality_score(self, layer: str, metric: str, score: float):
-        """Define score de qualidade"""
-        self.data_quality_score.labels(layer=layer, metric=metric).set(score)
+    def update_quality_score(
+        self,
+        layer: str,
+        score: float
+    ) -> None:
+        """
+        Atualiza score de qualidade.
+        
+        Args:
+            layer: Camada (bronze, silver, gold)
+            score: Score (0-100)
+        """
+        self.quality_score.labels(layer=layer).set(score)
     
-    def set_active_vehicles(self, count: int, route_code: str = "all"):
-        """Define número de veículos ativos"""
-        self.active_vehicles.labels(route_code=route_code).set(count)
+    def update_fleet_coverage(
+        self,
+        active_vehicles: int,
+        total_fleet: int
+    ) -> None:
+        """
+        Atualiza cobertura da frota.
+        
+        Args:
+            active_vehicles: Veículos ativos
+            total_fleet: Tamanho total da frota
+        """
+        coverage = (active_vehicles / total_fleet * 100) if total_fleet > 0 else 0
+        self.fleet_coverage.set(coverage)
+        self.active_vehicles.set(active_vehicles)
     
-    def set_active_routes(self, count: int):
-        """Define número de rotas ativas"""
-        self.active_routes.set(count)
+    def update_service_health(
+        self,
+        service: str,
+        is_healthy: bool
+    ) -> None:
+        """
+        Atualiza status de saúde de um serviço.
+        
+        Args:
+            service: Nome do serviço
+            is_healthy: Se está saudável
+        """
+        self.service_health.labels(service=service).set(1 if is_healthy else 0)
     
-    def set_avg_speed(self, speed_kmh: float, route_code: str = "all"):
-        """Define velocidade média"""
-        self.avg_speed.labels(route_code=route_code).set(speed_kmh)
+    def get_metrics(self) -> bytes:
+        """
+        Obtém métricas no formato Prometheus.
+        
+        Returns:
+            Métricas em formato texto
+        """
+        return generate_latest(self.registry)
     
-    def set_headway(self, minutes: float, route_code: str):
-        """Define headway"""
-        self.headway_minutes.labels(route_code=route_code).set(minutes)
-    
-    def increment_api_requests(self, endpoint: str, status: str):
-        """Incrementa contador de requisições API"""
-        self.api_requests.labels(endpoint=endpoint, status=status).inc()
-    
-    def record_api_latency(self, endpoint: str, latency_seconds: float):
-        """Registra latência da API"""
-        self.api_latency.labels(endpoint=endpoint).observe(latency_seconds)
-    
-    def set_memory_usage(self, component: str, bytes_used: int):
-        """Define uso de memória"""
-        self.memory_usage.labels(component=component).set(bytes_used)
-    
-    def set_active_connections(self, service: str, count: int):
-        """Define conexões ativas"""
-        self.active_connections.labels(service=service).set(count)
-    
-    def set_cache_hit_rate(self, cache_type: str, rate: float):
-        """Define taxa de acerto do cache"""
-        self.cache_hit_rate.labels(cache_type=cache_type).set(rate)
-
-
-# =============================================================================
-# GLOBAL INSTANCE
-# =============================================================================
-
-_exporter: Optional[MetricsExporter] = None
-
-
-def get_exporter() -> Optional[MetricsExporter]:
-    """Retorna instância global do exporter"""
-    return _exporter
-
-
-def create_metrics_exporter(
-    port: Optional[int] = None,
-    auto_start: bool = False
-) -> MetricsExporter:
-    """
-    Factory function para criar metrics exporter.
-    
-    Args:
-        port: Porta (default: env PROMETHEUS_PORT ou 9090)
-        auto_start: Se True, inicia servidor automaticamente
-    
-    Returns:
-        MetricsExporter configurado
-    
-    Example:
-        >>> exporter = create_metrics_exporter(auto_start=True)
-        >>> exporter.increment_job_counter("bronze_to_silver", "success")
-    """
-    import os
-    global _exporter
-    
-    port = port or int(os.getenv("PROMETHEUS_PORT", "9090"))
-    
-    _exporter = MetricsExporter(port=port)
-    
-    if auto_start:
-        _exporter.start()
-    
-    return _exporter
-
-
-# =============================================================================
-# CONVENIENCE FUNCTIONS
-# =============================================================================
-
-def increment_counter(metric_name: str, value: float = 1.0, labels: dict = None):
-    """
-    Incrementa contador genérico.
-    
-    Args:
-        metric_name: Nome da métrica
-        value: Valor a incrementar
-        labels: Labels da métrica
-    """
-    exporter = get_exporter()
-    if exporter:
-        # Mapear para métrica específica
-        if metric_name == "jobs_total":
-            exporter.jobs_total.labels(**(labels or {})).inc(value)
-        elif metric_name == "errors_total":
-            exporter.errors_total.labels(**(labels or {})).inc(value)
-
-
-def set_gauge(metric_name: str, value: float, labels: dict = None):
-    """
-    Define valor de gauge.
-    
-    Args:
-        metric_name: Nome da métrica
-        value: Valor
-        labels: Labels
-    """
-    exporter = get_exporter()
-    if exporter:
-        if metric_name == "active_vehicles":
-            route = (labels or {}).get("route_code", "all")
-            exporter.set_active_vehicles(int(value), route)
-        elif metric_name == "data_quality_score":
-            layer = (labels or {}).get("layer", "unknown")
-            metric = (labels or {}).get("metric", "overall")
-            exporter.set_data_quality_score(layer, metric, value)
-
-
-def record_histogram(metric_name: str, value: float, labels: dict = None):
-    """
-    Registra valor em histogram.
-    
-    Args:
-        metric_name: Nome da métrica
-        value: Valor
-        labels: Labels
-    """
-    exporter = get_exporter()
-    if exporter:
-        if metric_name == "job_duration_seconds":
-            job_name = (labels or {}).get("job_name", "unknown")
-            exporter.record_job_duration(job_name, value)
-
-
-# =============================================================================
-# DECORATORS
-# =============================================================================
-
-def track_duration(metric_name: str = "operation_duration_seconds"):
-    """
-    Decorator para rastrear duração de função.
-    
-    Example:
-        >>> @track_duration()
-        ... def process_data():
-        ...     pass
-    """
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            import time
+    def create_flask_app(self, port: int = 9090) -> Flask:
+        """
+        Cria app Flask para servir métricas.
+        
+        Args:
+            port: Porta para o servidor
             
-            start = time.time()
-            try:
-                result = func(*args, **kwargs)
-                return result
-            finally:
-                duration = time.time() - start
-                record_histogram(
-                    metric_name,
-                    duration,
-                    labels={"function": func.__name__}
-                )
+        Returns:
+            App Flask configurado
+        """
+        app = Flask(__name__)
         
-        return wrapper
-    return decorator
+        @app.route("/metrics")
+        def metrics():
+            """Endpoint de métricas."""
+            return Response(self.get_metrics(), mimetype=CONTENT_TYPE_LATEST)
+        
+        @app.route("/health")
+        def health():
+            """Health check endpoint."""
+            return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+        
+        return app
+    
+    def start_server(self, host: str = "0.0.0.0", port: int = 9090) -> None:
+        """
+        Inicia servidor HTTP para métricas.
+        
+        Args:
+            host: Host para bind
+            port: Porta
+        """
+        self.logger.info(f"Starting Prometheus exporter on {host}:{port}")
+        
+        app = self.create_flask_app(port)
+        app.run(host=host, port=port, threaded=True)
 
 
-# =============================================================================
-# MAIN (para testes)
-# =============================================================================
-
-def main():
-    """Função main para testes"""
+def export_metrics(
+    metrics: Dict[str, float],
+    namespace: str = "sptrans"
+) -> None:
+    """
+    Função utilitária para exportar métricas.
     
-    logger.info("=== Testando Prometheus Metrics ===")
+    Args:
+        metrics: Dicionário com métricas
+        namespace: Namespace para métricas
+    """
+    exporter = PrometheusExporter(namespace=namespace)
     
-    # Criar e iniciar exporter
-    exporter = create_metrics_exporter(port=9090, auto_start=True)
-    
-    # Simular métricas
-    logger.info("\n1. Simulando métricas de jobs")
-    exporter.increment_job_counter("bronze_to_silver", "success")
-    exporter.record_job_duration("bronze_to_silver", 45.5)
-    
-    logger.info("\n2. Simulando métricas de dados")
-    exporter.increment_records_processed("bronze", "api", 1000)
-    exporter.set_data_quality_score("silver", "completeness", 95.5)
-    
-    logger.info("\n3. Simulando métricas de negócio")
-    exporter.set_active_vehicles(1500)
-    exporter.set_active_routes(250)
-    exporter.set_avg_speed(35.2)
-    
-    logger.info(f"\n✓ Métricas disponíveis em: http://localhost:9090/metrics")
-    logger.info("Pressione Ctrl+C para sair")
-    
-    try:
-        import time
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("\nEncerrando...")
+    # Mapear métricas para gauges/counters apropriados
+    for metric_name, metric_value in metrics.items():
+        if "quality_score" in metric_name:
+            layer = metric_name.split("_")[-1] if "_" in metric_name else "unknown"
+            exporter.update_quality_score(layer, metric_value)
+        
+        elif "fleet_coverage" in metric_name:
+            exporter.fleet_coverage.set(metric_value)
+        
+        elif "active_vehicles" in metric_name:
+            exporter.active_vehicles.set(metric_value)
 
 
-if __name__ == "__main__":
-    main()
+# Singleton global exporter
+_global_exporter: Optional[PrometheusExporter] = None
 
-# =============================================================================
-# END
-# =============================================================================
+
+def get_global_exporter() -> PrometheusExporter:
+    """Obtém ou cria o exportador global."""
+    global _global_exporter
+    
+    if _global_exporter is None:
+        _global_exporter = PrometheusExporter()
+    
+    return _global_exporter

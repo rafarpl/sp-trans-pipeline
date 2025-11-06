@@ -1,458 +1,411 @@
-# =============================================================================
-# DATA QUALITY CHECKER
-# =============================================================================
-# Verificações de qualidade de dados para todas as camadas
-# =============================================================================
-
 """
-Data Quality Checker
+Data Quality Module
 
-Implementa verificações de qualidade de dados:
-    - Completeness: Percentual de campos preenchidos
-    - Validity: Validação de valores (coordenadas, timestamps, etc)
-    - Accuracy: Precisão dos dados
-    - Consistency: Consistência entre campos
-    - Timeliness: Atualidade dos dados
-    - Uniqueness: Verificação de duplicatas
+Responsável por validações e verificações de qualidade dos dados:
+- Validação de schemas
+- Regras de negócio
+- Detecção de anomalias
+- Quality scores
 """
 
-import logging
-from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, FloatType, IntegerType
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType
 
-# =============================================================================
-# LOGGING
-# =============================================================================
+from src.common.logging_config import get_logger
+from src.common.exceptions import DataQualityException
+from src.common.metrics import MetricsCollector
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# =============================================================================
-# DATA QUALITY CHECKER
-# =============================================================================
+
+@dataclass
+class QualityMetrics:
+    """Métricas de qualidade de dados."""
+    total_records: int
+    valid_records: int
+    invalid_records: int
+    null_records: int
+    duplicate_records: int
+    out_of_range_records: int
+    quality_score: float
+    timestamp: datetime
+
 
 class DataQualityChecker:
-    """Verificador de qualidade de dados"""
+    """
+    Classe para validação de qualidade de dados.
     
-    def __init__(self, spark: SparkSession, config: Optional[Dict[str, Any]] = None):
+    Implementa validações em múltiplas camadas:
+    - Schema validation
+    - Business rules
+    - Anomaly detection
+    - Statistical checks
+    """
+    
+    # Limites geográficos de São Paulo
+    SP_LAT_MIN = -24.0
+    SP_LAT_MAX = -23.0
+    SP_LON_MIN = -47.0
+    SP_LON_MAX = -46.0
+    
+    # Limites de velocidade (km/h)
+    MIN_SPEED = 0.0
+    MAX_SPEED = 120.0
+    
+    # Timestamp válido (últimas 24 horas)
+    MAX_TIMESTAMP_DELAY_HOURS = 24
+    
+    def __init__(self, spark: SparkSession):
         """
-        Inicializa o checker.
+        Inicializa o Data Quality Checker.
         
         Args:
-            spark: SparkSession
-            config: Configurações opcionais
+            spark: SparkSession ativa
         """
         self.spark = spark
-        self.config = config or {}
-        
-        # Thresholds padrão
-        self.thresholds = {
-            "completeness_min": self.config.get("completeness_min", 80.0),
-            "validity_min": self.config.get("validity_min", 90.0),
-            "accuracy_min": self.config.get("accuracy_min", 85.0),
-            "overall_quality_min": self.config.get("overall_quality_min", 80.0),
-        }
-        
-        # Limites geográficos de São Paulo
-        self.sp_bounds = {
-            "lat_min": -24.0,
-            "lat_max": -23.3,
-            "lon_min": -46.9,
-            "lon_max": -46.3,
-        }
-        
-        logger.info("DataQualityChecker inicializado")
+        self.metrics = MetricsCollector()
+        self.logger = get_logger(self.__class__.__name__)
     
-    def check_all(self, df: DataFrame, layer: str = "unknown") -> Dict[str, Any]:
+    def validate_schema(self, df: DataFrame) -> Tuple[bool, List[str]]:
         """
-        Executa todas as verificações de qualidade.
+        Valida se o DataFrame possui o schema esperado.
         
         Args:
-            df: DataFrame a verificar
-            layer: Nome da camada (bronze, silver, gold)
-        
+            df: DataFrame a validar
+            
         Returns:
-            Dicionário com métricas de qualidade
+            Tuple com (is_valid, errors_list)
         """
-        logger.info(f"Iniciando verificações de qualidade ({layer})")
+        expected_schema = StructType([
+            StructField("vehicle_id", StringType(), False),
+            StructField("latitude", DoubleType(), False),
+            StructField("longitude", DoubleType(), False),
+            StructField("timestamp", TimestampType(), False),
+            StructField("speed", DoubleType(), True),
+            StructField("line_id", StringType(), True),
+        ])
         
-        results = {
-            "layer": layer,
-            "timestamp": datetime.now().isoformat(),
-            "total_records": df.count(),
-            "metrics": {}
-        }
+        errors = []
         
-        # Completeness
-        results["metrics"]["completeness"] = self.check_completeness(df)
+        # Verificar colunas obrigatórias
+        required_cols = [field.name for field in expected_schema.fields if not field.nullable]
+        missing_cols = set(required_cols) - set(df.columns)
         
-        # Validity
-        results["metrics"]["validity"] = self.check_validity(df)
+        if missing_cols:
+            errors.append(f"Missing required columns: {missing_cols}")
         
-        # Accuracy
-        results["metrics"]["accuracy"] = self.check_accuracy(df)
+        # Verificar tipos de dados
+        for field in expected_schema.fields:
+            if field.name in df.columns:
+                actual_type = dict(df.dtypes)[field.name]
+                expected_type = str(field.dataType)
+                if actual_type != expected_type:
+                    errors.append(
+                        f"Column '{field.name}' has wrong type. "
+                        f"Expected {expected_type}, got {actual_type}"
+                    )
         
-        # Consistency
-        results["metrics"]["consistency"] = self.check_consistency(df)
+        is_valid = len(errors) == 0
         
-        # Timeliness
-        results["metrics"]["timeliness"] = self.check_timeliness(df)
+        if is_valid:
+            self.logger.info("Schema validation passed")
+        else:
+            self.logger.error(f"Schema validation failed: {errors}")
         
-        # Uniqueness
-        results["metrics"]["uniqueness"] = self.check_uniqueness(df)
+        return is_valid, errors
+    
+    def check_nulls(self, df: DataFrame) -> DataFrame:
+        """
+        Identifica e marca registros com valores nulos em campos obrigatórios.
         
-        # Score geral
-        results["overall_quality_score"] = self._calculate_overall_score(results["metrics"])
-        
-        # Verificar se passou nos thresholds
-        results["quality_check_passed"] = (
-            results["overall_quality_score"] >= self.thresholds["overall_quality_min"]
+        Args:
+            df: DataFrame de entrada
+            
+        Returns:
+            DataFrame com coluna 'has_nulls' adicionada
+        """
+        null_condition = (
+            F.col("vehicle_id").isNull() |
+            F.col("latitude").isNull() |
+            F.col("longitude").isNull() |
+            F.col("timestamp").isNull()
         )
         
-        logger.info(f"Quality Score: {results['overall_quality_score']:.2f}%")
+        df_with_null_flag = df.withColumn("has_nulls", null_condition)
         
-        return results
+        null_count = df_with_null_flag.filter(F.col("has_nulls")).count()
+        total_count = df.count()
+        
+        self.logger.info(f"Null check: {null_count}/{total_count} records have nulls")
+        self.metrics.gauge("data_quality.null_records", null_count)
+        
+        return df_with_null_flag
     
-    def check_completeness(self, df: DataFrame) -> Dict[str, Any]:
+    def check_geographic_bounds(self, df: DataFrame) -> DataFrame:
         """
-        Verifica completude dos dados (campos não-nulos).
+        Valida se coordenadas estão dentro dos limites de São Paulo.
         
         Args:
-            df: DataFrame
-        
+            df: DataFrame de entrada
+            
         Returns:
-            Métricas de completude
+            DataFrame com coluna 'out_of_bounds' adicionada
         """
-        logger.debug("Verificando completeness...")
+        out_of_bounds_condition = (
+            (F.col("latitude") < self.SP_LAT_MIN) |
+            (F.col("latitude") > self.SP_LAT_MAX) |
+            (F.col("longitude") < self.SP_LON_MIN) |
+            (F.col("longitude") > self.SP_LON_MAX)
+        )
         
-        total_records = df.count()
+        df_with_bounds_flag = df.withColumn("out_of_bounds", out_of_bounds_condition)
         
-        if total_records == 0:
-            return {"score": 0.0, "details": {}}
+        out_of_bounds_count = df_with_bounds_flag.filter(F.col("out_of_bounds")).count()
+        total_count = df.count()
         
-        # Contar nulls por coluna
-        null_counts = {}
-        completeness_by_column = {}
+        self.logger.info(
+            f"Geographic bounds check: {out_of_bounds_count}/{total_count} "
+            f"records are out of São Paulo bounds"
+        )
+        self.metrics.gauge("data_quality.out_of_bounds_records", out_of_bounds_count)
         
-        for col in df.columns:
-            null_count = df.filter(F.col(col).isNull()).count()
-            null_counts[col] = null_count
-            completeness_pct = ((total_records - null_count) / total_records) * 100
-            completeness_by_column[col] = round(completeness_pct, 2)
-        
-        # Score médio de completude
-        avg_completeness = sum(completeness_by_column.values()) / len(completeness_by_column)
-        
-        return {
-            "score": round(avg_completeness, 2),
-            "by_column": completeness_by_column,
-            "null_counts": null_counts,
-            "total_records": total_records
-        }
+        return df_with_bounds_flag
     
-    def check_validity(self, df: DataFrame) -> Dict[str, Any]:
+    def check_speed_limits(self, df: DataFrame) -> DataFrame:
         """
-        Verifica validade dos dados.
+        Valida se velocidades estão dentro de limites razoáveis.
         
         Args:
-            df: DataFrame
-        
+            df: DataFrame de entrada
+            
         Returns:
-            Métricas de validade
+            DataFrame com coluna 'invalid_speed' adicionada
         """
-        logger.debug("Verificando validity...")
+        invalid_speed_condition = (
+            F.col("speed").isNotNull() &
+            ((F.col("speed") < self.MIN_SPEED) | (F.col("speed") > self.MAX_SPEED))
+        )
         
-        total_records = df.count()
+        df_with_speed_flag = df.withColumn("invalid_speed", invalid_speed_condition)
         
-        if total_records == 0:
-            return {"score": 0.0, "details": {}}
+        invalid_speed_count = df_with_speed_flag.filter(F.col("invalid_speed")).count()
+        total_count = df.count()
         
-        invalid_counts = {}
+        self.logger.info(
+            f"Speed check: {invalid_speed_count}/{total_count} "
+            f"records have invalid speed"
+        )
+        self.metrics.gauge("data_quality.invalid_speed_records", invalid_speed_count)
         
-        # Validar coordenadas (se existirem)
-        if "latitude" in df.columns and "longitude" in df.columns:
-            invalid_coords = df.filter(
-                (F.col("latitude") < self.sp_bounds["lat_min"]) |
-                (F.col("latitude") > self.sp_bounds["lat_max"]) |
-                (F.col("longitude") < self.sp_bounds["lon_min"]) |
-                (F.col("longitude") > self.sp_bounds["lon_max"]) |
-                (F.col("latitude") == 0.0) |
-                (F.col("longitude") == 0.0)
-            ).count()
-            
-            invalid_counts["coordinates"] = invalid_coords
-        
-        # Validar velocidade (se existir)
-        if "speed" in df.columns:
-            invalid_speed = df.filter(
-                (F.col("speed") < 0) | (F.col("speed") > 150)
-            ).count()
-            
-            invalid_counts["speed"] = invalid_speed
-        
-        # Validar vehicle_id (se existir)
-        if "vehicle_id" in df.columns:
-            invalid_vehicle_id = df.filter(
-                F.col("vehicle_id").isNull() |
-                (F.length(F.col("vehicle_id")) < 4) |
-                (F.length(F.col("vehicle_id")) > 6)
-            ).count()
-            
-            invalid_counts["vehicle_id"] = invalid_vehicle_id
-        
-        # Calcular score
-        total_invalid = sum(invalid_counts.values())
-        validity_pct = ((total_records - total_invalid) / total_records) * 100
-        
-        return {
-            "score": round(validity_pct, 2),
-            "invalid_counts": invalid_counts,
-            "total_invalid": total_invalid,
-            "total_records": total_records
-        }
+        return df_with_speed_flag
     
-    def check_accuracy(self, df: DataFrame) -> Dict[str, Any]:
+    def check_timestamp_freshness(self, df: DataFrame) -> DataFrame:
         """
-        Verifica precisão dos dados.
+        Valida se timestamps estão dentro de um período aceitável.
         
         Args:
-            df: DataFrame
-        
+            df: DataFrame de entrada
+            
         Returns:
-            Métricas de precisão
+            DataFrame com coluna 'stale_timestamp' adicionada
         """
-        logger.debug("Verificando accuracy...")
+        current_time = F.current_timestamp()
+        max_delay = F.expr(f"INTERVAL {self.MAX_TIMESTAMP_DELAY_HOURS} HOURS")
         
-        total_records = df.count()
+        stale_condition = (
+            F.col("timestamp") < (current_time - max_delay)
+        )
         
-        if total_records == 0:
-            return {"score": 0.0, "details": {}}
+        df_with_freshness_flag = df.withColumn("stale_timestamp", stale_condition)
         
-        accuracy_issues = 0
+        stale_count = df_with_freshness_flag.filter(F.col("stale_timestamp")).count()
+        total_count = df.count()
         
-        # Verificar coordenadas duplicadas suspeitas
-        if "latitude" in df.columns and "longitude" in df.columns:
-            duplicate_coords = df.groupBy("latitude", "longitude").count() \
-                .filter(F.col("count") > 100).count()
-            
-            accuracy_issues += duplicate_coords
+        self.logger.info(
+            f"Timestamp freshness check: {stale_count}/{total_count} "
+            f"records have stale timestamps"
+        )
+        self.metrics.gauge("data_quality.stale_records", stale_count)
         
-        # Verificar timestamps suspeitos
-        if "timestamp" in df.columns:
-            # Timestamps muito no futuro
-            future_records = df.filter(
-                F.col("timestamp") > F.current_timestamp()
-            ).count()
-            
-            accuracy_issues += future_records
-        
-        # Score de precisão
-        accuracy_pct = ((total_records - accuracy_issues) / total_records) * 100
-        
-        return {
-            "score": round(accuracy_pct, 2),
-            "accuracy_issues": accuracy_issues,
-            "total_records": total_records
-        }
+        return df_with_freshness_flag
     
-    def check_consistency(self, df: DataFrame) -> Dict[str, Any]:
+    def calculate_quality_score(self, df: DataFrame) -> float:
         """
-        Verifica consistência entre campos.
+        Calcula um score geral de qualidade (0-100).
         
         Args:
-            df: DataFrame
-        
-        Returns:
-            Métricas de consistência
-        """
-        logger.debug("Verificando consistency...")
-        
-        total_records = df.count()
-        
-        if total_records == 0:
-            return {"score": 100.0, "details": {}}
-        
-        inconsistencies = 0
-        
-        # Verificar consistência entre velocidade e movimento
-        if "speed" in df.columns and "is_moving" in df.columns:
-            # Se speed > 0 mas is_moving = false
-            inconsistent = df.filter(
-                (F.col("speed") > 5) & (F.col("is_moving") == False)
-            ).count()
+            df: DataFrame com flags de qualidade
             
-            inconsistencies += inconsistent
-        
-        # Score de consistência
-        consistency_pct = ((total_records - inconsistencies) / total_records) * 100
-        
-        return {
-            "score": round(consistency_pct, 2),
-            "inconsistencies": inconsistencies,
-            "total_records": total_records
-        }
-    
-    def check_timeliness(self, df: DataFrame) -> Dict[str, Any]:
-        """
-        Verifica atualidade dos dados.
-        
-        Args:
-            df: DataFrame
-        
         Returns:
-            Métricas de atualidade
+            Quality score (0-100)
         """
-        logger.debug("Verificando timeliness...")
+        total_count = df.count()
         
-        if "timestamp" not in df.columns:
-            return {"score": 100.0, "details": "No timestamp column"}
-        
-        total_records = df.count()
-        
-        if total_records == 0:
-            return {"score": 0.0, "details": {}}
-        
-        # Dados mais antigos que 7 dias
-        seven_days_ago = datetime.now() - timedelta(days=7)
-        
-        old_records = df.filter(
-            F.col("timestamp") < F.lit(seven_days_ago)
-        ).count()
-        
-        # Score de atualidade
-        timeliness_pct = ((total_records - old_records) / total_records) * 100
-        
-        # Timestamp mais recente e mais antigo
-        timestamp_stats = df.agg(
-            F.max("timestamp").alias("most_recent"),
-            F.min("timestamp").alias("oldest")
-        ).collect()[0]
-        
-        return {
-            "score": round(timeliness_pct, 2),
-            "old_records": old_records,
-            "most_recent": str(timestamp_stats["most_recent"]),
-            "oldest": str(timestamp_stats["oldest"]),
-            "total_records": total_records
-        }
-    
-    def check_uniqueness(self, df: DataFrame) -> Dict[str, Any]:
-        """
-        Verifica unicidade (duplicatas).
-        
-        Args:
-            df: DataFrame
-        
-        Returns:
-            Métricas de unicidade
-        """
-        logger.debug("Verificando uniqueness...")
-        
-        total_records = df.count()
-        
-        if total_records == 0:
-            return {"score": 100.0, "details": {}}
-        
-        # Identificar key columns para duplicatas
-        key_columns = []
-        if "vehicle_id" in df.columns:
-            key_columns.append("vehicle_id")
-        if "timestamp" in df.columns:
-            key_columns.append("timestamp")
-        
-        if not key_columns:
-            return {"score": 100.0, "details": "No key columns to check"}
-        
-        # Contar registros únicos
-        unique_records = df.select(key_columns).distinct().count()
-        
-        # Contar duplicatas
-        duplicates = total_records - unique_records
-        
-        # Score de unicidade
-        uniqueness_pct = (unique_records / total_records) * 100
-        
-        return {
-            "score": round(uniqueness_pct, 2),
-            "unique_records": unique_records,
-            "duplicate_records": duplicates,
-            "total_records": total_records
-        }
-    
-    def _calculate_overall_score(self, metrics: Dict[str, Any]) -> float:
-        """Calcula score geral de qualidade"""
-        
-        # Pesos para cada métrica
-        weights = {
-            "completeness": 0.25,
-            "validity": 0.30,
-            "accuracy": 0.20,
-            "consistency": 0.10,
-            "timeliness": 0.10,
-            "uniqueness": 0.05,
-        }
-        
-        weighted_sum = 0.0
-        total_weight = 0.0
-        
-        for metric_name, weight in weights.items():
-            if metric_name in metrics and "score" in metrics[metric_name]:
-                weighted_sum += metrics[metric_name]["score"] * weight
-                total_weight += weight
-        
-        if total_weight == 0:
+        if total_count == 0:
             return 0.0
         
-        return round(weighted_sum / total_weight, 2)
+        # Contar registros com problemas
+        invalid_count = df.filter(
+            F.col("has_nulls") |
+            F.col("out_of_bounds") |
+            F.col("invalid_speed") |
+            F.col("stale_timestamp")
+        ).count()
+        
+        valid_count = total_count - invalid_count
+        quality_score = (valid_count / total_count) * 100
+        
+        self.logger.info(
+            f"Quality score: {quality_score:.2f}% "
+            f"({valid_count}/{total_count} valid records)"
+        )
+        self.metrics.gauge("data_quality.score", quality_score)
+        
+        return quality_score
+    
+    def run_all_checks(self, df: DataFrame) -> Tuple[DataFrame, QualityMetrics]:
+        """
+        Executa todas as validações de qualidade.
+        
+        Args:
+            df: DataFrame de entrada
+            
+        Returns:
+            Tuple com (DataFrame validado, QualityMetrics)
+        """
+        self.logger.info("Starting data quality checks")
+        
+        # Validar schema
+        is_valid, errors = self.validate_schema(df)
+        if not is_valid:
+            raise DataQualityException(f"Schema validation failed: {errors}")
+        
+        # Executar checks
+        df_checked = df
+        df_checked = self.check_nulls(df_checked)
+        df_checked = self.check_geographic_bounds(df_checked)
+        df_checked = self.check_speed_limits(df_checked)
+        df_checked = self.check_timestamp_freshness(df_checked)
+        
+        # Adicionar coluna de qualidade geral
+        df_checked = df_checked.withColumn(
+            "is_valid",
+            ~(
+                F.col("has_nulls") |
+                F.col("out_of_bounds") |
+                F.col("invalid_speed") |
+                F.col("stale_timestamp")
+            )
+        )
+        
+        # Calcular métricas
+        total_records = df.count()
+        valid_records = df_checked.filter(F.col("is_valid")).count()
+        invalid_records = total_records - valid_records
+        null_records = df_checked.filter(F.col("has_nulls")).count()
+        
+        quality_score = self.calculate_quality_score(df_checked)
+        
+        metrics = QualityMetrics(
+            total_records=total_records,
+            valid_records=valid_records,
+            invalid_records=invalid_records,
+            null_records=null_records,
+            duplicate_records=0,  # Será calculado no deduplicator
+            out_of_range_records=df_checked.filter(F.col("out_of_bounds")).count(),
+            quality_score=quality_score,
+            timestamp=datetime.now()
+        )
+        
+        self.logger.info(f"Data quality checks completed: {metrics}")
+        
+        return df_checked, metrics
+    
+    def filter_valid_records(self, df: DataFrame) -> DataFrame:
+        """
+        Filtra apenas registros válidos.
+        
+        Args:
+            df: DataFrame com flags de qualidade
+            
+        Returns:
+            DataFrame apenas com registros válidos
+        """
+        df_valid = df.filter(F.col("is_valid"))
+        
+        valid_count = df_valid.count()
+        total_count = df.count()
+        
+        self.logger.info(
+            f"Filtered valid records: {valid_count}/{total_count} "
+            f"({(valid_count/total_count)*100:.2f}%)"
+        )
+        
+        return df_valid
+    
+    def quarantine_invalid_records(
+        self,
+        df: DataFrame,
+        quarantine_path: str
+    ) -> None:
+        """
+        Move registros inválidos para área de quarentena.
+        
+        Args:
+            df: DataFrame com flags de qualidade
+            quarantine_path: Caminho para salvar registros inválidos
+        """
+        df_invalid = df.filter(~F.col("is_valid"))
+        
+        invalid_count = df_invalid.count()
+        
+        if invalid_count > 0:
+            self.logger.warning(
+                f"Moving {invalid_count} invalid records to quarantine: {quarantine_path}"
+            )
+            
+            df_invalid.write.mode("append").parquet(quarantine_path)
+            
+            self.metrics.counter("data_quality.quarantined_records", invalid_count)
+        else:
+            self.logger.info("No invalid records to quarantine")
 
 
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
-
-def calculate_quality_score(df: DataFrame, spark: SparkSession) -> float:
+def validate_vehicle_position(
+    latitude: float,
+    longitude: float,
+    speed: Optional[float] = None
+) -> bool:
     """
-    Calcula score de qualidade rapidamente.
+    Função utilitária para validar uma posição de veículo.
     
     Args:
-        df: DataFrame
-        spark: SparkSession
-    
+        latitude: Latitude
+        longitude: Longitude
+        speed: Velocidade (opcional)
+        
     Returns:
-        Score de qualidade (0-100)
+        True se válido, False caso contrário
     """
-    checker = DataQualityChecker(spark)
-    results = checker.check_all(df)
-    return results["overall_quality_score"]
+    # Verificar bounds geográficos
+    if not (DataQualityChecker.SP_LAT_MIN <= latitude <= DataQualityChecker.SP_LAT_MAX):
+        return False
+    
+    if not (DataQualityChecker.SP_LON_MIN <= longitude <= DataQualityChecker.SP_LON_MAX):
+        return False
+    
+    # Verificar velocidade se fornecida
+    if speed is not None:
+        if not (DataQualityChecker.MIN_SPEED <= speed <= DataQualityChecker.MAX_SPEED):
+            return False
+    
+    return True
 
 
-def validate_positions_dataframe(df: DataFrame) -> Dict[str, Any]:
-    """
-    Valida DataFrame de posições.
-    
-    Args:
-        df: DataFrame de posições
-    
-    Returns:
-        Dicionário com resultados da validação
-    """
-    required_columns = ["vehicle_id", "timestamp", "latitude", "longitude"]
-    
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    
-    if missing_columns:
-        return {
-            "is_valid": False,
-            "error": f"Colunas faltando: {missing_columns}"
-        }
-    
-    return {
-        "is_valid": True,
-        "total_records": df.count()
-    }
-
-# =============================================================================
-# END
-# =============================================================================
+# Alias para compatibilidade
+DataQualityValidator = DataQualityChecker

@@ -1,448 +1,455 @@
-# =============================================================================
-# AGGREGATIONS
-# =============================================================================
-# Agregações e cálculo de KPIs para camada Gold
-# =============================================================================
-
 """
 Aggregations Module
 
-Calcula KPIs e métricas agregadas:
-    - KPIs por hora: Total veículos, velocidade média, etc
-    - Métricas por rota: Performance de cada rota
-    - Análise de headway: Intervalos entre ônibus
-    - Resumo do sistema: Visão geral do transporte
+Responsável por agregações e cálculo de KPIs:
+- Fleet coverage (cobertura da frota)
+- Average speed (velocidade média)
+- Headway (intervalo entre veículos)
+- Punctuality (pontualidade)
+- Trip statistics
 """
 
-import logging
-from typing import Optional
-from datetime import datetime
-from pyspark.sql import DataFrame
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
-# =============================================================================
-# LOGGING
-# =============================================================================
+from src.common.logging_config import get_logger
+from src.common.metrics import MetricsCollector
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# =============================================================================
-# HOURLY KPIS
-# =============================================================================
 
-def calculate_hourly_kpis(
-    df: DataFrame,
-    date_col: str = "date",
-    hour_col: str = "hour"
-) -> DataFrame:
+class KPICalculator:
     """
-    Calcula KPIs agregados por hora e rota.
+    Classe para cálculo de KPIs (Key Performance Indicators).
     
-    Args:
-        df: DataFrame Silver com posições enriquecidas
-        date_col: Coluna de data
-        hour_col: Coluna de hora
-    
-    Returns:
-        DataFrame com KPIs horários
-    
-    Example:
-        >>> kpis_df = calculate_hourly_kpis(silver_df)
+    Calcula métricas de negócio importantes:
+    - Cobertura da frota
+    - Velocidade média
+    - Headway
+    - Pontualidade
+    - Estatísticas de viagens
     """
-    logger.info("Calculando KPIs horários...")
     
-    # Group by date, hour, route
-    kpis = df.groupBy(date_col, hour_col, "route_code").agg(
-        # Contagem de veículos
-        F.countDistinct("vehicle_id").alias("total_vehicles"),
+    def __init__(self, spark: SparkSession):
+        """
+        Inicializa o calculador de KPIs.
         
-        # Total de registros
-        F.count("*").alias("total_records"),
+        Args:
+            spark: SparkSession ativa
+        """
+        self.spark = spark
+        self.metrics = MetricsCollector()
+        self.logger = get_logger(self.__class__.__name__)
+    
+    def calculate_fleet_coverage(
+        self,
+        df: DataFrame,
+        total_fleet_size: int,
+        time_window_minutes: int = 60
+    ) -> DataFrame:
+        """
+        Calcula cobertura da frota (% de veículos ativos).
         
-        # Velocidade
-        F.avg("speed").alias("avg_speed_kmh"),
-        F.max("speed").alias("max_speed_kmh"),
-        F.min("speed").alias("min_speed_kmh"),
-        F.stddev("speed").alias("stddev_speed_kmh"),
+        Args:
+            df: DataFrame com dados de veículos
+            total_fleet_size: Tamanho total da frota
+            time_window_minutes: Janela de tempo para considerar ativo
+            
+        Returns:
+            DataFrame com KPI de cobertura por período
+        """
+        self.logger.info(f"Calculating fleet coverage (total fleet: {total_fleet_size})")
         
-        # Movimento
-        F.sum(F.when(F.col("is_moving") == True, 1).otherwise(0)).alias("moving_count"),
-        
-        # Acessibilidade
-        F.sum(F.when(F.col("accessibility") == True, 1).otherwise(0)).alias("accessible_count"),
-        
-        # Qualidade de dados
-        F.avg("data_quality_score").alias("avg_data_quality_score")
-    )
-    
-    # Calcular percentuais
-    kpis = kpis.withColumn(
-        "pct_moving",
-        (F.col("moving_count") / F.col("total_records") * 100)
-    ).withColumn(
-        "pct_with_accessibility",
-        (F.col("accessible_count") / F.col("total_records") * 100)
-    )
-    
-    # Adicionar timestamp de processamento
-    kpis = kpis.withColumn("processing_timestamp", F.current_timestamp())
-    
-    logger.info(f"KPIs calculados: {kpis.count()} registros")
-    
-    return kpis
-
-
-def calculate_route_metrics(
-    df: DataFrame,
-    date_col: str = "date"
-) -> DataFrame:
-    """
-    Calcula métricas agregadas por rota (diárias).
-    
-    Args:
-        df: DataFrame Silver
-        date_col: Coluna de data
-    
-    Returns:
-        DataFrame com métricas por rota
-    """
-    logger.info("Calculando métricas por rota...")
-    
-    metrics = df.groupBy(date_col, "route_code").agg(
-        # Veículos
-        F.countDistinct("vehicle_id").alias("total_vehicles"),
-        F.count("*").alias("total_observations"),
-        
-        # Distância total aproximada
-        F.sum("distance_meters").alias("distance_traveled_km"),
-        
-        # Velocidade
-        F.avg("speed").alias("avg_speed"),
-        F.max("speed").alias("max_speed"),
-        
-        # Horas de operação
-        F.countDistinct("hour").alias("operating_hours"),
-        
-        # Acessibilidade
-        F.avg(F.when(F.col("accessibility") == True, 100).otherwise(0)).alias("accessibility_pct"),
-        
-        # Qualidade
-        F.avg("data_quality_score").alias("avg_data_quality")
-    )
-    
-    # Converter distância para km
-    metrics = metrics.withColumn(
-        "distance_traveled_km",
-        F.col("distance_traveled_km") / 1000
-    )
-    
-    # Calcular horas de serviço por veículo
-    metrics = metrics.withColumn(
-        "service_hours_per_vehicle",
-        F.col("operating_hours") / F.col("total_vehicles")
-    )
-    
-    # Adicionar timestamp
-    metrics = metrics.withColumn("processing_timestamp", F.current_timestamp())
-    
-    logger.info(f"Métricas de rota calculadas: {metrics.count()} rotas")
-    
-    return metrics
-
-
-def calculate_headway(
-    df: DataFrame,
-    date_col: str = "date",
-    hour_col: str = "hour"
-) -> DataFrame:
-    """
-    Calcula headway (intervalo entre ônibus) por rota.
-    
-    Args:
-        df: DataFrame Silver
-        date_col: Coluna de data
-        hour_col: Coluna de hora
-    
-    Returns:
-        DataFrame com análise de headway
-    """
-    logger.info("Calculando análise de headway...")
-    
-    # Window para calcular diferença de tempo entre veículos
-    window_spec = Window.partitionBy(date_col, hour_col, "route_code") \
-                        .orderBy("timestamp")
-    
-    # Calcular tempo desde último veículo
-    df_with_prev = df.withColumn(
-        "prev_timestamp",
-        F.lag("timestamp").over(window_spec)
-    )
-    
-    # Calcular headway em minutos
-    df_with_headway = df_with_prev.withColumn(
-        "headway_minutes",
-        F.when(
-            F.col("prev_timestamp").isNotNull(),
-            (F.unix_timestamp("timestamp") - F.unix_timestamp("prev_timestamp")) / 60
-        )
-    )
-    
-    # Agregar por hora e rota
-    headway_stats = df_with_headway.groupBy(date_col, hour_col, "route_code").agg(
-        F.count("*").alias("total_observations"),
-        F.avg("headway_minutes").alias("avg_headway_minutes"),
-        F.min("headway_minutes").alias("min_headway_minutes"),
-        F.max("headway_minutes").alias("max_headway_minutes"),
-        F.stddev("headway_minutes").alias("stddev_headway_minutes"),
-        F.expr("percentile_approx(headway_minutes, 0.5)").alias("median_headway_minutes")
-    )
-    
-    # Calcular score de regularidade (0-100)
-    # Quanto menor o desvio padrão, melhor a regularidade
-    headway_stats = headway_stats.withColumn(
-        "headway_regularity_score",
-        F.when(
-            F.col("avg_headway_minutes").isNotNull(),
-            100 - F.least(
-                (F.col("stddev_headway_minutes") / F.col("avg_headway_minutes")) * 100,
-                F.lit(100)
+        # Agrupar por hora
+        df_hourly = (
+            df
+            .withColumn("hour", F.date_trunc("hour", "timestamp"))
+            .groupBy("hour")
+            .agg(
+                F.countDistinct("vehicle_id").alias("active_vehicles"),
+                F.count("*").alias("total_positions")
             )
-        ).otherwise(0)
-    )
-    
-    # Classificar qualidade do serviço
-    headway_stats = headway_stats.withColumn(
-        "service_quality",
-        F.when(F.col("avg_headway_minutes") <= 10, "excellent")
-         .when(F.col("avg_headway_minutes") <= 15, "good")
-         .when(F.col("avg_headway_minutes") <= 20, "fair")
-         .otherwise("poor")
-    )
-    
-    # Adicionar timestamp
-    headway_stats = headway_stats.withColumn("processing_timestamp", F.current_timestamp())
-    
-    logger.info(f"Análise de headway calculada: {headway_stats.count()} registros")
-    
-    return headway_stats
-
-
-def calculate_system_summary(
-    df: DataFrame,
-    date_col: str = "date"
-) -> DataFrame:
-    """
-    Calcula resumo geral do sistema por dia.
-    
-    Args:
-        df: DataFrame Silver
-        date_col: Coluna de data
-    
-    Returns:
-        DataFrame com resumo do sistema
-    """
-    logger.info("Calculando resumo do sistema...")
-    
-    summary = df.groupBy(date_col).agg(
-        # Veículos e rotas
-        F.countDistinct("vehicle_id").alias("total_active_vehicles"),
-        F.countDistinct("route_code").alias("total_active_routes"),
-        F.count("*").alias("total_observations"),
+            .withColumn("total_fleet_size", F.lit(total_fleet_size))
+            .withColumn(
+                "coverage_percent",
+                (F.col("active_vehicles") / F.col("total_fleet_size")) * 100
+            )
+            .orderBy("hour")
+        )
         
-        # Velocidade do sistema
-        F.avg("speed").alias("system_avg_speed"),
-        F.max("speed").alias("system_max_speed"),
+        # Log estatísticas
+        avg_coverage = df_hourly.agg(F.avg("coverage_percent")).collect()[0][0]
+        self.logger.info(f"Average fleet coverage: {avg_coverage:.2f}%")
+        self.metrics.gauge("kpi.fleet_coverage_avg", avg_coverage)
         
-        # Distância total
-        F.sum("distance_meters").alias("total_distance_km"),
-        
-        # Acessibilidade
-        F.avg(F.when(F.col("accessibility") == True, 100).otherwise(0)).alias("system_accessibility_pct"),
-        
-        # Movimento
-        F.avg(F.when(F.col("is_moving") == True, 100).otherwise(0)).alias("system_movement_pct"),
-        
-        # Qualidade de dados
-        F.avg("data_quality_score").alias("system_data_quality")
-    )
+        return df_hourly
     
-def calculate_gtfs_enriched_kpis(
-    df_positions: DataFrame,
-    df_routes: DataFrame,
-    df_trips: DataFrame,
-    df_stop_times: DataFrame
-) -> DataFrame:
-    """
-    Calcula KPIs enriquecidos com dados do GTFS (rotas, viagens, horários).
+    def calculate_average_speed(
+        self,
+        df: DataFrame,
+        group_by_cols: List[str] = None
+    ) -> DataFrame:
+        """
+        Calcula velocidade média por diferentes dimensões.
+        
+        Args:
+            df: DataFrame com dados de veículos (com coluna speed)
+            group_by_cols: Colunas para agrupar (ex: line_id, hour, route_id)
+            
+        Returns:
+            DataFrame com velocidade média agregada
+        """
+        if group_by_cols is None:
+            group_by_cols = ["line_id", "hour"]
+        
+        self.logger.info(f"Calculating average speed grouped by: {group_by_cols}")
+        
+        # Preparar dados
+        df_with_hour = df.withColumn("hour", F.date_trunc("hour", "timestamp"))
+        
+        # Calcular médias
+        df_avg_speed = (
+            df_with_hour
+            .filter(F.col("speed").isNotNull())
+            .groupBy(*group_by_cols)
+            .agg(
+                F.avg("speed").alias("avg_speed_kmh"),
+                F.stddev("speed").alias("stddev_speed"),
+                F.min("speed").alias("min_speed"),
+                F.max("speed").alias("max_speed"),
+                F.count("*").alias("sample_size")
+            )
+            .orderBy(*group_by_cols)
+        )
+        
+        # Log estatísticas gerais
+        overall_avg = df.filter(F.col("speed").isNotNull()).agg(F.avg("speed")).collect()[0][0]
+        self.logger.info(f"Overall average speed: {overall_avg:.2f} km/h")
+        self.metrics.gauge("kpi.avg_speed", overall_avg)
+        
+        return df_avg_speed
     
-    Integra dados de posição em tempo quase real com dados estáticos GTFS,
-    permitindo análises mais completas de pontualidade, tempo médio de viagem
-    e cobertura de frota.
-    """
-    logger.info("Calculando KPIs enriquecidos com GTFS...")
-
-    # Join entre posições (API) e rotas (GTFS)
-    df_joined = (
-        df_positions
-        .join(df_routes, "route_code", "left")
-        .join(df_trips, "trip_id", "left")
-        .join(df_stop_times, "stop_id", "left")
-    )
-
-    # Cálculo de pontualidade (diferença entre horário real e previsto)
-    df_kpis = (
-        df_joined
-        .withColumn(
+    def calculate_headway(
+        self,
+        df: DataFrame,
+        stop_id_col: str = "stop_id",
+        line_id_col: str = "line_id"
+    ) -> DataFrame:
+        """
+        Calcula headway (intervalo entre veículos consecutivos).
+        
+        Args:
+            df: DataFrame com passagens de veículos em paradas
+            stop_id_col: Coluna com ID da parada
+            line_id_col: Coluna com ID da linha
+            
+        Returns:
+            DataFrame com headway calculado
+        """
+        self.logger.info("Calculating headway (interval between vehicles)")
+        
+        # Window spec: particionar por parada e linha, ordenar por timestamp
+        window_spec = Window.partitionBy(stop_id_col, line_id_col).orderBy("timestamp")
+        
+        # Calcular tempo desde o último veículo
+        df_with_headway = (
+            df
+            .withColumn("prev_timestamp", F.lag("timestamp").over(window_spec))
+            .withColumn(
+                "headway_minutes",
+                (F.unix_timestamp("timestamp") - F.unix_timestamp("prev_timestamp")) / 60
+            )
+            .filter(F.col("headway_minutes").isNotNull())
+        )
+        
+        # Agregações por parada e linha
+        df_headway_summary = (
+            df_with_headway
+            .groupBy(stop_id_col, line_id_col)
+            .agg(
+                F.avg("headway_minutes").alias("avg_headway_minutes"),
+                F.stddev("headway_minutes").alias("stddev_headway"),
+                F.min("headway_minutes").alias("min_headway"),
+                F.max("headway_minutes").alias("max_headway"),
+                F.count("*").alias("sample_size")
+            )
+        )
+        
+        # Classificar qualidade do headway
+        df_headway_classified = df_headway_summary.withColumn(
+            "headway_quality",
+            F.when(F.col("avg_headway_minutes") <= 5, "excellent")
+            .when(F.col("avg_headway_minutes") <= 10, "good")
+            .when(F.col("avg_headway_minutes") <= 15, "fair")
+            .otherwise("poor")
+        )
+        
+        # Log estatísticas
+        overall_avg_headway = df_with_headway.agg(F.avg("headway_minutes")).collect()[0][0]
+        self.logger.info(f"Overall average headway: {overall_avg_headway:.2f} minutes")
+        self.metrics.gauge("kpi.avg_headway_minutes", overall_avg_headway)
+        
+        return df_headway_classified
+    
+    def calculate_punctuality(
+        self,
+        df_actual: DataFrame,
+        df_scheduled: DataFrame,
+        tolerance_minutes: int = 5
+    ) -> DataFrame:
+        """
+        Calcula pontualidade (aderência aos horários programados).
+        
+        Args:
+            df_actual: DataFrame com horários reais
+            df_scheduled: DataFrame com horários programados
+            tolerance_minutes: Tolerância em minutos para considerar pontual
+            
+        Returns:
+            DataFrame com métricas de pontualidade
+        """
+        self.logger.info(f"Calculating punctuality (tolerance: {tolerance_minutes} min)")
+        
+        # Join entre horários reais e programados
+        df_comparison = df_actual.join(
+            df_scheduled,
+            on=["trip_id", "stop_id"],
+            how="inner"
+        )
+        
+        # Calcular diferença em minutos
+        df_with_diff = df_comparison.withColumn(
             "delay_minutes",
-            (F.unix_timestamp("timestamp") - F.unix_timestamp("arrival_time")) / 60
+            (F.unix_timestamp("actual_time") - F.unix_timestamp("scheduled_time")) / 60
         )
-        .groupBy("route_code")
-        .agg(
-            F.avg("delay_minutes").alias("avg_delay_minutes"),
-            F.countDistinct("vehicle_id").alias("active_vehicles"),
-            F.avg("speed").alias("avg_speed_kmh"),
-            F.countDistinct("trip_id").alias("total_trips"),
-            F.first("route_long_name").alias("route_name")
+        
+        # Classificar pontualidade
+        df_punctuality = df_with_diff.withColumn(
+            "is_on_time",
+            F.abs(F.col("delay_minutes")) <= tolerance_minutes
+        ).withColumn(
+            "punctuality_status",
+            F.when(F.col("delay_minutes") < -tolerance_minutes, "early")
+            .when(F.col("delay_minutes") > tolerance_minutes, "late")
+            .otherwise("on_time")
         )
-        .withColumn("processing_timestamp", F.current_timestamp())
-    )
+        
+        # Agregar por linha
+        df_punctuality_summary = (
+            df_punctuality
+            .groupBy("line_id")
+            .agg(
+                F.avg("delay_minutes").alias("avg_delay_minutes"),
+                F.stddev("delay_minutes").alias("stddev_delay"),
+                (F.sum(F.when(F.col("is_on_time"), 1).otherwise(0)) / F.count("*") * 100)
+                    .alias("on_time_percent"),
+                F.count("*").alias("total_trips")
+            )
+        )
+        
+        # Log estatísticas
+        overall_on_time = (
+            df_punctuality.filter(F.col("is_on_time")).count() /
+            df_punctuality.count() * 100
+        )
+        self.logger.info(f"Overall on-time performance: {overall_on_time:.2f}%")
+        self.metrics.gauge("kpi.on_time_percent", overall_on_time)
+        
+        return df_punctuality_summary
+    
+    def calculate_trip_statistics(
+        self,
+        df: DataFrame
+    ) -> DataFrame:
+        """
+        Calcula estatísticas de viagens.
+        
+        Args:
+            df: DataFrame com dados de viagens
+            
+        Returns:
+            DataFrame com estatísticas agregadas
+        """
+        self.logger.info("Calculating trip statistics")
+        
+        # Agregar por viagem
+        df_trip_stats = (
+            df
+            .groupBy("trip_id", "line_id", "vehicle_id")
+            .agg(
+                F.min("timestamp").alias("trip_start_time"),
+                F.max("timestamp").alias("trip_end_time"),
+                F.count("*").alias("num_positions"),
+                F.avg("speed").alias("avg_trip_speed"),
+                F.max("speed").alias("max_trip_speed")
+            )
+            .withColumn(
+                "trip_duration_minutes",
+                (F.unix_timestamp("trip_end_time") - F.unix_timestamp("trip_start_time")) / 60
+            )
+        )
+        
+        # Estatísticas por linha
+        df_line_stats = (
+            df_trip_stats
+            .groupBy("line_id")
+            .agg(
+                F.count("trip_id").alias("total_trips"),
+                F.avg("trip_duration_minutes").alias("avg_trip_duration_minutes"),
+                F.avg("avg_trip_speed").alias("avg_line_speed_kmh"),
+                F.countDistinct("vehicle_id").alias("unique_vehicles")
+            )
+        )
+        
+        # Log estatísticas
+        total_trips = df_trip_stats.count()
+        self.logger.info(f"Total trips analyzed: {total_trips}")
+        self.metrics.gauge("kpi.total_trips", total_trips)
+        
+        return df_line_stats
+    
+    def calculate_daily_summary(
+        self,
+        df: DataFrame,
+        date_col: str = "date"
+    ) -> DataFrame:
+        """
+        Calcula resumo diário de operações.
+        
+        Args:
+            df: DataFrame com dados diários
+            date_col: Coluna de data
+            
+        Returns:
+            DataFrame com resumo diário
+        """
+        self.logger.info("Calculating daily summary")
+        
+        df_daily = (
+            df
+            .withColumn("date", F.to_date("timestamp"))
+            .groupBy("date")
+            .agg(
+                # Veículos
+                F.countDistinct("vehicle_id").alias("unique_vehicles"),
+                F.count("*").alias("total_positions"),
+                
+                # Velocidade
+                F.avg("speed").alias("avg_speed_kmh"),
+                F.max("speed").alias("max_speed_kmh"),
+                
+                # Cobertura temporal
+                F.min("timestamp").alias("first_position_time"),
+                F.max("timestamp").alias("last_position_time"),
+                
+                # Linhas
+                F.countDistinct("line_id").alias("unique_lines"),
+                
+                # Viagens
+                F.countDistinct("trip_id").alias("total_trips")
+            )
+            .withColumn(
+                "operational_hours",
+                (F.unix_timestamp("last_position_time") - 
+                 F.unix_timestamp("first_position_time")) / 3600
+            )
+            .orderBy("date")
+        )
+        
+        return df_daily
+    
+    def calculate_all_kpis(
+        self,
+        df: DataFrame,
+        total_fleet_size: int,
+        df_scheduled: Optional[DataFrame] = None
+    ) -> Dict[str, DataFrame]:
+        """
+        Calcula todos os KPIs disponíveis.
+        
+        Args:
+            df: DataFrame com dados de veículos
+            total_fleet_size: Tamanho total da frota
+            df_scheduled: DataFrame com horários programados (opcional)
+            
+        Returns:
+            Dicionário com DataFrames de cada KPI
+        """
+        self.logger.info("Calculating all KPIs")
+        
+        kpis = {}
+        
+        # Fleet Coverage
+        kpis["fleet_coverage"] = self.calculate_fleet_coverage(df, total_fleet_size)
+        
+        # Average Speed
+        kpis["average_speed"] = self.calculate_average_speed(df)
+        
+        # Trip Statistics
+        kpis["trip_stats"] = self.calculate_trip_statistics(df)
+        
+        # Daily Summary
+        kpis["daily_summary"] = self.calculate_daily_summary(df)
+        
+        # Punctuality (se dados programados disponíveis)
+        if df_scheduled is not None:
+            kpis["punctuality"] = self.calculate_punctuality(df, df_scheduled)
+        
+        self.logger.info(f"Calculated {len(kpis)} KPIs")
+        
+        return kpis
 
-    logger.info(f"KPIs enriquecidos com GTFS calculados: {df_kpis.count()} rotas")
 
-    return df_kpis
-    
-    # Converter distância
-    summary = summary.withColumn(
-        "total_distance_km",
-        F.col("total_distance_km") / 1000
-    )
-    
-    # Calcular produtividade (km por veículo)
-    summary = summary.withColumn(
-        "avg_km_per_vehicle",
-        F.col("total_distance_km") / F.col("total_active_vehicles")
-    )
-    
-    # Adicionar timestamp
-    summary = summary.withColumn("processing_timestamp", F.current_timestamp())
-    
-    logger.info(f"Resumo do sistema calculado: {summary.count()} dias")
-    
-    return summary
-
-
-def aggregate_by_route(
+def calculate_fleet_coverage(
     df: DataFrame,
-    agg_columns: list,
-    group_by: list = None
+    total_fleet_size: int
 ) -> DataFrame:
     """
-    Agrega dados por rota com colunas customizadas.
+    Função utilitária para calcular cobertura da frota.
     
     Args:
-        df: DataFrame
-        agg_columns: Lista de agregações (ex: [F.avg("speed")])
-        group_by: Colunas para group by (default: route_code)
-    
+        df: DataFrame com dados de veículos
+        total_fleet_size: Tamanho total da frota
+        
     Returns:
-        DataFrame agregado
+        DataFrame com cobertura por hora
     """
-    if group_by is None:
-        group_by = ["route_code"]
-    
-    return df.groupBy(group_by).agg(*agg_columns)
+    spark = df.sparkSession
+    calculator = KPICalculator(spark)
+    return calculator.calculate_fleet_coverage(df, total_fleet_size)
 
 
-def aggregate_by_hour(
-    df: DataFrame,
-    agg_columns: list,
-    include_date: bool = True
-) -> DataFrame:
+def create_kpi_dashboard_data(
+    spark: SparkSession,
+    vehicle_positions_path: str,
+    output_path: str,
+    total_fleet_size: int = 15000
+) -> None:
     """
-    Agrega dados por hora.
+    Cria dados agregados para dashboard de KPIs.
     
     Args:
-        df: DataFrame
-        agg_columns: Lista de agregações
-        include_date: Se True, agrupa por date + hour
-    
-    Returns:
-        DataFrame agregado
+        spark: SparkSession
+        vehicle_positions_path: Caminho para dados de posições
+        output_path: Caminho para salvar KPIs agregados
+        total_fleet_size: Tamanho total da frota
     """
-    group_cols = ["date", "hour"] if include_date else ["hour"]
+    logger.info("Creating KPI dashboard data")
     
-    return df.groupBy(group_cols).agg(*agg_columns)
-
-
-def calculate_time_series_metrics(
-    df: DataFrame,
-    metric_col: str,
-    time_col: str = "timestamp",
-    window_minutes: int = 30
-) -> DataFrame:
-    """
-    Calcula métricas de série temporal (média móvel, etc).
+    # Carregar dados
+    df = spark.read.parquet(vehicle_positions_path)
     
-    Args:
-        df: DataFrame
-        metric_col: Coluna da métrica
-        time_col: Coluna de tempo
-        window_minutes: Janela em minutos
+    # Calcular KPIs
+    calculator = KPICalculator(spark)
+    kpis = calculator.calculate_all_kpis(df, total_fleet_size)
     
-    Returns:
-        DataFrame com métricas de série temporal
-    """
-    logger.info(f"Calculando série temporal para {metric_col}...")
+    # Salvar cada KPI
+    for kpi_name, kpi_df in kpis.items():
+        kpi_path = f"{output_path}/{kpi_name}"
+        kpi_df.write.mode("overwrite").parquet(kpi_path)
+        logger.info(f"Saved KPI '{kpi_name}' to {kpi_path}")
     
-    # Window de tempo
-    window_seconds = window_minutes * 60
-    window_spec = Window.partitionBy("route_code") \
-                        .orderBy(F.col(time_col).cast("long")) \
-                        .rangeBetween(-window_seconds, 0)
-    
-    # Média móvel
-    df = df.withColumn(
-        f"{metric_col}_moving_avg",
-        F.avg(metric_col).over(window_spec)
-    )
-    
-    # Desvio padrão móvel
-    df = df.withColumn(
-        f"{metric_col}_moving_std",
-        F.stddev(metric_col).over(window_spec)
-    )
-    
-    return df
-
-
-def calculate_percentiles(
-    df: DataFrame,
-    metric_col: str,
-    percentiles: list = [0.25, 0.5, 0.75, 0.95]
-) -> DataFrame:
-    """
-    Calcula percentis de uma métrica.
-    
-    Args:
-        df: DataFrame
-        metric_col: Coluna da métrica
-        percentiles: Lista de percentis (0-1)
-    
-    Returns:
-        DataFrame com percentis
-    """
-    logger.info(f"Calculando percentis de {metric_col}...")
-    
-    agg_exprs = [
-        F.expr(f"percentile_approx({metric_col}, {p})").alias(f"p{int(p*100)}")
-        for p in percentiles
-    ]
-    
-    result = df.agg(*agg_exprs)
-    
-    return result
-
-# =============================================================================
-# END
-# =============================================================================
+    logger.info("KPI dashboard data creation completed")

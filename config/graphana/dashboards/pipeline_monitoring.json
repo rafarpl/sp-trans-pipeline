@@ -1,0 +1,300 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "sptrans-pipeline-monitoring",
+    "title": "SPTrans Pipeline Monitoring",
+    "tags": ["sptrans", "pipeline", "monitoring"],
+    "timezone": "America/Sao_Paulo",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "30s",
+    
+    "panels": [
+      {
+        "id": 1,
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "type": "graph",
+        "title": "DAG Success Rate",
+        "targets": [
+          {
+            "expr": "rate(airflow_dag_run_success_total[5m])",
+            "legendFormat": "{{dag_id}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "percentunit", "label": "Success Rate"},
+          {"format": "short"}
+        ]
+      },
+      
+      {
+        "id": 2,
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "type": "graph",
+        "title": "DAG Duration",
+        "targets": [
+          {
+            "expr": "airflow_dag_run_duration_seconds",
+            "legendFormat": "{{dag_id}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Duration"},
+          {"format": "short"}
+        ]
+      },
+      
+      {
+        "id": 3,
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "type": "stat",
+        "title": "Active DAGs",
+        "targets": [
+          {
+            "expr": "count(airflow_dag_status{status=\"running\"})",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "orientation": "auto",
+          "reduceOptions": {
+            "values": false,
+            "fields": "",
+            "calcs": ["lastNotNull"]
+          },
+          "textMode": "auto"
+        }
+      },
+      
+      {
+        "id": 4,
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "type": "stat",
+        "title": "Failed Tasks (24h)",
+        "targets": [
+          {
+            "expr": "increase(airflow_task_instance_failed_total[24h])",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 5, "color": "yellow"},
+                {"value": 10, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      
+      {
+        "id": 5,
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+        "type": "table",
+        "title": "Recent DAG Runs",
+        "targets": [
+          {
+            "expr": "airflow_dag_run_info",
+            "refId": "A",
+            "format": "table"
+          }
+        ],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {},
+              "indexByName": {},
+              "renameByName": {
+                "dag_id": "DAG",
+                "execution_date": "Execution Date",
+                "state": "State",
+                "duration": "Duration (s)"
+              }
+            }
+          }
+        ]
+      },
+      
+      {
+        "id": 6,
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+        "type": "graph",
+        "title": "Spark Jobs Active",
+        "targets": [
+          {
+            "expr": "spark_jobs_active",
+            "legendFormat": "{{job_name}}",
+            "refId": "A"
+          }
+        ]
+      },
+      
+      {
+        "id": 7,
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+        "type": "graph",
+        "title": "Spark Executor Memory",
+        "targets": [
+          {
+            "expr": "spark_executor_memory_used_bytes / spark_executor_memory_total_bytes",
+            "legendFormat": "{{executor_id}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "percentunit", "label": "Memory Usage"},
+          {"format": "short"}
+        ]
+      },
+      
+      {
+        "id": 8,
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+        "type": "graph",
+        "title": "PostgreSQL Connections",
+        "targets": [
+          {
+            "expr": "pg_stat_database_numbackends{datname=\"airflow\"}",
+            "legendFormat": "Active Connections",
+            "refId": "A"
+          }
+        ]
+      },
+      
+      {
+        "id": 9,
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+        "type": "graph",
+        "title": "Redis Memory Usage",
+        "targets": [
+          {
+            "expr": "redis_memory_used_bytes / redis_memory_max_bytes",
+            "legendFormat": "Memory Usage",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "percentunit"},
+          {"format": "short"}
+        ]
+      },
+      
+      {
+        "id": 10,
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 40},
+        "type": "graph",
+        "title": "Data Processing Rate (Records/min)",
+        "targets": [
+          {
+            "expr": "rate(records_processed_total[1m])",
+            "legendFormat": "{{layer}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Records/min"},
+          {"format": "short"}
+        ]
+      },
+      
+      {
+        "id": 11,
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 48},
+        "type": "stat",
+        "title": "Bronze Layer Size",
+        "targets": [
+          {
+            "expr": "sum(bronze_layer_size_bytes)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "decbytes",
+            "decimals": 2
+          }
+        }
+      },
+      
+      {
+        "id": 12,
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 48},
+        "type": "stat",
+        "title": "API Requests/min",
+        "targets": [
+          {
+            "expr": "rate(api_requests_total[1m])",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "reqps",
+            "decimals": 0
+          }
+        }
+      }
+    ],
+    
+    "templating": {
+      "list": [
+        {
+          "name": "datasource",
+          "type": "datasource",
+          "query": "prometheus",
+          "current": {
+            "text": "Prometheus",
+            "value": "Prometheus"
+          }
+        },
+        {
+          "name": "dag_id",
+          "type": "query",
+          "datasource": "${datasource}",
+          "query": "label_values(airflow_dag_run_duration_seconds, dag_id)",
+          "multi": true,
+          "includeAll": true
+        }
+      ]
+    },
+    
+    "time": {
+      "from": "now-6h",
+      "to": "now"
+    },
+    
+    "timepicker": {
+      "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"]
+    },
+    
+    "annotations": {
+      "list": [
+        {
+          "datasource": "${datasource}",
+          "enable": true,
+          "expr": "ALERTS{alertname=~\".*\"}",
+          "iconColor": "red",
+          "name": "Alerts",
+          "step": "60s",
+          "tagKeys": "alertname",
+          "textFormat": "{{alertname}}: {{instance}}",
+          "titleFormat": "Alert"
+        }
+      ]
+    }
+  },
+  
+  "overwrite": true,
+  "folderId": 0,
+  "folderUid": ""
+}

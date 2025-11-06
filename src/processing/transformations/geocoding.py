@@ -1,474 +1,388 @@
 """
 Geocoding Module
-================
-Enriquecimento de dados com geocoding reverso (latitude/longitude → endereço).
 
-Utiliza APIs open source:
-- Nominatim (OpenStreetMap) - API gratuita
-- Photon (Komoot) - API gratuita alternativa
+Responsável por conversão entre coordenadas e endereços:
+- Reverse geocoding (lat/lon → endereço)
+- Geocoding (endereço → lat/lon)
+- Cache de resultados para performance
 """
 
-from typing import Optional, Dict, Any, List, Tuple
-import time
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from typing import Dict, Optional, Tuple
 from functools import lru_cache
-import hashlib
+import time
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType, StructType, StructField
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 
 from src.common.logging_config import get_logger
-from src.common.exceptions import GeocodingError
-from src.common.metrics import track_api_call, metrics
+from src.common.metrics import MetricsCollector
+from src.common.exceptions import SPTransPipelineException
 
 logger = get_logger(__name__)
 
 
-class ReverseGeocoder:
-    """Cliente para geocoding reverso usando APIs open source."""
+class GeocodingException(SPTransPipelineException):
+    """Exceção para erros de geocoding."""
+    pass
+
+
+class GeocodingService:
+    """
+    Serviço de geocoding e reverse geocoding.
     
-    # Rate limits (requisições por segundo)
-    NOMINATIM_RATE_LIMIT = 1.0  # 1 req/segundo
-    PHOTON_RATE_LIMIT = 10.0    # 10 req/segundo
+    Usa Nominatim (OpenStreetMap) para conversões gratuitas com cache.
+    Para produção, considere usar serviços pagos como Google Maps API.
+    """
     
-    def __init__(self, provider: str = 'nominatim', cache_enabled: bool = True):
+    def __init__(
+        self,
+        user_agent: str = "sptrans-pipeline",
+        timeout: int = 5,
+        use_cache: bool = True
+    ):
         """
-        Inicializa geocoder.
+        Inicializa o serviço de geocoding.
         
         Args:
-            provider: Provedor de geocoding ('nominatim' ou 'photon')
-            cache_enabled: Se deve usar cache para coordenadas já consultadas
+            user_agent: User agent para requisições
+            timeout: Timeout em segundos
+            use_cache: Se deve usar cache local
         """
-        self.provider = provider.lower()
-        self.cache_enabled = cache_enabled
-        self._cache = {} if cache_enabled else None
+        self.geolocator = Nominatim(user_agent=user_agent, timeout=timeout)
+        self.use_cache = use_cache
+        self.metrics = MetricsCollector()
+        self.logger = get_logger(self.__class__.__name__)
         
-        # Configurar sessão HTTP com retry
-        self.session = self._create_session()
-        
-        # URLs base
-        self.base_urls = {
-            'nominatim': 'https://nominatim.openstreetmap.org/reverse',
-            'photon': 'https://photon.komoot.io/reverse'
-        }
-        
-        if self.provider not in self.base_urls:
-            raise ValueError(f"Provider inválido: {provider}. Use 'nominatim' ou 'photon'")
-        
-        self.base_url = self.base_urls[self.provider]
-        
-        # Rate limiting
-        self.last_request_time = 0
-        self.rate_limit = (
-            self.NOMINATIM_RATE_LIMIT if provider == 'nominatim'
-            else self.PHOTON_RATE_LIMIT
-        )
-        
-        logger.info(f"ReverseGeocoder inicializado com provider={provider}, cache={cache_enabled}")
+        # Contadores
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.api_calls = 0
+        self.failures = 0
     
-    def _create_session(self) -> requests.Session:
-        """Cria sessão HTTP com retry automático."""
-        session = requests.Session()
-        
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
-        
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        
-        # User-Agent obrigatório para Nominatim
-        session.headers.update({
-            'User-Agent': 'SPTransPipeline/1.0 (sptrans-pipeline@example.com)'
-        })
-        
-        return session
-    
-    def _get_cache_key(self, lat: float, lon: float, precision: int = 4) -> str:
+    @lru_cache(maxsize=10000)
+    def _cached_reverse_geocode(
+        self,
+        lat: float,
+        lon: float,
+        precision: int = 3
+    ) -> Optional[Dict[str, str]]:
         """
-        Gera chave de cache para coordenadas.
+        Reverse geocoding com cache (interno).
         
         Args:
-            lat: Latitude
-            lon: Longitude
-            precision: Casas decimais para arredondamento (evita cache muito granular)
-        
+            lat: Latitude (arredondada para precision)
+            lon: Longitude (arredondada para precision)
+            precision: Casas decimais para arredondar (para cache)
+            
         Returns:
-            Chave de cache
+            Dicionário com informações de endereço ou None
         """
-        rounded_lat = round(lat, precision)
-        rounded_lon = round(lon, precision)
-        key = f"{rounded_lat},{rounded_lon}"
-        return hashlib.md5(key.encode()).hexdigest()
-    
-    def _rate_limit_wait(self):
-        """Aguarda para respeitar rate limit."""
-        if self.rate_limit <= 0:
-            return
-        
-        min_interval = 1.0 / self.rate_limit
-        elapsed = time.time() - self.last_request_time
-        
-        if elapsed < min_interval:
-            wait_time = min_interval - elapsed
-            time.sleep(wait_time)
-        
-        self.last_request_time = time.time()
-    
-    @track_api_call('geocoding')
-    def reverse_geocode(self, lat: float, lon: float, 
-                       language: str = 'pt-BR') -> Optional[Dict[str, Any]]:
-        """
-        Geocoding reverso: coordenadas → endereço.
-        
-        Args:
-            lat: Latitude
-            lon: Longitude
-            language: Idioma do resultado
-        
-        Returns:
-            Dict com informações de endereço ou None se falhar
-        """
-        # Verificar cache
-        if self.cache_enabled:
-            cache_key = self._get_cache_key(lat, lon)
-            if cache_key in self._cache:
-                metrics.cache_hits.labels(cache_type='geocoding').inc()
-                return self._cache[cache_key]
-            metrics.cache_misses.labels(cache_type='geocoding').inc()
-        
-        # Rate limiting
-        self._rate_limit_wait()
-        
         try:
-            if self.provider == 'nominatim':
-                result = self._nominatim_reverse(lat, lon, language)
-            else:  # photon
-                result = self._photon_reverse(lat, lon, language)
+            location = self.geolocator.reverse(f"{lat}, {lon}", language="pt-BR")
             
-            # Adicionar ao cache
-            if self.cache_enabled and result:
-                cache_key = self._get_cache_key(lat, lon)
-                self._cache[cache_key] = result
+            if location and location.raw:
+                address = location.raw.get("address", {})
+                return {
+                    "full_address": location.address,
+                    "road": address.get("road"),
+                    "suburb": address.get("suburb"),
+                    "city": address.get("city", address.get("municipality")),
+                    "state": address.get("state"),
+                    "postcode": address.get("postcode"),
+                    "country": address.get("country"),
+                }
             
+            return None
+            
+        except (GeocoderTimedOut, GeocoderServiceError) as e:
+            self.logger.warning(f"Geocoding error for ({lat}, {lon}): {e}")
+            self.failures += 1
+            return None
+    
+    def reverse_geocode(
+        self,
+        latitude: float,
+        longitude: float,
+        precision: int = 3
+    ) -> Optional[Dict[str, str]]:
+        """
+        Converte coordenadas em endereço (reverse geocoding).
+        
+        Args:
+            latitude: Latitude
+            longitude: Longitude
+            precision: Precisão para cache (casas decimais)
+            
+        Returns:
+            Dicionário com informações de endereço ou None
+        """
+        # Arredondar para cache
+        lat_rounded = round(latitude, precision)
+        lon_rounded = round(longitude, precision)
+        
+        self.api_calls += 1
+        
+        if self.use_cache:
+            result = self._cached_reverse_geocode(lat_rounded, lon_rounded, precision)
+            if result:
+                self.cache_hits += 1
+            else:
+                self.cache_misses += 1
             return result
-        
-        except Exception as e:
-            logger.error(f"Erro no geocoding reverso ({lat}, {lon}): {e}")
-            return None
+        else:
+            return self._cached_reverse_geocode(lat_rounded, lon_rounded, precision)
     
-    def _nominatim_reverse(self, lat: float, lon: float, 
-                          language: str) -> Optional[Dict[str, Any]]:
-        """Geocoding via Nominatim (OpenStreetMap)."""
-        params = {
-            'lat': lat,
-            'lon': lon,
-            'format': 'json',
-            'addressdetails': 1,
-            'accept-language': language
-        }
-        
-        response = self.session.get(self.base_url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if 'error' in data:
-            logger.warning(f"Nominatim error: {data['error']}")
-            return None
-        
-        address = data.get('address', {})
-        
-        return {
-            'street': self._get_street(address),
-            'number': address.get('house_number', ''),
-            'neighborhood': self._get_neighborhood(address),
-            'city': address.get('city', address.get('municipality', 'São Paulo')),
-            'state': address.get('state', 'SP'),
-            'postcode': address.get('postcode', ''),
-            'country': address.get('country', 'Brasil'),
-            'formatted_address': data.get('display_name', ''),
-            'provider': 'nominatim'
-        }
-    
-    def _photon_reverse(self, lat: float, lon: float, 
-                       language: str) -> Optional[Dict[str, Any]]:
-        """Geocoding via Photon (Komoot)."""
-        params = {
-            'lat': lat,
-            'lon': lon,
-            'lang': language.split('-')[0]  # 'pt' ao invés de 'pt-BR'
-        }
-        
-        response = self.session.get(self.base_url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if not data.get('features'):
-            logger.warning("Photon: nenhum resultado encontrado")
-            return None
-        
-        feature = data['features'][0]
-        properties = feature.get('properties', {})
-        
-        return {
-            'street': properties.get('street', ''),
-            'number': properties.get('housenumber', ''),
-            'neighborhood': properties.get('suburb', ''),
-            'city': properties.get('city', 'São Paulo'),
-            'state': properties.get('state', 'SP'),
-            'postcode': properties.get('postcode', ''),
-            'country': properties.get('country', 'Brasil'),
-            'formatted_address': properties.get('name', ''),
-            'provider': 'photon'
-        }
-    
-    def _get_street(self, address: Dict[str, Any]) -> str:
-        """Extrai nome da rua de forma robusta."""
-        return (
-            address.get('road') or
-            address.get('pedestrian') or
-            address.get('highway') or
-            address.get('footway') or
-            ''
-        )
-    
-    def _get_neighborhood(self, address: Dict[str, Any]) -> str:
-        """Extrai bairro de forma robusta."""
-        return (
-            address.get('suburb') or
-            address.get('neighbourhood') or
-            address.get('quarter') or
-            address.get('district') or
-            ''
-        )
-    
-    def get_cache_stats(self) -> Dict[str, int]:
-        """Retorna estatísticas do cache."""
-        if not self.cache_enabled:
-            return {'enabled': False}
-        
-        return {
-            'enabled': True,
-            'size': len(self._cache),
-            'items': list(self._cache.keys())[:10]  # Primeiros 10
-        }
-    
-    def clear_cache(self):
-        """Limpa o cache."""
-        if self.cache_enabled:
-            self._cache.clear()
-            logger.info("Cache de geocoding limpo")
-
-
-class SparkGeocoder:
-    """Geocoding em larga escala usando Spark."""
-    
-    def __init__(self, provider: str = 'nominatim', 
-                 batch_size: int = 100,
-                 cache_enabled: bool = True):
+    def batch_reverse_geocode(
+        self,
+        coordinates: list[Tuple[float, float]],
+        delay_seconds: float = 1.0
+    ) -> list[Optional[Dict[str, str]]]:
         """
-        Inicializa Spark geocoder.
+        Reverse geocoding em lote.
         
         Args:
-            provider: Provedor de geocoding
-            batch_size: Tamanho do lote para processamento
-            cache_enabled: Se deve usar cache
+            coordinates: Lista de tuplas (latitude, longitude)
+            delay_seconds: Delay entre requisições (rate limiting)
+            
+        Returns:
+            Lista de dicionários com endereços
         """
-        self.provider = provider
-        self.batch_size = batch_size
-        self.cache_enabled = cache_enabled
+        self.logger.info(f"Batch reverse geocoding {len(coordinates)} coordinates")
         
-        logger.info(f"SparkGeocoder inicializado: provider={provider}, batch_size={batch_size}")
+        results = []
+        
+        for i, (lat, lon) in enumerate(coordinates):
+            result = self.reverse_geocode(lat, lon)
+            results.append(result)
+            
+            # Rate limiting (respeitar política de uso da API)
+            if i < len(coordinates) - 1:
+                time.sleep(delay_seconds)
+            
+            if (i + 1) % 100 == 0:
+                self.logger.info(f"Processed {i + 1}/{len(coordinates)} coordinates")
+        
+        success_count = sum(1 for r in results if r is not None)
+        self.logger.info(
+            f"Batch geocoding completed: {success_count}/{len(coordinates)} successful"
+        )
+        
+        return results
     
-    def geocode_dataframe(self, df: DataFrame, 
-                         lat_col: str = 'latitude',
-                         lon_col: str = 'longitude',
-                         output_col: str = 'address') -> DataFrame:
+    def get_statistics(self) -> Dict[str, int]:
         """
-        Aplica geocoding reverso em DataFrame Spark.
-        
-        Args:
-            df: DataFrame com coordenadas
-            lat_col: Nome da coluna de latitude
-            lon_col: Nome da coluna de longitude
-            output_col: Nome da coluna de saída com endereço
+        Retorna estatísticas de uso do serviço.
         
         Returns:
-            DataFrame enriquecido com endereços
+            Dicionário com estatísticas
         """
-        logger.info(f"Iniciando geocoding de {df.count()} registros")
+        total_requests = self.cache_hits + self.cache_misses
+        cache_hit_rate = (
+            (self.cache_hits / total_requests * 100) if total_requests > 0 else 0
+        )
         
-        # Schema para o resultado
-        address_schema = StructType([
-            StructField("street", StringType(), True),
-            StructField("number", StringType(), True),
-            StructField("neighborhood", StringType(), True),
-            StructField("city", StringType(), True),
-            StructField("state", StringType(), True),
-            StructField("postcode", StringType(), True),
-            StructField("country", StringType(), True),
-            StructField("formatted_address", StringType(), True),
-            StructField("provider", StringType(), True)
-        ])
+        stats = {
+            "total_requests": total_requests,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_rate_percent": round(cache_hit_rate, 2),
+            "api_calls": self.api_calls,
+            "failures": self.failures,
+        }
         
-        # UDF para geocoding
-        def geocode_udf(lat, lon):
-            """UDF para aplicar geocoding."""
+        # Publicar métricas
+        self.metrics.gauge("geocoding.cache_hit_rate", cache_hit_rate)
+        self.metrics.counter("geocoding.api_calls", self.api_calls)
+        self.metrics.counter("geocoding.failures", self.failures)
+        
+        return stats
+
+
+class SparkGeocodingUDF:
+    """
+    UDF para usar geocoding em Spark DataFrames.
+    
+    Wrapper para usar o GeocodingService como UDF no Spark.
+    """
+    
+    def __init__(self, geocoding_service: Optional[GeocodingService] = None):
+        """
+        Inicializa o UDF de geocoding.
+        
+        Args:
+            geocoding_service: Serviço de geocoding (opcional)
+        """
+        self.service = geocoding_service or GeocodingService()
+        self.logger = get_logger(self.__class__.__name__)
+    
+    def create_reverse_geocode_udf(self):
+        """
+        Cria UDF para reverse geocoding.
+        
+        Returns:
+            PySpark UDF
+        """
+        def reverse_geocode_udf(lat: float, lon: float) -> Optional[str]:
+            """UDF para reverse geocoding."""
             if lat is None or lon is None:
                 return None
             
-            geocoder = ReverseGeocoder(
-                provider=self.provider,
-                cache_enabled=self.cache_enabled
-            )
-            
-            result = geocoder.reverse_geocode(lat, lon)
-            
-            if result:
-                return (
-                    result.get('street'),
-                    result.get('number'),
-                    result.get('neighborhood'),
-                    result.get('city'),
-                    result.get('state'),
-                    result.get('postcode'),
-                    result.get('country'),
-                    result.get('formatted_address'),
-                    result.get('provider')
-                )
-            
-            return None
+            try:
+                result = self.service.reverse_geocode(lat, lon)
+                return result.get("full_address") if result else None
+            except Exception as e:
+                logger.warning(f"Error in geocoding UDF: {e}")
+                return None
         
-        # Registrar UDF
-        spark_udf = F.udf(geocode_udf, address_schema)
-        
-        # Aplicar geocoding
-        df_geocoded = df.withColumn(
-            output_col,
-            spark_udf(F.col(lat_col), F.col(lon_col))
-        )
-        
-        # Expandir struct em colunas separadas
-        df_geocoded = df_geocoded.withColumn('address_street', F.col(f'{output_col}.street')) \
-                                 .withColumn('address_number', F.col(f'{output_col}.number')) \
-                                 .withColumn('address_neighborhood', F.col(f'{output_col}.neighborhood')) \
-                                 .withColumn('address_city', F.col(f'{output_col}.city')) \
-                                 .withColumn('address_state', F.col(f'{output_col}.state')) \
-                                 .withColumn('address_postcode', F.col(f'{output_col}.postcode')) \
-                                 .withColumn('address_formatted', F.col(f'{output_col}.formatted_address'))
-        
-        # Remover coluna struct temporária
-        df_geocoded = df_geocoded.drop(output_col)
-        
-        logger.info("Geocoding concluído")
-        
-        return df_geocoded
+        return F.udf(reverse_geocode_udf, StringType())
     
-    def geocode_unique_coordinates(self, df: DataFrame,
-                                   lat_col: str = 'latitude',
-                                   lon_col: str = 'longitude') -> DataFrame:
+    def create_get_road_udf(self):
         """
-        Geocoda apenas coordenadas únicas (mais eficiente).
-        
-        Args:
-            df: DataFrame original
-            lat_col: Coluna de latitude
-            lon_col: Coluna de longitude
+        Cria UDF para obter nome da rua.
         
         Returns:
-            DataFrame com coordenadas únicas geocodadas
+            PySpark UDF
         """
-        # Extrair coordenadas únicas
-        unique_coords = df.select(lat_col, lon_col).distinct()
+        def get_road_udf(lat: float, lon: float) -> Optional[str]:
+            """UDF para obter nome da rua."""
+            if lat is None or lon is None:
+                return None
+            
+            try:
+                result = self.service.reverse_geocode(lat, lon)
+                return result.get("road") if result else None
+            except Exception as e:
+                logger.warning(f"Error in get_road UDF: {e}")
+                return None
         
-        logger.info(f"Geocodando {unique_coords.count()} coordenadas únicas")
+        return F.udf(get_road_udf, StringType())
+    
+    def create_get_neighborhood_udf(self):
+        """
+        Cria UDF para obter bairro.
         
-        # Geocodar coordenadas únicas
-        geocoded_coords = self.geocode_dataframe(unique_coords, lat_col, lon_col)
+        Returns:
+            PySpark UDF
+        """
+        def get_neighborhood_udf(lat: float, lon: float) -> Optional[str]:
+            """UDF para obter bairro."""
+            if lat is None or lon is None:
+                return None
+            
+            try:
+                result = self.service.reverse_geocode(lat, lon)
+                return result.get("suburb") if result else None
+            except Exception as e:
+                logger.warning(f"Error in get_neighborhood UDF: {e}")
+                return None
         
-        # Join com DataFrame original
-        df_enriched = df.join(
-            geocoded_coords,
-            on=[lat_col, lon_col],
-            how='left'
-        )
-        
-        return df_enriched
+        return F.udf(get_neighborhood_udf, StringType())
 
 
-def batch_geocode(coordinates: List[Tuple[float, float]],
-                 provider: str = 'nominatim',
-                 delay: float = 1.0) -> List[Optional[Dict[str, Any]]]:
+def add_geocoding_to_dataframe(
+    df: DataFrame,
+    latitude_col: str = "latitude",
+    longitude_col: str = "longitude",
+    address_col: str = "address",
+    road_col: str = "road",
+    neighborhood_col: str = "neighborhood"
+) -> DataFrame:
     """
-    Geocoding em lote de lista de coordenadas.
+    Adiciona colunas de geocoding a um DataFrame.
     
     Args:
-        coordinates: Lista de tuplas (lat, lon)
-        provider: Provedor de geocoding
-        delay: Delay entre requisições (segundos)
-    
+        df: DataFrame de entrada com coordenadas
+        latitude_col: Nome da coluna de latitude
+        longitude_col: Nome da coluna de longitude
+        address_col: Nome para coluna de endereço completo
+        road_col: Nome para coluna de rua
+        neighborhood_col: Nome para coluna de bairro
+        
     Returns:
-        Lista de resultados de geocoding
+        DataFrame com colunas de geocoding adicionadas
     """
-    geocoder = ReverseGeocoder(provider=provider, cache_enabled=True)
-    results = []
+    logger.info("Adding geocoding columns to DataFrame")
     
-    logger.info(f"Geocodando {len(coordinates)} coordenadas em lote")
+    # Criar UDFs
+    spark_geocoding = SparkGeocodingUDF()
+    reverse_geocode_udf = spark_geocoding.create_reverse_geocode_udf()
+    get_road_udf = spark_geocoding.create_get_road_udf()
+    get_neighborhood_udf = spark_geocoding.create_get_neighborhood_udf()
     
-    for i, (lat, lon) in enumerate(coordinates):
-        result = geocoder.reverse_geocode(lat, lon)
-        results.append(result)
-        
-        if (i + 1) % 10 == 0:
-            logger.info(f"Progresso: {i + 1}/{len(coordinates)}")
-        
-        if delay > 0 and i < len(coordinates) - 1:
-            time.sleep(delay)
+    # Aplicar UDFs
+    df_with_geocoding = (
+        df
+        .withColumn(address_col, reverse_geocode_udf(F.col(latitude_col), F.col(longitude_col)))
+        .withColumn(road_col, get_road_udf(F.col(latitude_col), F.col(longitude_col)))
+        .withColumn(neighborhood_col, get_neighborhood_udf(F.col(latitude_col), F.col(longitude_col)))
+    )
     
-    logger.info("Geocoding em lote concluído")
+    # Contar sucessos
+    geocoded_count = df_with_geocoding.filter(F.col(address_col).isNotNull()).count()
+    total_count = df.count()
     
-    return results
+    success_rate = (geocoded_count / total_count * 100) if total_count > 0 else 0
+    
+    logger.info(
+        f"Geocoding completed: {geocoded_count}/{total_count} records "
+        f"({success_rate:.2f}% success rate)"
+    )
+    
+    return df_with_geocoding
 
 
-if __name__ == "__main__":
-    # Testes básicos
-    print("=== Testando Geocoding ===")
+def reverse_geocode(
+    latitude: float,
+    longitude: float
+) -> Optional[Dict[str, str]]:
+    """
+    Função utilitária para reverse geocoding simples.
     
-    # Coordenadas de teste (Av. Paulista, São Paulo)
-    test_lat = -23.5613
-    test_lon = -46.6563
+    Args:
+        latitude: Latitude
+        longitude: Longitude
+        
+    Returns:
+        Dicionário com informações de endereço ou None
+    """
+    service = GeocodingService()
+    return service.reverse_geocode(latitude, longitude)
+
+
+def create_geocoding_lookup_table(
+    spark: SparkSession,
+    coordinates_df: DataFrame,
+    output_path: str
+) -> None:
+    """
+    Cria tabela de lookup de geocoding para reuso.
     
-    print(f"\n1. Testando Nominatim para ({test_lat}, {test_lon}):")
-    geocoder = ReverseGeocoder(provider='nominatim')
-    result = geocoder.reverse_geocode(test_lat, test_lon)
+    Útil para pré-processar coordenadas comuns e evitar chamadas repetidas à API.
     
-    if result:
-        print(f"   Rua: {result['street']}")
-        print(f"   Bairro: {result['neighborhood']}")
-        print(f"   Cidade: {result['city']}")
-        print(f"   ✅ Geocoding funcionando")
-    else:
-        print("   ❌ Falha no geocoding")
+    Args:
+        spark: SparkSession
+        coordinates_df: DataFrame com coordenadas únicas
+        output_path: Caminho para salvar tabela de lookup
+    """
+    logger.info("Creating geocoding lookup table")
     
-    print("\n2. Testando cache:")
-    result2 = geocoder.reverse_geocode(test_lat, test_lon)
-    print(f"   Cache stats: {geocoder.get_cache_stats()}")
-    print("   ✅ Cache funcionando")
+    # Obter coordenadas únicas
+    unique_coords = (
+        coordinates_df
+        .select("latitude", "longitude")
+        .distinct()
+    )
     
-    print("\n3. Testando geocoding em lote:")
-    coords = [
-        (-23.5613, -46.6563),  # Av. Paulista
-        (-23.5505, -46.6333),  # Região central
-    ]
-    results = batch_geocode(coords, delay=1.5)
-    print(f"   ✅ {len([r for r in results if r])} coordenadas geocodadas")
+    logger.info(f"Found {unique_coords.count()} unique coordinates")
     
-    print("\n✅ Todos os testes passaram!")
+    # Aplicar geocoding
+    df_with_geocoding = add_geocoding_to_dataframe(unique_coords)
+    
+    # Salvar
+    df_with_geocoding.write.mode("overwrite").parquet(output_path)
+    
+    logger.info(f"Geocoding lookup table saved to {output_path}")

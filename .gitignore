@@ -1,5 +1,7 @@
 # ============================================================================
-# SPTrans Pipeline - .gitignore
+# SPTrans Pipeline - Git Ignore
+# ============================================================================
+# Arquivos e pastas que não devem ser versionados
 # ============================================================================
 
 # ====================
@@ -34,17 +36,13 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Virtual environments
-venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-.venv/
-
 # PyInstaller
 *.manifest
 *.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
 
 # Unit test / coverage reports
 htmlcov/
@@ -56,83 +54,192 @@ htmlcov/
 nosetests.xml
 coverage.xml
 *.cover
-*.log
+*.py,cover
 .hypothesis/
 .pytest_cache/
+test-results/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-*.ipynb
+*.ipynb_checkpoints/
+
+# IPython
+profile_default/
+ipython_config.py
 
 # pyenv
 .python-version
+
+# pipenv
+Pipfile.lock
+
+# Poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
 
 # Environments
 .env
 .env.local
 .env.*.local
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# ====================
-# SPARK
-# ====================
-spark-warehouse/
-metastore_db/
-derby.log
-*.parquet
-*.orc
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
 
 # ====================
 # AIRFLOW
 # ====================
 airflow.db
 airflow.cfg
-logs/
-*.pid
-unittests.cfg
 airflow-webserver.pid
+airflow-scheduler.pid
+unittests.cfg
+logs/
+dags/__pycache__/
+plugins/__pycache__/
 
 # ====================
-# DATA
+# SPARK
 # ====================
-# Data files
-*.csv
-*.json
-*.xml
-*.txt
-*.parquet
-*.orc
-*.avro
+# Spark logs
+spark-warehouse/
+metastore_db/
+derby.log
+*.log
 
-# Directories
-data/
-raw/
-processed/
-bronze/
-silver/
-gold/
-temp/
-tmp/
-cache/
-
-# MinIO/S3
-.minio.sys/
+# Spark temporary files
+.spark-history/
 
 # ====================
-# DATABASES
+# DATA FILES
 # ====================
-*.db
-*.sqlite
-*.sqlite3
-*.sql.gz
+# Dados locais (não versionar)
+data/raw/**
+data/bronze/**
+data/silver/**
+data/gold/**
+data/serving/**
+data/temp/**
+data/backup/**
 
-# PostgreSQL
-*.dump
+# Exceto exemplos/schemas
+!data/raw/.gitkeep
+!data/bronze/.gitkeep
+!data/silver/.gitkeep
+!data/gold/.gitkeep
+!data/schemas/
+
+# GTFS files
+*.zip
+gtfs/
+!gtfs/.gitkeep
+
+# ====================
+# CREDENCIAIS & SEGREDOS
+# ====================
+# Nunca versionar credenciais!
+.secrets/
+secrets.yaml
+credentials.json
+service-account.json
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# AWS
+.aws/
+
+# GCP
+gcloud-service-key.json
+
+# Tokens
+.token
+*.token
 
 # ====================
 # DOCKER
 # ====================
-docker-compose.override.yml
-.dockerignore
+# Docker volumes
+docker-volumes/
+postgres-data/
+minio-data/
+kafka-data/
+
+# ====================
+# KUBERNETES
+# ====================
+# Sensitive K8s configs
+kubeconfig
+*.kubeconfig
+secrets.enc.yaml
+
+# ====================
+# TERRAFORM
+# ====================
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Exclude all .tfvars files
+*.tfvars
+*.tfvars.json
+
+# Ignore override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Ignore CLI configuration files
+.terraformrc
+terraform.rc
 
 # ====================
 # IDEs
@@ -150,6 +257,21 @@ docker-compose.override.yml
 *.sublime-project
 *.sublime-workspace
 
+# Eclipse
+.project
+.pydevproject
+.settings/
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
 # ====================
 # OS
 # ====================
@@ -157,111 +279,103 @@ docker-compose.override.yml
 .DS_Store
 .AppleDouble
 .LSOverride
+._*
 
 # Windows
 Thumbs.db
+Thumbs.db:encryptable
 ehthumbs.db
-Desktop.ini
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
 $RECYCLE.BIN/
 
 # Linux
 *~
 .directory
+.Trash-*
 
 # ====================
-# LOGS
+# DATABASES
 # ====================
-*.log
-logs/
-*.log.*
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
 
-# ====================
-# BACKUPS
-# ====================
-*.bak
-*.backup
-*.old
-*.orig
-
-# ====================
-# SECRETS
-# ====================
-secrets/
-credentials/
-*.key
-*.pem
-*.crt
-*.p12
-
-# API Keys
-*_api_key*
-*_secret*
-*_token*
-
-# ====================
-# TEMPORARY
-# ====================
-*.tmp
-*.temp
-.tmp/
-.temp/
-
-# ====================
-# NOTEBOOKS OUTPUT
-# ====================
-notebooks/output/
-notebooks/checkpoints/
-
-# ====================
-# DOCUMENTATION
-# ====================
-docs/_build/
-docs/.doctrees/
-site/
+# PostgreSQL dumps
+*.sql.gz
+*.dump
 
 # ====================
 # MONITORING
 # ====================
-prometheus/data/
-grafana/data/
+# Prometheus data
+prometheus-data/
+
+# Grafana
+grafana-data/
+grafana.db
+
+# ====================
+# TEMP & CACHE
+# ====================
+tmp/
+temp/
+*.tmp
+*.temp
+cache/
+.cache/
+
+# ====================
+# NOTEBOOKS
+# ====================
+# Notebook outputs (se quiser versionar sem outputs)
+# Descomente se preferir não versionar outputs:
+# *.ipynb
+# Mas manter os notebooks versionados sem output:
+# !notebooks/*.ipynb
+
+# ====================
+# BUILD ARTIFACTS
+# ====================
+target/
+out/
+*.jar
+*.war
+*.ear
 
 # ====================
 # MISC
 # ====================
-*.swp
-*.swo
+# Backup files
+*.bak
+*.backup
+*.old
 *~
-.project
-.pydevproject
-.settings/
+
+# Compressed files (exceto releases)
+# *.tar.gz
+# *.zip
+# *.7z
+
+# Large files (Git LFS recommended)
+*.parquet
+*.avro
+*.orc
 
 # ====================
 # PROJECT SPECIFIC
 # ====================
-# GTFS cache
-gtfs_cache/
+# Outputs de teste
+outputs/
+results/
+reports/
 
-# API responses cache
-api_cache/
-
-# Test outputs
-test_output/
-test_data/
-
-# Spark checkpoints
+# Checkpoints
 checkpoints/
-_spark_metadata/
+*.ckpt
 
-# ============================================================================
-# NOTES
-# ============================================================================
-# 
-# Este .gitignore é configurado para:
-# 1. Evitar commit de dados sensíveis (credenciais, secrets)
-# 2. Evitar commit de dados grandes (parquet, csv)
-# 3. Evitar commit de arquivos temporários
-# 4. Manter repositório limpo e profissional
-#
-# Para forçar add de arquivo ignorado: git add -f <file>
-#
-# ============================================================================
+# Datasets grandes
+datasets/large/
+datasets/production/

@@ -1,0 +1,471 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "sptrans-data-quality",
+    "title": "SPTrans Data Quality Dashboard",
+    "tags": ["sptrans", "data-quality", "dq"],
+    "timezone": "America/Sao_Paulo",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "1m",
+    
+    "panels": [
+      {
+        "id": 1,
+        "gridPos": {"h": 6, "w": 6, "x": 0, "y": 0},
+        "type": "stat",
+        "title": "Overall Data Quality Score",
+        "targets": [
+          {
+            "expr": "avg(data_quality_score)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "decimals": 1,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 70, "color": "yellow"},
+                {"value": 85, "color": "green"}
+              ]
+            }
+          }
+        },
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "textMode": "value_and_name"
+        }
+      },
+      
+      {
+        "id": 2,
+        "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0},
+        "type": "stat",
+        "title": "Completeness",
+        "targets": [
+          {
+            "expr": "avg(data_completeness_percentage)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 80, "color": "yellow"},
+                {"value": 95, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      
+      {
+        "id": 3,
+        "gridPos": {"h": 6, "w": 6, "x": 12, "y": 0},
+        "type": "stat",
+        "title": "Validity",
+        "targets": [
+          {
+            "expr": "avg(data_validity_percentage)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 85, "color": "yellow"},
+                {"value": 95, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      
+      {
+        "id": 4,
+        "gridPos": {"h": 6, "w": 6, "x": 18, "y": 0},
+        "type": "stat",
+        "title": "Accuracy",
+        "targets": [
+          {
+            "expr": "avg(data_accuracy_percentage)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 85, "color": "yellow"},
+                {"value": 95, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      
+      {
+        "id": 5,
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+        "type": "graph",
+        "title": "Data Quality Trend (24h)",
+        "targets": [
+          {
+            "expr": "data_quality_score",
+            "legendFormat": "{{layer}} - {{source}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "percent",
+            "label": "Quality Score",
+            "min": 0,
+            "max": 100
+          },
+          {"format": "short"}
+        ],
+        "lines": true,
+        "fill": 1,
+        "linewidth": 2
+      },
+      
+      {
+        "id": 6,
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+        "type": "graph",
+        "title": "Duplicate Records Detected",
+        "targets": [
+          {
+            "expr": "rate(duplicate_records_total[5m])",
+            "legendFormat": "{{layer}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Duplicates/sec"},
+          {"format": "short"}
+        ]
+      },
+      
+      {
+        "id": 7,
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+        "type": "graph",
+        "title": "Invalid Coordinates",
+        "targets": [
+          {
+            "expr": "invalid_coordinates_total",
+            "legendFormat": "{{validation_type}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Count"},
+          {"format": "short"}
+        ]
+      },
+      
+      {
+        "id": 8,
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+        "type": "graph",
+        "title": "Null Values by Field",
+        "targets": [
+          {
+            "expr": "null_values_by_field",
+            "legendFormat": "{{field_name}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Null Count"},
+          {"format": "short"}
+        ]
+      },
+      
+      {
+        "id": 9,
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 22},
+        "type": "table",
+        "title": "Data Quality Issues by Layer",
+        "targets": [
+          {
+            "expr": "data_quality_issues",
+            "refId": "A",
+            "format": "table"
+          }
+        ],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "renameByName": {
+                "layer": "Layer",
+                "issue_type": "Issue Type",
+                "count": "Count",
+                "severity": "Severity"
+              }
+            }
+          }
+        ]
+      },
+      
+      {
+        "id": 10,
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
+        "type": "bargauge",
+        "title": "Quality Score by Route",
+        "targets": [
+          {
+            "expr": "avg(data_quality_score_by_route) by (route_code)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100,
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 70, "color": "yellow"},
+                {"value": 85, "color": "green"}
+              ]
+            }
+          }
+        },
+        "options": {
+          "orientation": "horizontal",
+          "displayMode": "gradient"
+        }
+      },
+      
+      {
+        "id": 11,
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
+        "type": "piechart",
+        "title": "Issues by Severity",
+        "targets": [
+          {
+            "expr": "sum(data_quality_issues) by (severity)",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "right"
+          },
+          "pieType": "pie"
+        }
+      },
+      
+      {
+        "id": 12,
+        "gridPos": {"h": 6, "w": 8, "x": 0, "y": 38},
+        "type": "stat",
+        "title": "Critical Issues (24h)",
+        "targets": [
+          {
+            "expr": "sum(increase(data_quality_issues{severity=\"critical\"}[24h]))",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 1, "color": "yellow"},
+                {"value": 5, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      
+      {
+        "id": 13,
+        "gridPos": {"h": 6, "w": 8, "x": 8, "y": 38},
+        "type": "stat",
+        "title": "Records Rejected (24h)",
+        "targets": [
+          {
+            "expr": "sum(increase(records_rejected_total[24h]))",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 100, "color": "yellow"},
+                {"value": 1000, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      
+      {
+        "id": 14,
+        "gridPos": {"h": 6, "w": 8, "x": 16, "y": 38},
+        "type": "stat",
+        "title": "Data Quality Alerts",
+        "targets": [
+          {
+            "expr": "count(ALERTS{alertname=~\".*DataQuality.*\",alertstate=\"firing\"})",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 1, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      
+      {
+        "id": 15,
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 44},
+        "type": "graph",
+        "title": "Schema Validation Errors",
+        "targets": [
+          {
+            "expr": "rate(schema_validation_errors_total[5m])",
+            "legendFormat": "{{error_type}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Errors/sec"},
+          {"format": "short"}
+        ]
+      },
+      
+      {
+        "id": 16,
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 52},
+        "type": "graph",
+        "title": "Timeliness Score",
+        "targets": [
+          {
+            "expr": "data_timeliness_score",
+            "legendFormat": "{{layer}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "min": 0, "max": 100},
+          {"format": "short"}
+        ]
+      },
+      
+      {
+        "id": 17,
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 52},
+        "type": "graph",
+        "title": "Data Freshness (minutes)",
+        "targets": [
+          {
+            "expr": "(time() - data_last_updated_timestamp) / 60",
+            "legendFormat": "{{layer}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "m", "label": "Age (minutes)"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"type": "gt", "params": [30]},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"type": "avg"}
+            }
+          ],
+          "executionErrorState": "alerting",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "Data Freshness Alert",
+          "noDataState": "no_data"
+        }
+      }
+    ],
+    
+    "templating": {
+      "list": [
+        {
+          "name": "datasource",
+          "type": "datasource",
+          "query": "prometheus"
+        },
+        {
+          "name": "layer",
+          "type": "query",
+          "datasource": "${datasource}",
+          "query": "label_values(data_quality_score, layer)",
+          "multi": true,
+          "includeAll": true
+        },
+        {
+          "name": "route",
+          "type": "query",
+          "datasource": "${datasource}",
+          "query": "label_values(data_quality_score_by_route, route_code)",
+          "multi": true,
+          "includeAll": true
+        }
+      ]
+    },
+    
+    "time": {
+      "from": "now-24h",
+      "to": "now"
+    },
+    
+    "timepicker": {
+      "refresh_intervals": ["30s", "1m", "5m", "15m", "30m", "1h"]
+    },
+    
+    "annotations": {
+      "list": [
+        {
+          "datasource": "${datasource}",
+          "enable": true,
+          "expr": "ALERTS{alertname=~\".*DataQuality.*\"}",
+          "iconColor": "red",
+          "name": "DQ Alerts"
+        }
+      ]
+    }
+  },
+  
+  "overwrite": true,
+  "folderId": 0,
+  "folderUid": ""
+}

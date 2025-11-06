@@ -1,601 +1,453 @@
-# =============================================================================
-# REDIS CACHE
-# =============================================================================
-# Gerenciador de cache Redis para dados em tempo real
-# =============================================================================
-
 """
-Redis Cache Manager
+Redis Cache Module
 
-Gerencia cache de dados em memória usando Redis:
-    - Posições de veículos em tempo real
-    - Informações de rotas
-    - Métricas agregadas
-    - Dados de API
-
-Funcionalidades:
-    - Set/Get com TTL
-    - Batch operations
-    - Cache patterns (vehicle:*, route:*, etc)
-    - Limpeza automática
+Responsável por cache de dados em Redis:
+- Cache de KPIs
+- Cache de queries frequentes
+- Real-time data caching
 """
 
+from typing import Any, Dict, List, Optional, Union
 import json
-import logging
-from typing import Optional, Dict, Any, List, Union
 from datetime import datetime, timedelta
 
-try:
-    import redis
-    from redis.exceptions import RedisError
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
-    redis = None
-    RedisError = Exception
+import redis
+from redis.exceptions import RedisError
 
-# =============================================================================
-# LOGGING
-# =============================================================================
+from src.common.config import get_config
+from src.common.logging_config import get_logger
+from src.common.exceptions import StorageException
+from src.common.metrics import MetricsCollector
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# =============================================================================
-# REDIS CACHE CLASS
-# =============================================================================
 
 class RedisCache:
-    """Gerenciador de cache Redis"""
+    """
+    Classe para gerenciar cache em Redis.
+    
+    Suporta:
+    - Cache de objetos JSON
+    - TTL (Time To Live)
+    - Bulk operations
+    - Pattern matching
+    """
     
     def __init__(
         self,
-        host: str = "redis",
-        port: int = 6379,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
         db: int = 0,
         password: Optional[str] = None,
-        default_ttl: int = 300,  # 5 minutos
-        config: Optional[Dict[str, Any]] = None
+        decode_responses: bool = True
     ):
         """
-        Inicializa conexão com Redis.
+        Inicializa o RedisCache.
         
         Args:
-            host: Host do Redis
-            port: Porta do Redis
-            db: Número do database
-            password: Senha (se necessário)
-            default_ttl: TTL padrão em segundos
-            config: Configurações adicionais
-        
-        Raises:
-            ImportError: Se redis-py não estiver instalado
+            host: Host do Redis (usa config se None)
+            port: Porta do Redis (usa config se None)
+            db: Número do database Redis
+            password: Senha do Redis (opcional)
+            decode_responses: Se deve decodificar respostas como strings
         """
-        if not REDIS_AVAILABLE:
-            raise ImportError(
-                "redis não instalado. "
-                "Instale com: pip install redis"
-            )
+        config = get_config()
         
-        self.host = host
-        self.port = port
+        self.host = host or config.REDIS_HOST
+        self.port = port or config.REDIS_PORT
         self.db = db
-        self.default_ttl = default_ttl
-        self.config = config or {}
+        self.password = password or config.REDIS_PASSWORD
+        
+        self.metrics = MetricsCollector()
+        self.logger = get_logger(self.__class__.__name__)
         
         # Conectar ao Redis
         try:
             self.client = redis.Redis(
-                host=host,
-                port=port,
-                db=db,
-                password=password,
-                decode_responses=True,
-                socket_timeout=5,
+                host=self.host,
+                port=self.port,
+                db=self.db,
+                password=self.password,
+                decode_responses=decode_responses,
                 socket_connect_timeout=5,
-                **self.config
+                socket_timeout=5
             )
             
             # Testar conexão
             self.client.ping()
+            self.logger.info(f"Connected to Redis at {self.host}:{self.port}")
             
-            logger.info(f"✓ Redis conectado: {host}:{port} (DB: {db})")
-        
-        except Exception as e:
-            logger.error(f"Erro ao conectar com Redis: {e}")
-            raise
-        
-        # Estatísticas
-        self.hits = 0
-        self.misses = 0
-        self.sets = 0
-    
-    def ping(self) -> bool:
-        """
-        Testa conexão com Redis.
-        
-        Returns:
-            True se conectado
-        """
-        try:
-            return self.client.ping()
-        except Exception as e:
-            logger.error(f"Ping falhou: {e}")
-            return False
+        except RedisError as e:
+            self.logger.error(f"Failed to connect to Redis: {e}")
+            raise StorageException(f"Redis connection failed: {e}")
     
     def set(
         self,
         key: str,
         value: Any,
-        ttl: Optional[int] = None
+        ttl_seconds: Optional[int] = None
     ) -> bool:
         """
-        Define valor no cache.
+        Define um valor no cache.
         
         Args:
-            key: Chave do cache
-            value: Valor a cachear (será serializado como JSON)
-            ttl: Tempo de vida em segundos (None = default_ttl)
-        
+            key: Chave
+            value: Valor (será serializado para JSON)
+            ttl_seconds: Tempo de vida em segundos (opcional)
+            
         Returns:
-            True se sucesso
-        
-        Example:
-            >>> cache.set("vehicle:12345", {"lat": -23.5, "lon": -46.6})
+            True se sucesso, False caso contrário
         """
         try:
-            ttl = ttl or self.default_ttl
-            
-            # Serializar valor
+            # Serializar para JSON se não for string
             if not isinstance(value, str):
                 value = json.dumps(value)
             
-            # Set com TTL
-            result = self.client.setex(key, ttl, value)
+            if ttl_seconds:
+                result = self.client.setex(key, ttl_seconds, value)
+            else:
+                result = self.client.set(key, value)
             
-            self.sets += 1
+            self.metrics.counter("redis.set_operations", 1)
+            return bool(result)
             
-            logger.debug(f"Cache SET: {key} (TTL: {ttl}s)")
-            
-            return result
-        
         except Exception as e:
-            logger.error(f"Erro ao fazer SET: {e}")
+            self.logger.error(f"Redis SET failed for key '{key}': {e}")
+            self.metrics.counter("redis.errors", 1)
             return False
     
-    def get(self, key: str) -> Optional[Any]:
+    def get(self, key: str, deserialize: bool = True) -> Optional[Any]:
         """
-        Obtém valor do cache.
+        Obtém um valor do cache.
         
         Args:
-            key: Chave do cache
-        
+            key: Chave
+            deserialize: Se deve deserializar JSON
+            
         Returns:
             Valor ou None se não encontrado
-        
-        Example:
-            >>> data = cache.get("vehicle:12345")
         """
         try:
             value = self.client.get(key)
             
             if value is None:
-                self.misses += 1
-                logger.debug(f"Cache MISS: {key}")
+                self.metrics.counter("redis.cache_misses", 1)
                 return None
             
-            self.hits += 1
-            logger.debug(f"Cache HIT: {key}")
+            self.metrics.counter("redis.cache_hits", 1)
             
-            # Tentar desserializar JSON
-            try:
-                return json.loads(value)
-            except:
-                return value
-        
+            # Deserializar JSON se solicitado
+            if deserialize and isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    pass  # Retornar string se não for JSON
+            
+            return value
+            
         except Exception as e:
-            logger.error(f"Erro ao fazer GET: {e}")
+            self.logger.error(f"Redis GET failed for key '{key}': {e}")
+            self.metrics.counter("redis.errors", 1)
             return None
     
-    def delete(self, key: str) -> bool:
+    def delete(self, *keys: str) -> int:
         """
-        Remove chave do cache.
+        Remove uma ou mais chaves do cache.
         
         Args:
-            key: Chave a remover
-        
+            *keys: Chaves a remover
+            
         Returns:
-            True se removida
+            Número de chaves removidas
         """
         try:
-            result = self.client.delete(key)
-            logger.debug(f"Cache DELETE: {key}")
-            return bool(result)
-        
+            deleted_count = self.client.delete(*keys)
+            self.metrics.counter("redis.delete_operations", len(keys))
+            return deleted_count
+            
         except Exception as e:
-            logger.error(f"Erro ao fazer DELETE: {e}")
-            return False
+            self.logger.error(f"Redis DELETE failed: {e}")
+            self.metrics.counter("redis.errors", 1)
+            return 0
     
-    def exists(self, key: str) -> bool:
+    def exists(self, *keys: str) -> int:
         """
-        Verifica se chave existe.
+        Verifica se chaves existem.
         
         Args:
-            key: Chave a verificar
-        
+            *keys: Chaves a verificar
+            
         Returns:
-            True se existe
+            Número de chaves que existem
         """
         try:
-            return bool(self.client.exists(key))
+            return self.client.exists(*keys)
         except Exception as e:
-            logger.error(f"Erro ao verificar EXISTS: {e}")
+            self.logger.error(f"Redis EXISTS failed: {e}")
+            return 0
+    
+    def expire(self, key: str, ttl_seconds: int) -> bool:
+        """
+        Define TTL para uma chave existente.
+        
+        Args:
+            key: Chave
+            ttl_seconds: Tempo de vida em segundos
+            
+        Returns:
+            True se sucesso
+        """
+        try:
+            return bool(self.client.expire(key, ttl_seconds))
+        except Exception as e:
+            self.logger.error(f"Redis EXPIRE failed for key '{key}': {e}")
             return False
     
-    def get_ttl(self, key: str) -> Optional[int]:
+    def ttl(self, key: str) -> int:
         """
         Obtém TTL restante de uma chave.
         
         Args:
             key: Chave
-        
+            
         Returns:
-            TTL em segundos ou None
+            TTL em segundos (-1 se não tem TTL, -2 se não existe)
         """
         try:
-            ttl = self.client.ttl(key)
-            return ttl if ttl >= 0 else None
+            return self.client.ttl(key)
         except Exception as e:
-            logger.error(f"Erro ao obter TTL: {e}")
-            return None
+            self.logger.error(f"Redis TTL failed for key '{key}': {e}")
+            return -2
     
-    def set_many(self, mapping: Dict[str, Any], ttl: Optional[int] = None) -> int:
+    def set_multiple(
+        self,
+        mapping: Dict[str, Any],
+        ttl_seconds: Optional[int] = None
+    ) -> bool:
         """
-        Define múltiplos valores no cache.
+        Define múltiplos valores de uma vez.
         
         Args:
-            mapping: Dicionário {key: value}
-            ttl: TTL para todas as chaves
-        
-        Returns:
-            Número de chaves inseridas
-        """
-        count = 0
-        
-        for key, value in mapping.items():
-            if self.set(key, value, ttl):
-                count += 1
-        
-        logger.info(f"Cache SET_MANY: {count}/{len(mapping)} chaves")
-        
-        return count
-    
-    def get_many(self, keys: List[str]) -> Dict[str, Any]:
-        """
-        Obtém múltiplos valores do cache.
-        
-        Args:
-            keys: Lista de chaves
-        
-        Returns:
-            Dicionário {key: value}
-        """
-        result = {}
-        
-        for key in keys:
-            value = self.get(key)
-            if value is not None:
-                result[key] = value
-        
-        logger.debug(f"Cache GET_MANY: {len(result)}/{len(keys)} encontrados")
-        
-        return result
-    
-    def delete_pattern(self, pattern: str) -> int:
-        """
-        Remove chaves que correspondem a um pattern.
-        
-        Args:
-            pattern: Pattern com wildcards (ex: "vehicle:*")
-        
-        Returns:
-            Número de chaves removidas
-        
-        Example:
-            >>> cache.delete_pattern("vehicle:*")
-        """
-        try:
-            keys = self.client.keys(pattern)
+            mapping: Dicionário chave-valor
+            ttl_seconds: TTL para todas as chaves (opcional)
             
-            if not keys:
-                return 0
-            
-            deleted = self.client.delete(*keys)
-            
-            logger.info(f"Cache DELETE_PATTERN '{pattern}': {deleted} chaves")
-            
-            return deleted
-        
-        except Exception as e:
-            logger.error(f"Erro ao deletar pattern: {e}")
-            return 0
-    
-    def get_keys(self, pattern: str = "*") -> List[str]:
-        """
-        Lista chaves que correspondem a um pattern.
-        
-        Args:
-            pattern: Pattern (default: todas)
-        
-        Returns:
-            Lista de chaves
-        """
-        try:
-            keys = self.client.keys(pattern)
-            return [k.decode() if isinstance(k, bytes) else k for k in keys]
-        except Exception as e:
-            logger.error(f"Erro ao listar chaves: {e}")
-            return []
-    
-    def flush_db(self) -> bool:
-        """
-        Limpa todo o database.
-        
-        WARNING: Remove TODAS as chaves!
-        
         Returns:
             True se sucesso
         """
         try:
-            self.client.flushdb()
-            logger.warning("Cache FLUSH: todas as chaves removidas")
-            return True
+            # Serializar valores
+            serialized = {}
+            for key, value in mapping.items():
+                if not isinstance(value, str):
+                    value = json.dumps(value)
+                serialized[key] = value
+            
+            # SET múltiplo
+            result = self.client.mset(serialized)
+            
+            # Aplicar TTL se especificado
+            if ttl_seconds and result:
+                for key in serialized.keys():
+                    self.client.expire(key, ttl_seconds)
+            
+            self.metrics.counter("redis.mset_operations", len(mapping))
+            return bool(result)
+            
         except Exception as e:
-            logger.error(f"Erro ao fazer FLUSH: {e}")
+            self.logger.error(f"Redis MSET failed: {e}")
+            self.metrics.counter("redis.errors", 1)
+            return False
+    
+    def get_multiple(
+        self,
+        keys: List[str],
+        deserialize: bool = True
+    ) -> Dict[str, Optional[Any]]:
+        """
+        Obtém múltiplos valores de uma vez.
+        
+        Args:
+            keys: Lista de chaves
+            deserialize: Se deve deserializar JSON
+            
+        Returns:
+            Dicionário chave-valor
+        """
+        try:
+            values = self.client.mget(keys)
+            
+            result = {}
+            for key, value in zip(keys, values):
+                if value and deserialize:
+                    try:
+                        value = json.loads(value)
+                    except json.JSONDecodeError:
+                        pass
+                result[key] = value
+            
+            hits = sum(1 for v in values if v is not None)
+            self.metrics.counter("redis.cache_hits", hits)
+            self.metrics.counter("redis.cache_misses", len(keys) - hits)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Redis MGET failed: {e}")
+            self.metrics.counter("redis.errors", 1)
+            return {key: None for key in keys}
+    
+    def keys_matching(self, pattern: str) -> List[str]:
+        """
+        Busca chaves que correspondem a um padrão.
+        
+        Args:
+            pattern: Padrão (ex: "kpi:*", "vehicle:*")
+            
+        Returns:
+            Lista de chaves que correspondem
+        """
+        try:
+            return self.client.keys(pattern)
+        except Exception as e:
+            self.logger.error(f"Redis KEYS failed for pattern '{pattern}': {e}")
+            return []
+    
+    def delete_pattern(self, pattern: str) -> int:
+        """
+        Remove todas as chaves que correspondem a um padrão.
+        
+        Args:
+            pattern: Padrão
+            
+        Returns:
+            Número de chaves removidas
+        """
+        try:
+            keys = self.keys_matching(pattern)
+            if keys:
+                return self.delete(*keys)
+            return 0
+        except Exception as e:
+            self.logger.error(f"Redis DELETE PATTERN failed: {e}")
+            return 0
+    
+    def flush_db(self) -> bool:
+        """
+        Remove todas as chaves do database atual.
+        
+        ⚠️ CUIDADO: Operação destrutiva!
+        
+        Returns:
+            True se sucesso
+        """
+        self.logger.warning(f"Flushing Redis database {self.db}")
+        try:
+            return bool(self.client.flushdb())
+        except Exception as e:
+            self.logger.error(f"Redis FLUSHDB failed: {e}")
             return False
     
     def info(self) -> Dict[str, Any]:
         """
-        Retorna informações do Redis.
+        Obtém informações do servidor Redis.
         
         Returns:
             Dicionário com informações
         """
         try:
-            redis_info = self.client.info()
-            
-            return {
-                "connected": True,
-                "keys_count": self.client.dbsize(),
-                "memory_used_mb": redis_info.get("used_memory", 0) / 1024 / 1024,
-                "total_connections": redis_info.get("total_connections_received", 0),
-                "uptime_seconds": redis_info.get("uptime_in_seconds", 0),
-                "hit_rate": self._calculate_hit_rate(),
-            }
-        
+            return self.client.info()
         except Exception as e:
-            logger.error(f"Erro ao obter info: {e}")
-            return {"connected": False, "error": str(e)}
+            self.logger.error(f"Redis INFO failed: {e}")
+            return {}
     
-    def get_stats(self) -> Dict[str, Any]:
+    def get_cache_statistics(self) -> Dict[str, int]:
         """
-        Retorna estatísticas de uso do cache.
+        Obtém estatísticas de uso do cache.
         
         Returns:
             Dicionário com estatísticas
         """
+        info = self.info()
+        
         return {
-            "hits": self.hits,
-            "misses": self.misses,
-            "sets": self.sets,
-            "hit_rate": self._calculate_hit_rate(),
-            "total_requests": self.hits + self.misses,
+            "total_keys": info.get("db0", {}).get("keys", 0),
+            "used_memory_bytes": info.get("used_memory", 0),
+            "connected_clients": info.get("connected_clients", 0),
+            "total_commands_processed": info.get("total_commands_processed", 0),
+            "keyspace_hits": info.get("keyspace_hits", 0),
+            "keyspace_misses": info.get("keyspace_misses", 0),
         }
-    
-    def _calculate_hit_rate(self) -> float:
-        """Calcula taxa de acerto do cache"""
-        total = self.hits + self.misses
-        if total == 0:
-            return 0.0
-        return (self.hits / total) * 100
 
 
-# =============================================================================
-# SPECIALIZED CACHE FUNCTIONS
-# =============================================================================
-
-def cache_vehicle_positions(
-    cache: RedisCache,
-    positions: List[Dict[str, Any]],
-    ttl: int = 300
-) -> int:
-    """
-    Cacheia posições de veículos.
-    
-    Args:
-        cache: Instância de RedisCache
-        positions: Lista de posições
-        ttl: TTL em segundos
-    
-    Returns:
-        Número de posições cacheadas
-    
-    Example:
-        >>> positions = [{"vehicle_id": "12345", "lat": -23.5, "lon": -46.6}]
-        >>> cache_vehicle_positions(cache, positions)
-    """
-    count = 0
-    
-    for position in positions:
-        vehicle_id = position.get("vehicle_id")
-        
-        if not vehicle_id:
-            continue
-        
-        key = f"vehicle:position:{vehicle_id}"
-        
-        if cache.set(key, position, ttl):
-            count += 1
-    
-    logger.info(f"Cacheadas {count} posições de veículos")
-    
-    return count
-
-
-def get_cached_positions(
-    cache: RedisCache,
-    vehicle_ids: Optional[List[str]] = None
-) -> Dict[str, Dict[str, Any]]:
-    """
-    Obtém posições cacheadas.
-    
-    Args:
-        cache: Instância de RedisCache
-        vehicle_ids: Lista de IDs (None = todos)
-    
-    Returns:
-        Dicionário {vehicle_id: position}
-    """
-    if vehicle_ids:
-        keys = [f"vehicle:position:{vid}" for vid in vehicle_ids]
-    else:
-        keys = cache.get_keys("vehicle:position:*")
-    
-    positions = {}
-    
-    for key in keys:
-        value = cache.get(key)
-        if value:
-            vehicle_id = key.split(":")[-1]
-            positions[vehicle_id] = value
-    
-    logger.debug(f"Obtidas {len(positions)} posições do cache")
-    
-    return positions
-
-
-def cache_route_info(
-    cache: RedisCache,
-    route_code: str,
-    route_info: Dict[str, Any],
-    ttl: int = 3600  # 1 hora
+def cache_kpis(
+    kpis: Dict[str, Any],
+    ttl_minutes: int = 60,
+    prefix: str = "kpi"
 ) -> bool:
     """
-    Cacheia informações de rota.
+    Função utilitária para cachear KPIs.
     
     Args:
-        cache: Instância de RedisCache
-        route_code: Código da rota
-        route_info: Informações da rota
-        ttl: TTL em segundos
-    
+        kpis: Dicionário com KPIs
+        ttl_minutes: TTL em minutos
+        prefix: Prefixo para as chaves
+        
     Returns:
         True se sucesso
     """
-    key = f"route:info:{route_code}"
-    return cache.set(key, route_info, ttl)
+    cache = RedisCache()
+    
+    # Adicionar timestamp
+    kpis["cached_at"] = datetime.now().isoformat()
+    
+    # Construir chaves
+    cache_data = {}
+    for kpi_name, kpi_value in kpis.items():
+        key = f"{prefix}:{kpi_name}"
+        cache_data[key] = kpi_value
+    
+    # Cachear
+    return cache.set_multiple(cache_data, ttl_seconds=ttl_minutes * 60)
 
 
-def get_cached_route_info(
-    cache: RedisCache,
-    route_code: str
-) -> Optional[Dict[str, Any]]:
-    """Obtém informações de rota do cache"""
-    key = f"route:info:{route_code}"
+def get_cached_kpi(kpi_name: str, prefix: str = "kpi") -> Optional[Any]:
+    """
+    Obtém um KPI do cache.
+    
+    Args:
+        kpi_name: Nome do KPI
+        prefix: Prefixo das chaves
+        
+    Returns:
+        Valor do KPI ou None
+    """
+    cache = RedisCache()
+    key = f"{prefix}:{kpi_name}"
     return cache.get(key)
 
 
-# =============================================================================
-# FACTORY FUNCTION
-# =============================================================================
-
-def create_redis_cache(
-    host: Optional[str] = None,
-    port: Optional[int] = None,
-    db: Optional[int] = None,
-    **kwargs
-) -> RedisCache:
+def cache_vehicle_positions(
+    vehicle_positions: List[Dict],
+    ttl_seconds: int = 180
+) -> bool:
     """
-    Factory function para criar RedisCache.
+    Cacheia posições de veículos (dados em tempo real).
     
     Args:
-        host: Host do Redis (default: env REDIS_HOST)
-        port: Porta (default: env REDIS_PORT)
-        db: Database (default: 0)
-        **kwargs: Configurações adicionais
-    
+        vehicle_positions: Lista de posições
+        ttl_seconds: TTL em segundos (3 minutos padrão)
+        
     Returns:
-        RedisCache configurado
-    
-    Example:
-        >>> cache = create_redis_cache()
-        >>> cache.set("key", "value")
+        True se sucesso
     """
-    import os
+    cache = RedisCache()
     
-    host = host or os.getenv("REDIS_HOST", "redis")
-    port = port or int(os.getenv("REDIS_PORT", "6379"))
-    db = db or int(os.getenv("REDIS_DB", "0"))
-    password = os.getenv("REDIS_PASSWORD")
+    # Agrupar por vehicle_id
+    cache_data = {}
+    for position in vehicle_positions:
+        vehicle_id = position.get("vehicle_id")
+        if vehicle_id:
+            key = f"vehicle:position:{vehicle_id}"
+            cache_data[key] = position
     
-    return RedisCache(
-        host=host,
-        port=port,
-        db=db,
-        password=password,
-        config=kwargs
-    )
-
-
-# =============================================================================
-# MAIN (para testes)
-# =============================================================================
-
-def main():
-    """Função main para testes"""
-    
-    try:
-        # Criar cache
-        cache = create_redis_cache()
-        
-        logger.info("=== Testando Redis Cache ===")
-        
-        # Test 1: Set/Get
-        logger.info("\n1. Test SET/GET")
-        cache.set("test:key", {"data": "value"}, ttl=60)
-        value = cache.get("test:key")
-        logger.info(f"Value: {value}")
-        
-        # Test 2: Posições
-        logger.info("\n2. Test Vehicle Positions")
-        positions = [
-            {"vehicle_id": "12345", "latitude": -23.5, "longitude": -46.6},
-            {"vehicle_id": "67890", "latitude": -23.6, "longitude": -46.7},
-        ]
-        cache_vehicle_positions(cache, positions)
-        
-        cached = get_cached_positions(cache, ["12345", "67890"])
-        logger.info(f"Cached positions: {len(cached)}")
-        
-        # Test 3: Info
-        logger.info("\n3. Redis Info")
-        info = cache.info()
-        logger.info(f"Keys: {info['keys_count']}")
-        logger.info(f"Memory: {info['memory_used_mb']:.2f} MB")
-        
-        # Test 4: Stats
-        logger.info("\n4. Cache Stats")
-        stats = cache.get_stats()
-        logger.info(f"Hit rate: {stats['hit_rate']:.1f}%")
-        
-        logger.info("\n✓ Testes concluídos")
-    
-    except Exception as e:
-        logger.error(f"Erro nos testes: {e}", exc_info=True)
-
-
-if __name__ == "__main__":
-    main()
-
-# =============================================================================
-# END
-# =============================================================================
+    return cache.set_multiple(cache_data, ttl_seconds=ttl_seconds)
