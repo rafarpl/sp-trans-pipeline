@@ -1,0 +1,15 @@
+dashboard_title: SPTrans KPIs
+charts:
+- name: Velocidade Média por Linha
+  datasource: gold_kpi_operational
+  viz_type: line
+  metrics:
+  - avg_speed
+  groupby:
+  - route_id
+- name: Ônibus Ativos
+  datasource: silver_positions
+  viz_type: big_number_total
+  metrics:
+  - count_distinct(vehicle_id)
+refresh_frequency: 120
