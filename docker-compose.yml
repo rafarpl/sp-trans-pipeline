@@ -287,6 +287,7 @@ services:
     volumes:
       - superset_data:/app/superset_home
       - ./config/superset:/app/pythonpath
+      - ./dashboards:/app/dashboards
     networks:
       - sptrans-network
     command: >
@@ -343,6 +344,7 @@ services:
       - grafana_data:/var/lib/grafana
       - ./config/grafana/provisioning:/etc/grafana/provisioning
       - ./config/grafana/dashboards:/var/lib/grafana/dashboards
+      - ./dashboards:/var/lib/grafana/dashboards
     ports:
       - "3000:3000"
     networks:

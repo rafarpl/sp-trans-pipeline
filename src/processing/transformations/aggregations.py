@@ -267,6 +267,51 @@ def calculate_system_summary(
         F.avg("data_quality_score").alias("system_data_quality")
     )
     
+def calculate_gtfs_enriched_kpis(
+    df_positions: DataFrame,
+    df_routes: DataFrame,
+    df_trips: DataFrame,
+    df_stop_times: DataFrame
+) -> DataFrame:
+    """
+    Calcula KPIs enriquecidos com dados do GTFS (rotas, viagens, horários).
+    
+    Integra dados de posição em tempo quase real com dados estáticos GTFS,
+    permitindo análises mais completas de pontualidade, tempo médio de viagem
+    e cobertura de frota.
+    """
+    logger.info("Calculando KPIs enriquecidos com GTFS...")
+
+    # Join entre posições (API) e rotas (GTFS)
+    df_joined = (
+        df_positions
+        .join(df_routes, "route_code", "left")
+        .join(df_trips, "trip_id", "left")
+        .join(df_stop_times, "stop_id", "left")
+    )
+
+    # Cálculo de pontualidade (diferença entre horário real e previsto)
+    df_kpis = (
+        df_joined
+        .withColumn(
+            "delay_minutes",
+            (F.unix_timestamp("timestamp") - F.unix_timestamp("arrival_time")) / 60
+        )
+        .groupBy("route_code")
+        .agg(
+            F.avg("delay_minutes").alias("avg_delay_minutes"),
+            F.countDistinct("vehicle_id").alias("active_vehicles"),
+            F.avg("speed").alias("avg_speed_kmh"),
+            F.countDistinct("trip_id").alias("total_trips"),
+            F.first("route_long_name").alias("route_name")
+        )
+        .withColumn("processing_timestamp", F.current_timestamp())
+    )
+
+    logger.info(f"KPIs enriquecidos com GTFS calculados: {df_kpis.count()} rotas")
+
+    return df_kpis
+    
     # Converter distância
     summary = summary.withColumn(
         "total_distance_km",

@@ -12,8 +12,11 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
-
+from datetime import datetime
+from src.common.pipeline_overview import generate_summary
+from src.ingestion.data_lineage_extractor import extract_lineage
 import sys
+
 sys.path.append('/opt/airflow/src')
 
 from src.common.logging_config import setup_logging
@@ -370,6 +373,26 @@ with dag:
         python_callable=generate_maintenance_report,
         provide_context=True,
     )
-    
+
+with DAG(
+    dag_id='dag_07_maintenance',
+    start_date=datetime(2025, 1, 1),
+    schedule_interval='@daily',
+    catchup=False
+) as dag:
+
+    t1 = PythonOperator(
+        task_id='generate_pipeline_summary',
+        python_callable=generate_summary
+    )
+
+    t2 = PythonOperator(
+        task_id='extract_data_lineage',
+        python_callable=extract_lineage
+    )
+
+    t1 >> t2
+
+
     # Fluxo
     [delta_group, postgres_group, cleanup_bronze] >> generate_report

@@ -120,10 +120,10 @@ jupyterlab==4.0.10
 # OPTIONAL
 # ====================
 # Kafka (se usar streaming real)
-# kafka-python==2.0.2
+ kafka-python==2.0.2
 
 # Trino (se usar para queries distribuídas)
-# trino==0.328.0
+ trino==0.328.0
 
 # ============================================================================
 # INSTALLATION INSTRUCTIONS
@@ -139,3 +139,10 @@ jupyterlab==4.0.10
 #   RUN pip install --no-cache-dir -r requirements.txt
 #
 # ============================================================================
+
+
+
+pandas
+requests
+pyyaml
+python-pptx
