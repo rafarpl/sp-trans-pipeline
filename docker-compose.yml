@@ -1,385 +1,47 @@
 version: '3.8'
 
 services:
-  # ==========================================
-  # POSTGRESQL - Data Warehouse (Serving Layer)
-  # ==========================================
+  # PostgreSQL
   postgres:
     image: postgres:15-alpine
     container_name: sptrans-postgres
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-sptrans}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sptrans123}
-      POSTGRES_DB: ${POSTGRES_DB:-sptrans}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./sql:/docker-entrypoint-initdb.d
+      POSTGRES_DB: sptrans_test
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
     ports:
       - "5432:5432"
-    networks:
-      - sptrans-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sptrans}"]
+      test: ["CMD-SHELL", "pg_isready -U test_user"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # ==========================================
-  # REDIS - Cache Layer
-  # ==========================================
+  # Redis
   redis:
     image: redis:7-alpine
     container_name: sptrans-redis
     ports:
       - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - sptrans-network
-    command: redis-server --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 5
 
-  # ==========================================
-  # MINIO - S3-Compatible Data Lake
-  # ==========================================
+  # MinIO (S3-compatible)
   minio:
     image: minio/minio:latest
     container_name: sptrans-minio
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
-    volumes:
-      - minio_data:/data
-    ports:
-      - "9000:9000"      # API
-      - "9001:9001"      # Console
-    networks:
-      - sptrans-network
     command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-
-  # MinIO Client - Create buckets on startup
-  minio-client:
-    image: minio/mc:latest
-    container_name: sptrans-minio-client
-    depends_on:
-      - minio
-    networks:
-      - sptrans-network
-    entrypoint: >
-      /bin/sh -c "
-      sleep 10;
-      mc alias set minio http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin123};
-      mc mb minio/sptrans-datalake --ignore-existing;
-      mc mb minio/spark-logs --ignore-existing;
-      mc policy set public minio/sptrans-datalake;
-      echo 'Buckets created successfully';
-      exit 0;
-      "
-
-  # ==========================================
-  # APACHE SPARK - Processing Engine
-  # ==========================================
-  spark-master:
-    image: bitnami/spark:3.5
-    container_name: sptrans-spark-master
-    environment:
-      - SPARK_MODE=master
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
-      - SPARK_MASTER_WEBUI_PORT=8080
-    ports:
-      - "7077:7077"      # Spark Master
-      - "8081:8080"      # Spark Master Web UI
-    volumes:
-      - ./src:/opt/spark-apps
-      - ./config/spark:/opt/spark/conf
-      - spark_logs:/opt/spark/logs
-    networks:
-      - sptrans-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  spark-worker-1:
-    image: bitnami/spark:3.5
-    container_name: sptrans-spark-worker-1
-    depends_on:
-      - spark-master
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=2G
-      - SPARK_WORKER_CORES=2
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
-    volumes:
-      - ./src:/opt/spark-apps
-      - ./config/spark:/opt/spark/conf
-      - spark_logs:/opt/spark/logs
-    networks:
-      - sptrans-network
-
-  spark-worker-2:
-    image: bitnami/spark:3.5
-    container_name: sptrans-spark-worker-2
-    depends_on:
-      - spark-master
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=2G
-      - SPARK_WORKER_CORES=2
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
-    volumes:
-      - ./src:/opt/spark-apps
-      - ./config/spark:/opt/spark/conf
-      - spark_logs:/opt/spark/logs
-    networks:
-      - sptrans-network
-
-  # ==========================================
-  # APACHE AIRFLOW - Orchestration
-  # ==========================================
-  airflow-webserver:
-    image: apache/airflow:2.7.3-python3.11
-    container_name: sptrans-airflow-webserver
-    depends_on:
-      - postgres
-      - redis
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-sptrans}:${POSTGRES_PASSWORD:-sptrans123}@postgres/${POSTGRES_DB:-sptrans}
-      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${POSTGRES_USER:-sptrans}:${POSTGRES_PASSWORD:-sptrans123}@postgres/${POSTGRES_DB:-sptrans}
-      - AIRFLOW__CELERY__BROKER_URL=redis://:@redis:6379/0
-      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
-      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
-      - AIRFLOW__CORE__LOAD_EXAMPLES=false
-      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
-      - AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK=true
-      - _AIRFLOW_DB_UPGRADE=true
-      - _AIRFLOW_WWW_USER_CREATE=true
-      - _AIRFLOW_WWW_USER_USERNAME=${AIRFLOW_USER:-admin}
-      - _AIRFLOW_WWW_USER_PASSWORD=${AIRFLOW_PASSWORD:-admin}
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
-      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin123}
-      - SPARK_MASTER=spark://spark-master:7077
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./src:/opt/airflow/src
-      - ./logs:/opt/airflow/logs
-      - ./config/airflow:/opt/airflow/config
-      - airflow_data:/opt/airflow
-    ports:
-      - "8080:8080"
-    networks:
-      - sptrans-network
-    command: webserver
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
+      interval: 10s
+      timeout: 5s
       retries: 5
-
-  airflow-scheduler:
-    image: apache/airflow:2.7.3-python3.11
-    container_name: sptrans-airflow-scheduler
-    depends_on:
-      - postgres
-      - redis
-      - airflow-webserver
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-sptrans}:${POSTGRES_PASSWORD:-sptrans123}@postgres/${POSTGRES_DB:-sptrans}
-      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${POSTGRES_USER:-sptrans}:${POSTGRES_PASSWORD:-sptrans123}@postgres/${POSTGRES_DB:-sptrans}
-      - AIRFLOW__CELERY__BROKER_URL=redis://:@redis:6379/0
-      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
-      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
-      - AIRFLOW__CORE__LOAD_EXAMPLES=false
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
-      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin123}
-      - SPARK_MASTER=spark://spark-master:7077
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./src:/opt/airflow/src
-      - ./logs:/opt/airflow/logs
-      - ./config/airflow:/opt/airflow/config
-      - airflow_data:/opt/airflow
-    networks:
-      - sptrans-network
-    command: scheduler
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-
-  airflow-worker:
-    image: apache/airflow:2.7.3-python3.11
-    container_name: sptrans-airflow-worker
-    depends_on:
-      - postgres
-      - redis
-      - airflow-scheduler
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-sptrans}:${POSTGRES_PASSWORD:-sptrans123}@postgres/${POSTGRES_DB:-sptrans}
-      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${POSTGRES_USER:-sptrans}:${POSTGRES_PASSWORD:-sptrans123}@postgres/${POSTGRES_DB:-sptrans}
-      - AIRFLOW__CELERY__BROKER_URL=redis://:@redis:6379/0
-      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
-      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin123}
-      - SPARK_MASTER=spark://spark-master:7077
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./src:/opt/airflow/src
-      - ./logs:/opt/airflow/logs
-      - ./config/airflow:/opt/airflow/config
-      - airflow_data:/opt/airflow
-    networks:
-      - sptrans-network
-    command: celery worker
-    healthcheck:
-      test: ["CMD-SHELL", "celery --app airflow.executors.celery_executor.app inspect ping -d celery@$$HOSTNAME"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-
-  # ==========================================
-  # APACHE SUPERSET - Business Intelligence
-  # ==========================================
-  superset:
-    image: apache/superset:latest
-    container_name: sptrans-superset
-    depends_on:
-      - postgres
-      - redis
-    environment:
-      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY:-changeme}
-      - DATABASE_DB=${POSTGRES_DB:-sptrans}
-      - DATABASE_HOST=postgres
-      - DATABASE_PASSWORD=${POSTGRES_PASSWORD:-sptrans123}
-      - DATABASE_USER=${POSTGRES_USER:-sptrans}
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-    ports:
-      - "8088:8088"
-    volumes:
-      - superset_data:/app/superset_home
-      - ./config/superset:/app/pythonpath
-      - ./dashboards:/app/dashboards
-    networks:
-      - sptrans-network
-    command: >
-      bash -c "
-      superset db upgrade &&
-      superset fab create-admin --username admin --firstname Admin --lastname User --email admin@sptrans.com --password admin &&
-      superset init &&
-      gunicorn --bind 0.0.0.0:8088 --workers 4 --timeout 120 --limit-request-line 0 --limit-request-field_size 0 'superset.app:create_app()'
-      "
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # ==========================================
-  # PROMETHEUS - Metrics Collection
-  # ==========================================
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: sptrans-prometheus
-    volumes:
-      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
-    ports:
-      - "9090:9090"
-    networks:
-      - sptrans-network
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--web.enable-lifecycle'
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # ==========================================
-  # GRAFANA - Metrics Visualization
-  # ==========================================
-  grafana:
-    image: grafana/grafana:latest
-    container_name: sptrans-grafana
-    depends_on:
-      - prometheus
-    environment:
-      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
-      - GF_INSTALL_PLUGINS=grafana-clock-panel
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./config/grafana/provisioning:/etc/grafana/provisioning
-      - ./config/grafana/dashboards:/var/lib/grafana/dashboards
-      - ./dashboards:/var/lib/grafana/dashboards
-    ports:
-      - "3000:3000"
-    networks:
-      - sptrans-network
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-# ==========================================
-# NETWORKS
-# ==========================================
-networks:
-  sptrans-network:
-    driver: bridge
-    name: sptrans-network
-
-# ==========================================
-# VOLUMES
-# ==========================================
-volumes:
-  postgres_data:
-    name: sptrans-postgres-data
-  redis_data:
-    name: sptrans-redis-data
-  minio_data:
-    name: sptrans-minio-data
-  spark_logs:
-    name: sptrans-spark-logs
-  airflow_data:
-    name: sptrans-airflow-data
-  superset_data:
-    name: sptrans-superset-data
-  prometheus_data:
-    name: sptrans-prometheus-data
-  grafana_data:
-    name: sptrans-grafana-data
