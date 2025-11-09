@@ -45,3 +45,27 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  #Graphana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: sptrans-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - postgres
+    networks:
+      - sptrans-network
+
+
+volumes:
+  postgres-data:
+  minio-data:
+  redis-data:
+  grafana-data:  
