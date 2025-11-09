@@ -628,3 +628,138 @@ if __name__ == "__main__":
     )
 
     print(results)
+"""
+Funções de validação simples (para testes unitários).
+Adicionadas ao validators.py existente.
+"""
+
+from datetime import datetime, timedelta
+from typing import Optional
+
+
+# =============================================================================
+# Simple Validators (para testes unitários)
+# =============================================================================
+
+def validate_coordinates(lat: float, lon: float) -> bool:
+    """
+    Valida coordenadas individuais (versão simples).
+    
+    Args:
+        lat: Latitude
+        lon: Longitude
+        
+    Returns:
+        True se válido, False caso contrário
+    """
+    try:
+        # Importar constantes do próprio módulo
+        from .constants import DQ_LATITUDE_RANGE, DQ_LONGITUDE_RANGE
+        
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            return False
+        
+        lat_min, lat_max = DQ_LATITUDE_RANGE
+        lon_min, lon_max = DQ_LONGITUDE_RANGE
+        
+        if not (lat_min <= lat <= lat_max):
+            return False
+        
+        if not (lon_min <= lon <= lon_max):
+            return False
+        
+        return True
+    
+    except Exception:
+        return False
+
+
+def validate_speed(
+    speed: Optional[float],
+    min_speed: float = 0.0,
+    max_speed: float = 120.0
+) -> bool:
+    """
+    Valida velocidade individual (versão simples).
+    
+    Args:
+        speed: Velocidade em km/h
+        min_speed: Velocidade mínima
+        max_speed: Velocidade máxima
+        
+    Returns:
+        True se válido, False caso contrário
+    """
+    try:
+        if speed is None:
+            return False
+        
+        if not isinstance(speed, (int, float)):
+            return False
+        
+        return min_speed <= speed <= max_speed
+    
+    except Exception:
+        return False
+
+
+def validate_timestamp(
+    timestamp: datetime,
+    max_age_hours: int = 24,
+    max_future_hours: int = 1
+) -> bool:
+    """
+    Valida timestamp individual (versão simples).
+    
+    Args:
+        timestamp: Timestamp a validar
+        max_age_hours: Máximo de horas no passado
+        max_future_hours: Máximo de horas no futuro
+        
+    Returns:
+        True se válido, False caso contrário
+    """
+    try:
+        if not isinstance(timestamp, datetime):
+            return False
+        
+        now = datetime.now()
+        max_age = timedelta(hours=max_age_hours)
+        max_future = timedelta(hours=max_future_hours)
+        
+        if timestamp < (now - max_age):
+            return False
+        
+        if timestamp > (now + max_future):
+            return False
+        
+        return True
+    
+    except Exception:
+        return False
+
+
+def validate_vehicle_id(vehicle_id: Optional[str]) -> bool:
+    """
+    Valida ID de veículo (versão simples).
+    
+    Args:
+        vehicle_id: ID do veículo
+        
+    Returns:
+        True se válido, False caso contrário
+    """
+    try:
+        if not vehicle_id:
+            return False
+        
+        if not isinstance(vehicle_id, str):
+            return False
+        
+        if not vehicle_id.strip():
+            return False
+        
+        return True
+    
+    except Exception:
+        return False

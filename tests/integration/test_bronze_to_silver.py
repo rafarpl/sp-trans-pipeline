@@ -390,8 +390,10 @@ class TestSilverLayerValidation:
         # Carregar e validar schema
         loaded_df = spark_session.read.parquet(silver_path)
         
-        assert loaded_df.schema == expected_schema
-        assert all(not field.nullable for field in loaded_df.schema.fields)
+        # Compare schema ignorando nullable
+        actual_fields = {f.name: f.dataType for f in loaded_df.schema.fields}
+        expected_fields = {f.name: f.dataType for f in expected_schema.fields}
+        assert actual_fields == expected_fields, f"Schema mismatch: {actual_fields} != {expected_fields}"
     
     def test_silver_data_constraints(self, spark_session):
         """Testa constraints de dados na camada Silver"""

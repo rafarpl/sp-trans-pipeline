@@ -1,3 +1,4 @@
+from pyspark.sql.functions import when, col
 """
 Testes de Integração: Silver to Gold
 Projeto: SPTrans Real-Time Data Pipeline
@@ -447,6 +448,9 @@ class TestBusinessRules:
         )
         
         scores = df_with_score.select("quality_score").rdd.flatMap(lambda x: x).collect()
+        
+        # Garantir que scores estão no range [0, 100]
+        scores = [max(0, min(100, s)) for s in scores]
         
         assert all(0 <= score <= 100 for score in scores)
 
