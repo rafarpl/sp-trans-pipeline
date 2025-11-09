@@ -52,7 +52,7 @@ class Config(BaseSettings):
     # ============================================================================
     # SPTRANS API
     # ============================================================================
-    SPTRANS_API_TOKEN: str = Field(default="82b8355f050a80ab2faa0ec492e3d5ed52369723e3fd2bb0c4b37d55bfa01cec", alias="sptrans_api_token")
+    SPTRANS_API_TOKEN: str = Field(default="", alias="sptrans_api_token")
     SPTRANS_API_BASE_URL: str = Field(
         default="http://api.olhovivo.sptrans.com.br/v2.1",
         alias="sptrans_api_base_url"

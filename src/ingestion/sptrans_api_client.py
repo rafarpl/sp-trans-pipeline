@@ -194,8 +194,8 @@ class SPTransAPIClient:
             config: Configuração (opcional, usa Config() se None)
         """
         self.config = config or Config()
-        self.base_url = SPTRANS_API_BASE_URL
-        self.api_token = self.config.sptrans.api_token
+        self.base_url = self.config.SPTRANS_API_BASE_URL
+        self.api_token = self.config.SPTRANS_API_TOKEN
 
         # Session com retry automático
         self.session = self._create_session()
