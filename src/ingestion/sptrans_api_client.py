@@ -141,7 +141,7 @@ class SPTransAPIClient:
                                 'latitude': float(vehicle.get('py', 0)),
                                 'longitude': float(vehicle.get('px', 0)),
                                 'timestamp': datetime.now(),
-                                'speed': None,  # API não retorna velocidade
+                                'speed': 0.0,  # API não retorna velocidade
                                 'route_id': line_id
                             })
                 
