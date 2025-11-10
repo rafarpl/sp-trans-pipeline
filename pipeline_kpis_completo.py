@@ -9,6 +9,7 @@ sys.path.insert(0, '/workspaces/sp-trans-pipeline')
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType
 from pyspark.sql.window import Window
 from datetime import datetime, timedelta
 import time
@@ -135,7 +136,18 @@ def run_iteration(spark):
     
     # 2. Bronze
     print("\n📦 [2/6] Camada Bronze...")
-    df_bronze = spark.createDataFrame(positions)
+    # Schema explícito para evitar erro de inferência
+    schema = StructType([
+        StructField("vehicle_id", StringType(), True),
+        StructField("line_id", StringType(), True),
+        StructField("latitude", DoubleType(), True),
+        StructField("longitude", DoubleType(), True),
+        StructField("timestamp", TimestampType(), True),
+        StructField("speed", DoubleType(), True),
+        StructField("route_id", StringType(), True)
+    ])
+    
+    df_bronze = spark.createDataFrame(positions, schema=schema)
     print(f"   ✅ Bronze: {df_bronze.count()} registros")
     
     # 3. Silver - Validação
