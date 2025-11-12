@@ -10,6 +10,7 @@ sys.path.insert(0, '/workspaces/sp-trans-pipeline')
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType
+from math import radians, sin, cos, sqrt, atan2
 from pyspark.sql.window import Window
 from datetime import datetime, timedelta
 import time
@@ -34,18 +35,60 @@ POSTGRES_PASSWORD = "test_password"
 iteration = 0
 
 def init_spark():
-    """Inicializar Spark"""
+    """Inicializar Spark Session"""
     spark = SparkSession.builder \
         .appName("SPTrans-KPI-Pipeline") \
         .master("local[2]") \
         .config("spark.ui.enabled", "false") \
         .config("spark.sql.shuffle.partitions", "4") \
         .config("spark.jars", "/usr/local/lib/postgresql-42.7.1.jar") \
+        .config("spark.driver.extraClassPath", "/usr/local/lib/postgresql-42.7.1.jar") \
+        .config("spark.executor.extraClassPath", "/usr/local/lib/postgresql-42.7.1.jar") \
         .getOrCreate()
     
     spark.sparkContext.setLogLevel("WARN")
     print("✅ Spark iniciado")
     return spark
+
+def calculate_speed(lat1, lon1, lat2, lon2, time_diff_seconds):
+    """
+    Calcula velocidade entre dois pontos GPS
+    
+    Args:
+        lat1, lon1: Coordenadas do ponto 1
+        lat2, lon2: Coordenadas do ponto 2  
+        time_diff_seconds: Diferença de tempo em segundos
+        
+    Returns:
+        Velocidade em km/h
+    """
+    if time_diff_seconds == 0:
+        return 0.0
+    
+    # Raio da Terra em km
+    R = 6371.0
+    
+    # Converter para radianos
+    lat1_rad = radians(lat1)
+    lon1_rad = radians(lon1)
+    lat2_rad = radians(lat2)
+    lon2_rad = radians(lon2)
+    
+    # Diferenças
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    
+    # Fórmula de Haversine
+    a = sin(dlat / 2)**2 + cos(lat1_rad) * cos(lat2_rad) * sin(dlon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    
+    # Distância em km
+    distance_km = R * c
+    
+    # Velocidade em km/h
+    speed_kmh = (distance_km / time_diff_seconds) * 3600
+    
+    return round(speed_kmh, 2)
 
 def fetch_api_data():
     """Buscar dados da API SPTrans"""
@@ -150,17 +193,91 @@ def run_iteration(spark):
     df_bronze = spark.createDataFrame(positions, schema=schema)
     print(f"   ✅ Bronze: {df_bronze.count()} registros")
     
-    # 3. Silver - Validação
+    # 3. Silver - Validação e Cálculo de Velocidade
     print("\n🔹 [3/6] Camada Silver...")
+
+    # Validar dados
     df_silver = df_bronze.filter(
         (F.col("latitude").between(-24.0, -23.0)) &
-        (F.col("longitude").between(-47.0, -46.0)) &
-        (F.col("speed") >= 0) &
-        (F.col("speed") <= 120)
+        (F.col("longitude").between(-47.0, -46.0))
     ).dropDuplicates(["vehicle_id", "timestamp"])
-    
+
+    # Ler posições anteriores do PostgreSQL
+    try:
+        df_previous = spark.read \
+            .format("jdbc") \
+            .option("url", POSTGRES_URL) \
+            .option("dbtable", "serving.vehicle_positions_latest") \
+            .option("user", POSTGRES_USER) \
+            .option("password", POSTGRES_PASSWORD) \
+            .option("driver", "org.postgresql.Driver") \
+            .load() \
+            .select(
+                F.col("vehicle_id").alias("prev_vehicle_id"),
+                F.col("latitude").alias("prev_lat"),
+                F.col("longitude").alias("prev_lon"),
+                F.col("timestamp").alias("prev_time")
+            )
+        
+        prev_count = df_previous.count()
+        print(f"   📊 Posições anteriores: {prev_count} veículos")
+        
+        # Join com posições anteriores
+        df_with_prev = df_silver.join(
+            df_previous,
+            df_silver.vehicle_id == df_previous.prev_vehicle_id,
+            "left"
+        )
+        
+        # UDF para calcular velocidade
+        def calc_speed_udf(lat1, lon1, lat2, lon2, time1, time2):
+            if lat1 is None or lat2 is None or time1 is None or time2 is None:
+                return 0.0
+            
+            time_diff = (time2 - time1).total_seconds()
+            
+            if time_diff <= 0 or time_diff > 600:  # Ignorar se > 10 min
+                return 0.0
+            
+            return calculate_speed(lat1, lon1, lat2, lon2, time_diff)
+        
+        speed_udf = F.udf(calc_speed_udf, DoubleType())
+        
+        # Calcular velocidade
+        df_silver = df_with_prev.withColumn(
+            "calculated_speed",
+            speed_udf("prev_lat", "prev_lon", "latitude", "longitude", "prev_time", "timestamp")
+        )
+        
+        # Limitar velocidade
+        df_silver = df_silver.withColumn(
+            "speed",
+            F.when(F.col("calculated_speed") > 100, 0.0)
+            .when(F.col("calculated_speed") < 0, 0.0)
+            .otherwise(F.col("calculated_speed"))
+        )
+        
+        # Remover colunas auxiliares
+        df_silver = df_silver.select(
+            "vehicle_id", "line_id", "latitude", "longitude", 
+            "timestamp", "speed", "route_id"
+        )
+        
+        # Debug
+        speed_count = df_silver.filter(F.col("speed") > 0).count()
+        avg_speed = df_silver.filter(F.col("speed") > 0).agg(F.avg("speed")).collect()[0][0]
+        if avg_speed:
+            print(f"   🔍 Veículos com velocidade > 0: {speed_count} (média: {avg_speed:.1f} km/h)")
+        else:
+            print(f"   🔍 Veículos com velocidade > 0: 0")
+        
+    except Exception as e:
+        print(f"   ⚠️  Primeira iteração ou erro: {e}")
+        # Se não tem histórico, manter speed = 0
+        df_silver = df_silver.withColumn("speed", F.lit(0.0))
+
     silver_count = df_silver.count()
-    print(f"   ✅ Silver: {silver_count} registros válidos")
+    print(f"   ✅ Silver: {silver_count} registros processados")
     
     # 4. KPIs
     print("\n📊 [4/6] Calculando KPIs...")
