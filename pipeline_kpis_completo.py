@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SPTrans Pipeline - KPIs Completos para Grafana
-Atualiza a cada 3 minutos com todos os KPIs viáveis
+Atualiza a cada 2 minutos com todos os KPIs viáveis
 """
 
 import sys
@@ -10,6 +10,7 @@ sys.path.insert(0, '/workspaces/sp-trans-pipeline')
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType
+from math import radians, sin, cos, sqrt, atan2
 from pyspark.sql.window import Window
 from datetime import datetime, timedelta
 import time
@@ -21,7 +22,7 @@ print("""
 ║     🚌  SPTrans KPI Pipeline para Grafana                ║
 ║                                                           ║
 ║     Pipeline completo com todos os KPIs viáveis          ║
-║     Atualização automática a cada 3 minutos              ║
+║     Atualização automática a cada 2 minutos              ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
 """)
@@ -34,18 +35,74 @@ POSTGRES_PASSWORD = "test_password"
 iteration = 0
 
 def init_spark():
-    """Inicializar Spark"""
+    """Inicializar Spark Session com suporte a MinIO"""
+    
+    # Lista de JARs
+    jars = [
+        "/usr/local/lib/postgresql-42.7.1.jar",
+        "/usr/local/lib/hadoop-aws-3.3.4.jar",
+        "/usr/local/lib/aws-java-sdk-bundle-1.12.262.jar"
+    ]
+    
     spark = SparkSession.builder \
         .appName("SPTrans-KPI-Pipeline") \
         .master("local[2]") \
         .config("spark.ui.enabled", "false") \
         .config("spark.sql.shuffle.partitions", "4") \
-        .config("spark.jars", "/usr/local/lib/postgresql-42.7.1.jar") \
+        .config("spark.jars", ",".join(jars)) \
+        .config("spark.driver.extraClassPath", ":".join(jars)) \
+        .config("spark.executor.extraClassPath", ":".join(jars)) \
+        .config("spark.hadoop.fs.s3a.endpoint", "http://localhost:9000") \
+        .config("spark.hadoop.fs.s3a.access.key", "minioadmin") \
+        .config("spark.hadoop.fs.s3a.secret.key", "minioadmin") \
+        .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
         .getOrCreate()
     
     spark.sparkContext.setLogLevel("WARN")
-    print("✅ Spark iniciado")
+    print("✅ Spark iniciado com Data Lake (MinIO)")
     return spark
+
+def calculate_speed(lat1, lon1, lat2, lon2, time_diff_seconds):
+    """
+    Calcula velocidade entre dois pontos GPS
+    
+    Args:
+        lat1, lon1: Coordenadas do ponto 1
+        lat2, lon2: Coordenadas do ponto 2  
+        time_diff_seconds: Diferença de tempo em segundos
+        
+    Returns:
+        Velocidade em km/h
+    """
+    if time_diff_seconds == 0:
+        return 0.0
+    
+    # Raio da Terra em km
+    R = 6371.0
+    
+    # Converter para radianos
+    lat1_rad = radians(lat1)
+    lon1_rad = radians(lon1)
+    lat2_rad = radians(lat2)
+    lon2_rad = radians(lon2)
+    
+    # Diferenças
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    
+    # Fórmula de Haversine
+    a = sin(dlat / 2)**2 + cos(lat1_rad) * cos(lat2_rad) * sin(dlon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    
+    # Distância em km
+    distance_km = R * c
+    
+    # Velocidade em km/h
+    speed_kmh = (distance_km / time_diff_seconds) * 3600
+    
+    return round(speed_kmh, 2)
 
 def fetch_api_data():
     """Buscar dados da API SPTrans"""
@@ -113,6 +170,42 @@ def write_to_postgres(spark, df, table_name, mode="append"):
     except Exception as e:
         print(f"   ❌ Erro ao salvar {table_name}: {e}")
 
+def save_to_datalake(df, layer, table_name, partition_cols=None):
+    """
+    Salvar dados no Data Lake (MinIO)
+    
+    Args:
+        df: DataFrame Spark
+        layer: bronze, silver, gold
+        table_name: nome da tabela
+        partition_cols: lista de colunas para particionar
+    """
+    try:
+        current_time = datetime.now()
+        
+        # Path no formato: s3a://bucket/layer/table/year=YYYY/month=MM/day=DD/hour=HH/
+        base_path = f"s3a://sptrans-datalake/{layer}/{table_name}"
+        
+        # Adicionar colunas de partição
+        df_to_save = df.withColumn("year", F.year(F.col("timestamp"))) \
+                       .withColumn("month", F.month(F.col("timestamp"))) \
+                       .withColumn("day", F.dayofmonth(F.col("timestamp"))) \
+                       .withColumn("hour", F.hour(F.col("timestamp")))
+        
+        # Salvar como Parquet particionado
+        df_to_save.write \
+            .format("parquet") \
+            .mode("append") \
+            .partitionBy("year", "month", "day", "hour") \
+            .option("compression", "snappy") \
+            .save(base_path)
+        
+        record_count = df.count()
+        print(f"   💾 Data Lake ({layer}): {record_count} registros salvos em {base_path}")
+        
+    except Exception as e:
+        print(f"   ⚠️  Erro ao salvar no Data Lake: {e}")
+
 def run_iteration(spark):
     """Executar uma iteração completa"""
     global iteration
@@ -149,18 +242,94 @@ def run_iteration(spark):
     
     df_bronze = spark.createDataFrame(positions, schema=schema)
     print(f"   ✅ Bronze: {df_bronze.count()} registros")
-    
-    # 3. Silver - Validação
+    save_to_datalake(df_bronze, "bronze", "vehicle_positions")
+
+    # 3. Silver - Validação e Cálculo de Velocidade
     print("\n🔹 [3/6] Camada Silver...")
+
+    # Validar dados
     df_silver = df_bronze.filter(
         (F.col("latitude").between(-24.0, -23.0)) &
-        (F.col("longitude").between(-47.0, -46.0)) &
-        (F.col("speed") >= 0) &
-        (F.col("speed") <= 120)
+        (F.col("longitude").between(-47.0, -46.0))
     ).dropDuplicates(["vehicle_id", "timestamp"])
-    
+
+    # Ler posições anteriores do PostgreSQL
+    try:
+        df_previous = spark.read \
+            .format("jdbc") \
+            .option("url", POSTGRES_URL) \
+            .option("dbtable", "serving.vehicle_positions_latest") \
+            .option("user", POSTGRES_USER) \
+            .option("password", POSTGRES_PASSWORD) \
+            .option("driver", "org.postgresql.Driver") \
+            .load() \
+            .select(
+                F.col("vehicle_id").alias("prev_vehicle_id"),
+                F.col("latitude").alias("prev_lat"),
+                F.col("longitude").alias("prev_lon"),
+                F.col("timestamp").alias("prev_time")
+            )
+        
+        prev_count = df_previous.count()
+        print(f"   📊 Posições anteriores: {prev_count} veículos")
+        
+        # Join com posições anteriores
+        df_with_prev = df_silver.join(
+            df_previous,
+            df_silver.vehicle_id == df_previous.prev_vehicle_id,
+            "left"
+        )
+        
+        # UDF para calcular velocidade
+        def calc_speed_udf(lat1, lon1, lat2, lon2, time1, time2):
+            if lat1 is None or lat2 is None or time1 is None or time2 is None:
+                return 0.0
+            
+            time_diff = (time2 - time1).total_seconds()
+            
+            if time_diff <= 0 or time_diff > 600:  # Ignorar se > 10 min
+                return 0.0
+            
+            return calculate_speed(lat1, lon1, lat2, lon2, time_diff)
+        
+        speed_udf = F.udf(calc_speed_udf, DoubleType())
+        
+        # Calcular velocidade
+        df_silver = df_with_prev.withColumn(
+            "calculated_speed",
+            speed_udf("prev_lat", "prev_lon", "latitude", "longitude", "prev_time", "timestamp")
+        )
+        
+        # Limitar velocidade
+        df_silver = df_silver.withColumn(
+            "speed",
+            F.when(F.col("calculated_speed") > 100, 0.0)
+            .when(F.col("calculated_speed") < 0, 0.0)
+            .otherwise(F.col("calculated_speed"))
+        )
+        
+        # Remover colunas auxiliares
+        df_silver = df_silver.select(
+            "vehicle_id", "line_id", "latitude", "longitude", 
+            "timestamp", "speed", "route_id"
+        )
+        
+        # Debug
+        speed_count = df_silver.filter(F.col("speed") > 0).count()
+        avg_speed = df_silver.filter(F.col("speed") > 0).agg(F.avg("speed")).collect()[0][0]
+        if avg_speed:
+            print(f"   🔍 Veículos com velocidade > 0: {speed_count} (média: {avg_speed:.1f} km/h)")
+        else:
+            print(f"   🔍 Veículos com velocidade > 0: 0")
+        
+    except Exception as e:
+        print(f"   ⚠️  Primeira iteração ou erro: {e}")
+        # Se não tem histórico, manter speed = 0
+        df_silver = df_silver.withColumn("speed", F.lit(0.0))
+
     silver_count = df_silver.count()
-    print(f"   ✅ Silver: {silver_count} registros válidos")
+    print(f"   ✅ Silver: {silver_count} registros processados")
+    save_to_datalake(df_silver, "silver", "vehicle_positions_validated")
     
     # 4. KPIs
     print("\n📊 [4/6] Calculando KPIs...")
@@ -244,7 +413,9 @@ def run_iteration(spark):
     df_timeseries = spark.createDataFrame(timeseries_data)
     
     print(f"   ✅ KPIs calculados: {total_vehicles} veículos, {total_lines} linhas")
-    
+    save_to_datalake(df_kpi_realtime, "gold", "kpi_realtime")
+    save_to_datalake(df_kpi_by_line, "gold", "kpi_by_line")
+
     # 5. Salvar PostgreSQL
     print("\n💾 [5/6] Salvando no PostgreSQL...")
     write_to_postgres(spark, df_kpi_realtime, "kpi_realtime")
@@ -264,7 +435,7 @@ def main():
     """Loop principal"""
     
     spark = init_spark()
-    interval_seconds = 180  # 3 minutos
+    interval_seconds = 120  # 2 minutos
     
     print(f"\n🔄 Iniciando loop de atualização...")
     print(f"⏱️  Intervalo: {interval_seconds}s ({interval_seconds/60:.1f} min)")
