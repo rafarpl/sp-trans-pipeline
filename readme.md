@@ -1,521 +1,379 @@
 # 🚍 SPTrans Real-Time Data Pipeline
 
-[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
-[![PySpark](https://img.shields.io/badge/PySpark-3.5.0-orange.svg)](https://spark.apache.org/)
-[![Airflow](https://img.shields.io/badge/Airflow-2.8.0-red.svg)](https://airflow.apache.org/)
-[![Delta Lake](https://img.shields.io/badge/Delta%20Lake-3.0-green.svg)](https://delta.io/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+Pipeline de dados em tempo real para monitoramento e análise do sistema de transporte público de São Paulo, processando dados GPS de aproximadamente 15.000 ônibus da SPTrans.
 
-> **Pipeline de dados em tempo real para monitoramento e análise da frota de ônibus da SPTrans em São Paulo**
-
-Projeto de TCC - Pós-Graduação em Engenharia de Dados | FIA/LABDATA 2024
+![Dashboard Grafana](docs/dashboard-screenshot.png)
 
 ---
 
-## 📋 Índice
+## 📊 Visão Geral do Projeto
 
-- [Sobre o Projeto](#-sobre-o-projeto)
-- [Arquitetura](#-arquitetura)
-- [Features](#-features)
-- [Tecnologias](#-tecnologias)
-- [Pré-requisitos](#-pré-requisitos)
-- [Instalação](#-instalação)
-- [Uso](#-uso)
-- [KPIs e Métricas](#-kpis-e-métricas)
-- [Documentação](#-documentação)
-- [Estrutura do Projeto](#-estrutura-do-projeto)
-- [Contribuição](#-contribuição)
-- [Licença](#-licença)
-- [Autor](#-autor)
+Sistema completo de engenharia de dados que coleta, processa e visualiza dados em tempo real da API Olho Vivo da SPTrans, implementando uma arquitetura Medallion (Bronze → Silver → Gold) com processamento distribuído.
+
+### 🎯 Objetivos
+
+- Monitoramento em tempo real da frota de ônibus de São Paulo
+- Análise de performance por linha (velocidade média, cobertura, pontualidade)
+- Visualização geográfica da localização dos veículos
+- Métricas de qualidade de dados e saúde do pipeline
+- Dashboard interativo com atualização automática a cada 30 segundos
 
 ---
 
-## 🎯 Sobre o Projeto
-
-Este projeto implementa um **pipeline de dados em tempo real** para coletar, processar e analisar dados de GPS de aproximadamente **15.000 veículos** da frota de ônibus da SPTrans (São Paulo).
-
-### Objetivos
-
-- ✅ Ingestão de dados em **near real-time** (< 3 minutos)
-- ✅ Processamento distribuído com **Apache Spark**
-- ✅ Arquitetura **Medallion** (Bronze → Silver → Gold → Serving)
-- ✅ Integração com dados **GTFS** (rotas, horários, paradas)
-- ✅ Cálculo de **KPIs** de operação e qualidade de serviço
-- ✅ Dashboards interativos para monitoramento
-- ✅ 100% **Open Source**
-
-### Problema de Negócio
-
-A SPTrans disponibiliza dados de posicionamento de sua frota via API pública, mas:
-- Dados não são historicizados
-- Não há análises de qualidade de serviço
-- Falta integração com informações de rotas (GTFS)
-- Sem métricas operacionais consolidadas
-
-**Este projeto resolve** estes problemas com uma solução escalável e moderna.
-
----
-
-## 🏗️ Arquitetura
-
-### Visão Geral
-
+## 🏗️ Arquitetura do Sistema
 ```
-┌─────────────────┐
-│   DATA SOURCES  │
-├─────────────────┤
-│  SPTrans API    │──┐
-│  (15k vehicles) │  │
-│  GTFS Static    │  │
-└─────────────────┘  │
-                     │
-┌────────────────────▼──────────────────────┐
-│           INGESTION LAYER                 │
-├───────────────────────────────────────────┤
-│  • API Client (Circuit Breaker)           │
-│  • Kafka Producer (real-time streaming)   │
-│  • GTFS Downloader (batch)                │
-└────────────────────┬──────────────────────┘
-                     │
-┌────────────────────▼──────────────────────┐
-│         PROCESSING LAYER (Spark)          │
-├───────────────────────────────────────────┤
-│  BRONZE (Raw Data - MinIO)                │
-│    • vehicle_positions                     │
-│    • gtfs_static                           │
-│                                            │
-│  SILVER (Cleaned & Validated)             │
-│    • Deduplication                         │
-│    • Data Quality Checks                   │
-│    • Schema Enforcement                    │
-│                                            │
-│  GOLD (Business Logic)                    │
-│    • GTFS Integration                      │
-│    • Geocoding (reverse)                   │
-│    • Aggregations                          │
-│                                            │
-│  SERVING (PostgreSQL)                     │
-│    • Materialized Views                    │
-│    • KPI Tables                            │
-│    • Time-series Aggregates                │
-└────────────────────┬──────────────────────┘
-                     │
-┌────────────────────▼──────────────────────┐
-│         ORCHESTRATION (Airflow)           │
-├───────────────────────────────────────────┤
-│  DAG 1: GTFS Ingestion (daily)            │
-│  DAG 2: API Ingestion (every 3 min)       │
-│  DAG 3: Bronze → Silver (streaming)       │
-│  DAG 4: Silver → Gold (batch)             │
-│  DAG 5: Gold → Serving (batch)            │
-│  DAG 6: Data Quality Checks               │
-│  DAG 7: Maintenance & Optimization        │
-└────────────────────┬──────────────────────┘
-                     │
-┌────────────────────▼──────────────────────┐
-│      MONITORING & OBSERVABILITY           │
-├───────────────────────────────────────────┤
-│  • Prometheus (metrics)                    │
-│  • Grafana (dashboards)                    │
-│  • Data Quality Alerts                     │
-│  • Structured Logging                      │
-└───────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                     API SPTrans Olho Vivo                       │
+│              ~15.000 ônibus | ~1.000 linhas ativas              │
+└────────────────────────┬────────────────────────────────────────┘
+                         │ HTTP REST API
+                         │ Autenticação via Token
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   CAMADA BRONZE (Raw Data)                      │
+│                     Apache Spark (PySpark)                      │
+│                 • Ingestão via API Client                       │
+│                 • ~7.2M registros/dia                           │
+│                 • Validação básica de schema                    │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  CAMADA SILVER (Validated)                      │
+│                     Apache Spark (PySpark)                      │
+│                 • Validação de coordenadas                      │
+│                 • Cálculo de velocidade (Haversine)             │
+│                 • Deduplicação                                  │
+│                 • Limpeza de dados                              │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   CAMADA GOLD (Aggregated)                      │
+│                     Apache Spark (PySpark)                      │
+│                 • Agregações por linha                          │
+│                 • Cálculo de KPIs                               │
+│                 • Métricas de qualidade                         │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   CAMADA SERVING (Analytics)                    │
+│                        PostgreSQL 15                            │
+│                 • kpi_realtime (métricas globais)               │
+│                 • kpi_by_line (análise por linha)               │
+│                 • kpi_quality (qualidade do pipeline)           │
+│                 • vehicle_positions_latest (mapa)               │
+│                 • kpi_timeseries (séries temporais)             │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    VISUALIZAÇÃO (Dashboard)                     │
+│                         Grafana 10+                             │
+│                 • 6 painéis interativos                         │
+│                 • Mapa geográfico (OpenStreetMap)               │
+│                 • Auto-refresh 30s                              │
+│                 • Tema escuro                                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Arquitetura Medallion
+---
 
-| Layer | Descrição | Storage | Formato | Retention |
-|-------|-----------|---------|---------|-----------|
-| **Bronze** | Raw data (imutável) | MinIO (S3) | Parquet | 90 dias |
-| **Silver** | Cleaned & validated | MinIO (S3) | Delta Lake | 180 dias |
-| **Gold** | Business aggregations | MinIO (S3) | Delta Lake | 1 ano |
-| **Serving** | Materialized views | PostgreSQL | Tables/Views | Indefinido |
+## 🚀 Tecnologias Utilizadas
+
+### **Processamento de Dados**
+- **Apache Spark 3.5** - Processamento distribuído
+- **PySpark** - Interface Python para Spark
+- **Delta Lake** - Armazenamento ACID
+
+### **Armazenamento**
+- **PostgreSQL 15** - Banco de dados relacional (camada serving)
+- **MinIO** - Object storage S3-compatible (data lake)
+- **Redis** - Cache e fila de mensagens
+
+### **Orquestração & DevOps**
+- **Docker Compose** - Containerização
+- **GitHub Actions** - CI/CD (planejado)
+
+### **Visualização**
+- **Grafana** - Dashboards interativos
+- **OpenStreetMap** - Mapas geográficos
+
+### **Linguagens & Frameworks**
+- **Python 3.12**
+- **Pydantic** - Validação de configurações
+- **Requests** - Cliente HTTP
 
 ---
 
-## ✨ Features
+## 📊 KPIs e Métricas Implementadas
 
-### Ingestão de Dados
-- ✅ **API SPTrans**: Polling a cada 3 minutos (15.000 veículos)
-- ✅ **Circuit Breaker**: Proteção contra falhas de API
-- ✅ **Kafka Streaming**: Ingestão em tempo real
-- ✅ **GTFS Integration**: Download automático de rotas e horários
+### **Operacionais (Tempo Real)**
+- 🚌 **Veículos Ativos**: Quantidade total de ônibus transmitindo posição
+- 📍 **Linhas Ativas**: Número de linhas com veículos operando
+- 📡 **Cobertura**: Percentual de linhas cobertas vs total da rede (~400 linhas)
+- ⏱️ **Staleness**: Percentual de veículos com dados desatualizados (>4 min)
 
-### Processamento
-- ✅ **Spark Streaming**: Processamento incremental
-- ✅ **Delta Lake**: ACID transactions + time travel
-- ✅ **Data Quality**: Great Expectations + Pandera
-- ✅ **Deduplication**: Remoção de duplicatas
-- ✅ **Enrichment**: Geocoding reverso + integração GTFS
+### **Por Linha**
+- 🚌 **Frota Ativa**: Quantidade de veículos por linha
+- 🏃 **Velocidade Média**: Calculada via fórmula de Haversine entre capturas
+- 📈 **Velocidade Máxima/Mínima**: Extremos de velocidade
+- 📊 **Distribuição de Velocidade**: Faixas 0-20, 20-40, 40-60, 60+ km/h
 
-### KPIs Calculados
-- 📊 **Cobertura da Frota**: % veículos em operação
-- 🚌 **Frota Ativa**: Veículos transmitindo
-- ⏱️ **Velocidade Média**: Por linha e período
-- 📍 **Headway**: Intervalo entre veículos
-- 🚦 **Pontualidade**: Desvio vs horário programado
-- 🗺️ **Heatmaps**: Concentração de veículos
-
-### Observabilidade
-- 📈 **Prometheus**: Métricas técnicas
-- 📊 **Grafana**: 4 dashboards (pipeline, DQ, business, system)
-- 🔔 **Alertas**: Slack/Email para anomalias
-- 📝 **Logs Estruturados**: JSON + níveis de severidade
+### **Qualidade de Dados**
+- ✅ **Taxa de Validação**: % de registros que passam nas validações
+- 📦 **Registros Processados**: Volume de dados por iteração
+- ⏱️ **Tempo de Execução**: Duração do processamento
+- 🔄 **Status do Pipeline**: Saúde operacional
 
 ---
 
-## 🛠️ Tecnologias
+## 🗺️ Funcionalidades do Dashboard
 
-### Core Stack
-| Tecnologia | Versão | Uso |
-|------------|--------|-----|
-| **Python** | 3.9+ | Linguagem principal |
-| **Apache Spark** | 3.5.0 | Processamento distribuído |
-| **Delta Lake** | 3.0.0 | Data lakehouse |
-| **Apache Kafka** | 3.6 | Streaming real-time |
-| **PostgreSQL** | 15 | Serving layer |
-| **MinIO** | RELEASE.2024 | Object storage (S3-compatible) |
-| **Apache Airflow** | 2.8.0 | Orquestração |
+### **Painel 1: Visão Operacional**
+- Métricas principais (cards com indicadores visuais)
+- Série temporal de veículos ativos (últimas 2 horas)
+- Gráfico de linhas com maior frota
 
-### Monitoring & DevOps
-- **Prometheus** (2.48+): Métricas
-- **Grafana** (10.2+): Visualização
-- **Docker** + **Docker Compose**: Containerização
-- **Kubernetes** (opcional): Deployment
-- **Terraform** (opcional): IaC
+### **Painel 2: Análise por Linha**
+- Top 10 linhas mais ativas (gráfico de barras)
+- Tabela detalhada com velocidade média por linha
+- Filtros interativos por linha e período
 
-### Libraries Python
-- **pyspark**: Processamento Spark
-- **confluent-kafka**: Kafka producer/consumer
-- **pandas**: Manipulação de dados
-- **great-expectations**: Data quality
-- **geopandas**: Análise geoespacial
-- **sqlalchemy**: ORM PostgreSQL
+### **Painel 3: Mapa Geográfico**
+- Localização em tempo real de todos os veículos ativos
+- Pontos coloridos por linha
+- Zoom e navegação interativa
+- Tooltip com informações detalhadas (veículo, linha, velocidade)
+
+### **Painel 4: Qualidade de Dados**
+- Status do pipeline (running/stopped)
+- Taxa de validação de dados
+- Métricas de staleness
+- Tempo de execução
 
 ---
 
-## 📦 Pré-requisitos
-
-### Software Necessário
-
-```bash
-# Obrigatório
-- Python 3.9+
-- Docker 24.0+ & Docker Compose 2.20+
-- Git 2.40+
-
-# Opcional (para deploy)
-- Kubernetes 1.28+
-- Terraform 1.6+
+## 📁 Estrutura do Projeto
+```
+sp-trans-pipeline/
+├── src/
+│   ├── common/
+│   │   ├── config.py              # Configurações (Pydantic)
+│   │   ├── exceptions.py          # Exceções customizadas
+│   │   └── logger.py              # Sistema de logs
+│   ├── ingestion/
+│   │   └── sptrans_api_client.py  # Cliente API SPTrans
+│   └── pipelines/
+│       └── kpi_pipeline.py        # Pipeline principal
+├── sql/
+│   └── 08_kpi_tables.sql          # Schema do PostgreSQL
+├── docker-compose.yml              # Orquestração de containers
+├── pipeline_kpis_completo.py       # Script principal
+├── requirements.txt                # Dependências Python
+├── .env.example                    # Variáveis de ambiente
+└── README.md                       # Este arquivo
 ```
 
-### Hardware Recomendado
-
-| Componente | Mínimo | Recomendado |
-|------------|--------|-------------|
-| **CPU** | 4 cores | 8+ cores |
-| **RAM** | 8 GB | 16+ GB |
-| **Disco** | 50 GB | 200+ GB SSD |
-| **Rede** | 10 Mbps | 100+ Mbps |
-
 ---
 
-## 🚀 Instalação
+## ⚙️ Configuração e Instalação
 
-### 1. Clone o Repositório
+### **Pré-requisitos**
+- Docker & Docker Compose
+- Python 3.12+
+- Token de API da SPTrans ([solicitar aqui](https://www.sptrans.com.br/desenvolvedores/))
+- 8GB RAM mínimo
+- 20GB espaço em disco
 
+### **1. Clone o Repositório**
 ```bash
 git clone https://github.com/rafarpl/sp-trans-pipeline.git
 cd sp-trans-pipeline
 ```
 
-### 2. Configuração de Ambiente
-
+### **2. Configure as Variáveis de Ambiente**
 ```bash
-# Copiar arquivo de exemplo
 cp .env.example .env
-
-# Editar com suas credenciais
 nano .env
 ```
 
-**Variáveis obrigatórias:**
+Adicione seu token da API:
 ```env
-# SPTrans API
-SPTRANS_API_TOKEN=your_token_here
-
-# PostgreSQL
+SPTRANS_API_TOKEN=seu_token_aqui
+SPTRANS_API_BASE_URL=http://api.olhovivo.sptrans.com.br/v2.1
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
-POSTGRES_DB=sptrans
-POSTGRES_USER=sptrans
-POSTGRES_PASSWORD=your_password
-
-# MinIO (S3)
+POSTGRES_DB=sptrans_test
+POSTGRES_USER=test_user
+POSTGRES_PASSWORD=test_password
 MINIO_ENDPOINT=localhost:9000
 MINIO_ACCESS_KEY=minioadmin
 MINIO_SECRET_KEY=minioadmin
-MINIO_BUCKET=sptrans-datalake
-
-# Kafka
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 ```
 
-### 3. Criar Virtual Environment
-
+### **3. Suba os Containers**
 ```bash
-# Criar venv
-python3 -m venv venv
+docker-compose up -d
+```
 
-# Ativar
+Aguarde ~30 segundos para todos os serviços iniciarem.
+
+### **4. Crie o Ambiente Virtual Python**
+```bash
+python3 -m venv venv
 source venv/bin/activate  # Linux/Mac
 # ou
-venv\Scripts\activate     # Windows
+.\venv\Scripts\activate   # Windows
+```
 
-# Instalar dependências
+### **5. Instale as Dependências**
+```bash
 pip install -r requirements.txt
 ```
 
-### 4. Subir Infraestrutura (Docker)
-
+### **6. Baixe o Driver JDBC PostgreSQL**
 ```bash
-# Subir todos os serviços
-docker-compose up -d
-
-# Verificar status
-docker-compose ps
-
-# Logs
-docker-compose logs -f
+sudo mkdir -p /usr/local/lib
+sudo wget -O /usr/local/lib/postgresql-42.7.1.jar https://jdbc.postgresql.org/download/postgresql-42.7.1.jar
 ```
 
-**Serviços disponíveis:**
-- **Airflow**: http://localhost:8080 (admin/admin)
-- **Grafana**: http://localhost:3000 (admin/admin)
-- **MinIO Console**: http://localhost:9001 (minioadmin/minioadmin)
-- **Prometheus**: http://localhost:9090
-- **PostgreSQL**: localhost:5432
-
-### 5. Setup do Database
-
+### **7. Crie as Tabelas no PostgreSQL**
 ```bash
-# Executar scripts SQL
-./scripts/setup.sh
-
-# Ou manualmente
-psql -h localhost -U sptrans -d sptrans -f sql/bronze/01_bronze_schema.sql
-psql -h localhost -U sptrans -d sptrans -f sql/bronze/02_bronze_tables.sql
-# ... (todos os scripts)
+cat sql/08_kpi_tables.sql | docker exec -i sptrans-postgres psql -U test_user -d sptrans_test
 ```
 
----
-
-## 💻 Uso
-
-### Modo Desenvolvimento
-
+### **8. Execute o Pipeline**
 ```bash
-# Ativar ambiente
-source venv/bin/activate
-
-# Rodar ingestion manual
-python -m src.ingestion.sptrans_api_client
-
-# Rodar job Spark
-spark-submit src/processing/jobs/bronze_to_silver.py
-
-# Testar DAG
-airflow dags test dag_01_gtfs_ingestion 2024-01-01
+python3 pipeline_kpis_completo.py
 ```
 
-### Modo Produção
+O pipeline executará a cada 3 minutos automaticamente.
 
+---
+
+## 📊 Acessar o Dashboard Grafana
+
+1. **Abrir navegador:** http://localhost:3000
+2. **Login:** 
+   - Username: `admin`
+   - Password: `admin`
+   - Clicar "Skip" para não trocar senha
+3. **Configurar Data Source:**
+   - Menu → Configuration → Data sources
+   - Add data source → PostgreSQL
+   - Preencher:
+     - Host: `postgres:5432`
+     - Database: `sptrans_test`
+     - User: `test_user`
+     - Password: `test_password`
+     - TLS/SSL Mode: `disable`
+   - Save & Test
+4. **Dashboard está pronto para uso!**
+
+---
+
+## 🔢 Fórmulas e Algoritmos
+
+### **Cálculo de Velocidade (Haversine)**
+```python
+def calculate_speed(lat1, lon1, lat2, lon2, time_diff_seconds):
+    R = 6371.0  # Raio da Terra em km
+    
+    # Converter para radianos
+    lat1_rad = radians(lat1)
+    lon1_rad = radians(lon1)
+    lat2_rad = radians(lat2)
+    lon2_rad = radians(lon2)
+    
+    # Diferenças
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    
+    # Fórmula de Haversine
+    a = sin(dlat/2)**2 + cos(lat1_rad) * cos(lat2_rad) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    
+    distance_km = R * c
+    speed_kmh = (distance_km / time_diff_seconds) * 3600
+    
+    return round(speed_kmh, 2)
+```
+
+### **Validações Implementadas**
+
+- ✅ Coordenadas dentro de São Paulo (lat: -24.0 a -23.0, lon: -47.0 a -46.0)
+- ✅ Velocidade entre 0-100 km/h
+- ✅ Intervalo entre capturas < 10 minutos
+- ✅ Deduplicação por (vehicle_id, timestamp)
+
+---
+
+## 📈 Desempenho e Escalabilidade
+
+### **Métricas Atuais**
+- **Volume de Dados**: ~7.200.000 registros/dia
+- **Frequência de Atualização**: 3 minutos
+- **Latência de Processamento**: 12-18 segundos
+- **Taxa de Validação**: ~99.5%
+- **Veículos Monitorados**: 6.000-8.000 (variável por horário)
+- **Linhas Cobertas**: 1.000+ linhas ativas
+
+### **Capacidade**
+- Suporta até 15.000 veículos simultâneos
+- Processamento distribuído (Spark com 2 cores)
+- Armazenamento escalável (MinIO S3-compatible)
+
+---
+
+## 🧪 Testes
 ```bash
-# Iniciar todos os serviços
-./scripts/start_services.sh
+# Testar conexão com API
+python3 -c "from src.ingestion.sptrans_api_client import SPTransAPIClient; \
+            c = SPTransAPIClient(); \
+            print('✅ OK' if c.authenticate() else '❌ ERRO')"
 
-# Habilitar DAGs no Airflow
-# Acessar: http://localhost:8080
-# Ativar os 7 DAGs na UI
+# Testar conexão PostgreSQL
+docker exec -it sptrans-postgres psql -U test_user -d sptrans_test -c "SELECT version();"
 
-# Monitorar
-# Grafana: http://localhost:3000
-# Prometheus: http://localhost:9090
-```
-
-### Comandos Úteis
-
-```bash
-# Backup
-./scripts/backup_data.sh
-
-# Restore
-./scripts/restore_data.sh
-
-# Gerar dados de teste
-python scripts/generate_test_data.py
-
-# Rodar testes
-pytest tests/ -v --cov=src
-
-# Limpar ambiente
-./scripts/stop_services.sh
-docker-compose down -v
+# Verificar dados
+docker exec -it sptrans-postgres psql -U test_user -d sptrans_test -c \
+  "SELECT COUNT(*) FROM serving.kpi_realtime;"
 ```
 
 ---
 
-## 📊 KPIs e Métricas
+## 📚 Documentação Adicional
 
-### KPIs de Negócio
-
-| KPI | Descrição | Cálculo | Alvo |
-|-----|-----------|---------|------|
-| **Fleet Coverage** | % da frota transmitindo | (ativos / total) × 100 | > 95% |
-| **Avg Speed** | Velocidade média por linha | Σ(speed) / count | 15-25 km/h |
-| **Headway** | Intervalo entre veículos | Δt entre passagens | < 10 min |
-| **Punctuality** | Pontualidade vs programado | \|real - scheduled\| | < 5 min |
-| **Trip Completion** | % viagens completas | completas / planejadas | > 90% |
-
-### Métricas Técnicas
-
-- **Latência de Ingestão**: < 30 segundos
-- **Throughput**: ~5.000 mensagens/min
-- **Data Quality Score**: > 95%
-- **Pipeline Success Rate**: > 99%
-- **Storage Growth**: ~10 GB/dia
-
----
-
-## 📚 Documentação
-
-Documentação completa disponível em `docs/`:
-
-- **[Arquitetura](docs/01_architecture.md)**: Decisões técnicas e diagramas
-- **[Setup Guide](docs/02_setup_guide.md)**: Instalação passo a passo
-- **[User Guide](docs/03_user_guide.md)**: Como usar o sistema
-- **[API Reference](docs/04_api_reference.md)**: Referência de APIs
-- **[Troubleshooting](docs/05_troubleshooting.md)**: Resolução de problemas
-- **[Justifications](docs/06_justifications.md)**: Justificativas técnicas
-- **[Data Dictionary](docs/03_data_dictionary.md)**: Dicionário de dados
-
----
-
-## 📁 Estrutura do Projeto
-
-```
-sp-trans-pipeline/
-├── src/                          # Código-fonte Python
-│   ├── common/                   # Módulos compartilhados
-│   │   ├── config.py            # Configurações
-│   │   ├── logging_config.py    # Logging estruturado
-│   │   ├── exceptions.py        # Exceções customizadas
-│   │   └── validators.py        # Validações
-│   ├── ingestion/               # Camada de ingestão
-│   │   ├── sptrans_api_client.py
-│   │   ├── kafka_producer.py
-│   │   └── gtfs_downloader.py
-│   ├── processing/              # Jobs Spark
-│   │   ├── jobs/
-│   │   │   ├── kafka_to_bronze.py
-│   │   │   ├── bronze_to_silver.py
-│   │   │   └── ...
-│   │   └── transformations/     # Transformações
-│   ├── serving/                 # Serving layer
-│   └── monitoring/              # Observabilidade
-├── dags/                        # DAGs Airflow
-│   ├── dag_01_gtfs_ingestion.py
-│   ├── dag_02_api_ingestion.py
-│   └── ...
-├── sql/                         # Scripts SQL
-│   ├── bronze/
-│   ├── silver/
-│   ├── gold/
-│   └── serving/
-├── tests/                       # Testes
-│   ├── unit/
-│   └── integration/
-├── config/                      # Configurações
-│   ├── airflow/
-│   ├── spark/
-│   └── grafana/
-├── infra/                       # Infraestrutura
-│   ├── docker/
-│   ├── kubernetes/
-│   └── terraform/
-├── docs/                        # Documentação
-├── notebooks/                   # Jupyter notebooks
-├── scripts/                     # Scripts utilitários
-├── docker-compose.yml
-├── requirements.txt
-└── README.md
-```
-
----
-
-## 🤝 Contribuição
-
-Contribuições são bem-vindas! Por favor:
-
-1. Fork o projeto
-2. Crie uma branch (`git checkout -b feature/nova-feature`)
-3. Commit suas mudanças (`git commit -m 'Add nova feature'`)
-4. Push para a branch (`git push origin feature/nova-feature`)
-5. Abra um Pull Request
-
-### Padrões de Código
-
-- **Python**: PEP 8 (black + isort)
-- **SQL**: Lowercase, underscores
-- **Commits**: Conventional Commits
-- **Testes**: Coverage > 80%
-
----
-
-## 📄 Licença
-
-Este projeto está sob a licença MIT. Veja [LICENSE](LICENSE) para mais detalhes.
+- [API SPTrans Olho Vivo](https://www.sptrans.com.br/desenvolvedores/)
+- [Apache Spark Documentation](https://spark.apache.org/docs/latest/)
+- [Grafana Documentation](https://grafana.com/docs/)
+- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
 
 ---
 
 ## 👨‍💻 Autor
 
-**Rafael (rafarpl)**  
-Pós-Graduação em Engenharia de Dados  
-FIA/LABDATA - 2024
+**Rafael Lopes**
+- 🎓 Pós-graduação em Data Engineering - FIA/LABDATA (2025)
+- 📧 Email: [rafarpl@gmail.com]
+- 🐙 GitHub: [@rafarpl](https://github.com/rafarpl)
 
-📧 Email: [seu-email]  
-🔗 LinkedIn: [seu-linkedin]  
-🐙 GitHub: [@rafarpl](https://github.com/rafarpl)
+---
+
+## 📄 Licença
+
+Este projeto foi desenvolvido como Trabalho de Conclusão de Curso (TCC) do programa de pós-graduação em Engenharia de Dados da FIA/LABDATA.
 
 ---
 
 ## 🙏 Agradecimentos
 
-- **SPTrans** pelos dados públicos da API Olho Vivo
-- **FIA/LABDATA** pela orientação e suporte
-- **Comunidade Open Source** pelas ferramentas incríveis
+- **SPTrans** - Pela disponibilização da API Olho Vivo
+- **FIA/LABDATA** - Pelo programa de pós-graduação
+- **Comunidade Open Source** - Pelas ferramentas incríveis
 
 ---
 
-## 📊 Status do Projeto
-
-![Status](https://img.shields.io/badge/Status-Em%20Desenvolvimento-yellow)
-![Build](https://img.shields.io/badge/Build-Passing-green)
-![Coverage](https://img.shields.io/badge/Coverage-85%25-brightgreen)
-
-**Última atualização**: Novembro 2024
-
----
-
-## 🔗 Links Úteis
-
-- [SPTrans API Docs](http://www.sptrans.com.br/desenvolvedores/)
-- [GTFS Specification](https://gtfs.org/)
-- [Apache Spark Docs](https://spark.apache.org/docs/latest/)
-- [Delta Lake Docs](https://docs.delta.io/)
-- [Airflow Docs](https://airflow.apache.org/docs/)
-
----
-
-**⭐ Se este projeto foi útil, considere dar uma estrela!**
+⭐ **Se este projeto foi útil, considere dar uma estrela no GitHub!**
