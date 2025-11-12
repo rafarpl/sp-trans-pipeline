@@ -35,19 +35,33 @@ POSTGRES_PASSWORD = "test_password"
 iteration = 0
 
 def init_spark():
-    """Inicializar Spark Session"""
+    """Inicializar Spark Session com suporte a MinIO"""
+    
+    # Lista de JARs
+    jars = [
+        "/usr/local/lib/postgresql-42.7.1.jar",
+        "/usr/local/lib/hadoop-aws-3.3.4.jar",
+        "/usr/local/lib/aws-java-sdk-bundle-1.12.262.jar"
+    ]
+    
     spark = SparkSession.builder \
         .appName("SPTrans-KPI-Pipeline") \
         .master("local[2]") \
         .config("spark.ui.enabled", "false") \
         .config("spark.sql.shuffle.partitions", "4") \
-        .config("spark.jars", "/usr/local/lib/postgresql-42.7.1.jar") \
-        .config("spark.driver.extraClassPath", "/usr/local/lib/postgresql-42.7.1.jar") \
-        .config("spark.executor.extraClassPath", "/usr/local/lib/postgresql-42.7.1.jar") \
+        .config("spark.jars", ",".join(jars)) \
+        .config("spark.driver.extraClassPath", ":".join(jars)) \
+        .config("spark.executor.extraClassPath", ":".join(jars)) \
+        .config("spark.hadoop.fs.s3a.endpoint", "http://localhost:9000") \
+        .config("spark.hadoop.fs.s3a.access.key", "minioadmin") \
+        .config("spark.hadoop.fs.s3a.secret.key", "minioadmin") \
+        .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
         .getOrCreate()
     
     spark.sparkContext.setLogLevel("WARN")
-    print("✅ Spark iniciado")
+    print("✅ Spark iniciado com Data Lake (MinIO)")
     return spark
 
 def calculate_speed(lat1, lon1, lat2, lon2, time_diff_seconds):
@@ -156,6 +170,42 @@ def write_to_postgres(spark, df, table_name, mode="append"):
     except Exception as e:
         print(f"   ❌ Erro ao salvar {table_name}: {e}")
 
+def save_to_datalake(df, layer, table_name, partition_cols=None):
+    """
+    Salvar dados no Data Lake (MinIO)
+    
+    Args:
+        df: DataFrame Spark
+        layer: bronze, silver, gold
+        table_name: nome da tabela
+        partition_cols: lista de colunas para particionar
+    """
+    try:
+        current_time = datetime.now()
+        
+        # Path no formato: s3a://bucket/layer/table/year=YYYY/month=MM/day=DD/hour=HH/
+        base_path = f"s3a://sptrans-datalake/{layer}/{table_name}"
+        
+        # Adicionar colunas de partição
+        df_to_save = df.withColumn("year", F.year(F.col("timestamp"))) \
+                       .withColumn("month", F.month(F.col("timestamp"))) \
+                       .withColumn("day", F.dayofmonth(F.col("timestamp"))) \
+                       .withColumn("hour", F.hour(F.col("timestamp")))
+        
+        # Salvar como Parquet particionado
+        df_to_save.write \
+            .format("parquet") \
+            .mode("append") \
+            .partitionBy("year", "month", "day", "hour") \
+            .option("compression", "snappy") \
+            .save(base_path)
+        
+        record_count = df.count()
+        print(f"   💾 Data Lake ({layer}): {record_count} registros salvos em {base_path}")
+        
+    except Exception as e:
+        print(f"   ⚠️  Erro ao salvar no Data Lake: {e}")
+
 def run_iteration(spark):
     """Executar uma iteração completa"""
     global iteration
@@ -192,7 +242,8 @@ def run_iteration(spark):
     
     df_bronze = spark.createDataFrame(positions, schema=schema)
     print(f"   ✅ Bronze: {df_bronze.count()} registros")
-    
+    save_to_datalake(df_bronze, "bronze", "vehicle_positions")
+
     # 3. Silver - Validação e Cálculo de Velocidade
     print("\n🔹 [3/6] Camada Silver...")
 
@@ -278,6 +329,7 @@ def run_iteration(spark):
 
     silver_count = df_silver.count()
     print(f"   ✅ Silver: {silver_count} registros processados")
+    save_to_datalake(df_silver, "silver", "vehicle_positions_validated")
     
     # 4. KPIs
     print("\n📊 [4/6] Calculando KPIs...")
@@ -361,7 +413,9 @@ def run_iteration(spark):
     df_timeseries = spark.createDataFrame(timeseries_data)
     
     print(f"   ✅ KPIs calculados: {total_vehicles} veículos, {total_lines} linhas")
-    
+    save_to_datalake(df_kpi_realtime, "gold", "kpi_realtime")
+    save_to_datalake(df_kpi_by_line, "gold", "kpi_by_line")
+
     # 5. Salvar PostgreSQL
     print("\n💾 [5/6] Salvando no PostgreSQL...")
     write_to_postgres(spark, df_kpi_realtime, "kpi_realtime")
