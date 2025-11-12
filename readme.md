@@ -33,7 +33,7 @@ Sistema completo de engenharia de dados que coleta, processa e visualiza dados e
 │                   CAMADA BRONZE (Raw Data)                      │
 │                     Apache Spark (PySpark)                      │
 │                 • Ingestão via API Client                       │
-│                 • ~7.2M registros/dia                           │
+│                 • ~10.8M registros/dia                           │
 │                 • Validação básica de schema                    │
 └────────────────────────┬────────────────────────────────────────┘
                          │
@@ -249,7 +249,7 @@ cat sql/08_kpi_tables.sql | docker exec -i sptrans-postgres psql -U test_user -d
 python3 pipeline_kpis_completo.py
 ```
 
-O pipeline executará a cada 3 minutos automaticamente.
+O pipeline executará a cada 2 minutos automaticamente.
 
 ---
 
