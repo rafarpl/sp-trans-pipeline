@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SPTrans Pipeline - KPIs Completos para Grafana
-Atualiza a cada 3 minutos com todos os KPIs viáveis
+Atualiza a cada 2 minutos com todos os KPIs viáveis
 """
 
 import sys
@@ -22,7 +22,7 @@ print("""
 ║     🚌  SPTrans KPI Pipeline para Grafana                ║
 ║                                                           ║
 ║     Pipeline completo com todos os KPIs viáveis          ║
-║     Atualização automática a cada 3 minutos              ║
+║     Atualização automática a cada 2 minutos              ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
 """)
