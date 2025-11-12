@@ -1,0 +1,275 @@
+{
+  "dashboard": {
+    "title": "SPTrans - Real-Time Dashboard",
+    "tags": ["sptrans", "transporte", "real-time"],
+    "timezone": "America/Sao_Paulo",
+    "editable": true,
+    "graphTooltip": 1,
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "30s",
+    "panels": [
+      {
+        "id": 1,
+        "type": "row",
+        "title": "🚌 OPERACIONAL (TEMPO REAL)",
+        "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1},
+        "collapsed": false
+      },
+      {
+        "id": 2,
+        "type": "stat",
+        "title": "Veículos Ativos",
+        "gridPos": {"x": 0, "y": 1, "w": 6, "h": 4},
+        "targets": [{
+          "rawSql": "SELECT total_vehicles as value FROM serving.kpi_realtime ORDER BY timestamp DESC LIMIT 1",
+          "format": "table"
+        }],
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "orientation": "auto",
+          "textMode": "value_and_name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 1000, "color": "yellow"},
+                {"value": 2000, "color": "green"}
+              ]
+            },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "type": "stat",
+        "title": "Linhas Ativas",
+        "gridPos": {"x": 6, "y": 1, "w": 6, "h": 4},
+        "targets": [{
+          "rawSql": "SELECT total_lines as value FROM serving.kpi_realtime ORDER BY timestamp DESC LIMIT 1",
+          "format": "table"
+        }],
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "textMode": "value_and_name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 100, "color": "yellow"},
+                {"value": 200, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "type": "stat",
+        "title": "Cobertura",
+        "gridPos": {"x": 12, "y": 1, "w": 6, "h": 4},
+        "targets": [{
+          "rawSql": "SELECT coverage_percentage as value FROM serving.kpi_realtime ORDER BY timestamp DESC LIMIT 1",
+          "format": "table"
+        }],
+        "options": {
+          "colorMode": "background",
+          "textMode": "value_and_name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 50, "color": "yellow"},
+                {"value": 80, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "type": "stat",
+        "title": "Staleness",
+        "gridPos": {"x": 18, "y": 1, "w": 6, "h": 4},
+        "targets": [{
+          "rawSql": "SELECT stale_percentage as value FROM serving.kpi_realtime ORDER BY timestamp DESC LIMIT 1",
+          "format": "table"
+        }],
+        "options": {
+          "colorMode": "background",
+          "textMode": "value_and_name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 5, "color": "yellow"},
+                {"value": 10, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "type": "timeseries",
+        "title": "Veículos Ativos (Últimas 2h)",
+        "gridPos": {"x": 0, "y": 5, "w": 24, "h": 8},
+        "targets": [{
+          "rawSql": "SELECT timestamp as time, total_vehicles FROM serving.kpi_realtime WHERE timestamp > NOW() - INTERVAL '2 hours' ORDER BY timestamp",
+          "format": "time_series"
+        }],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "custom": {
+              "fillOpacity": 20,
+              "lineWidth": 2
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "type": "row",
+        "title": "📈 ANÁLISE POR LINHA",
+        "gridPos": {"x": 0, "y": 13, "w": 24, "h": 1},
+        "collapsed": false
+      },
+      {
+        "id": 8,
+        "type": "barchart",
+        "title": "Top 10 Linhas (Veículos)",
+        "gridPos": {"x": 0, "y": 14, "w": 12, "h": 8},
+        "targets": [{
+          "rawSql": "SELECT line_id, AVG(total_vehicles)::int as vehicles FROM serving.kpi_by_line WHERE timestamp > NOW() - INTERVAL '30 minutes' GROUP BY line_id ORDER BY vehicles DESC LIMIT 10",
+          "format": "table"
+        }],
+        "options": {
+          "orientation": "horizontal"
+        }
+      },
+      {
+        "id": 9,
+        "type": "table",
+        "title": "Linhas com Mais Veículos",
+        "gridPos": {"x": 12, "y": 14, "w": 12, "h": 8},
+        "targets": [{
+          "rawSql": "SELECT line_id as \"Linha\", total_vehicles as \"Veículos\", ROUND(avg_speed::numeric, 1) as \"Vel. Média (km/h)\" FROM serving.kpi_by_line WHERE timestamp = (SELECT MAX(timestamp) FROM serving.kpi_by_line) ORDER BY total_vehicles DESC LIMIT 15",
+          "format": "table"
+        }]
+      },
+      {
+        "id": 10,
+        "type": "row",
+        "title": "🔍 QUALIDADE DE DADOS",
+        "gridPos": {"x": 0, "y": 22, "w": 24, "h": 1},
+        "collapsed": false
+      },
+      {
+        "id": 11,
+        "type": "stat",
+        "title": "Taxa de Validação",
+        "gridPos": {"x": 0, "y": 23, "w": 6, "h": 4},
+        "targets": [{
+          "rawSql": "SELECT validation_rate as value FROM serving.kpi_quality ORDER BY timestamp DESC LIMIT 1",
+          "format": "table"
+        }],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 95, "color": "yellow"},
+                {"value": 99, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "type": "stat",
+        "title": "Registros Processados",
+        "gridPos": {"x": 6, "y": 23, "w": 6, "h": 4},
+        "targets": [{
+          "rawSql": "SELECT records_ingested as value FROM serving.kpi_quality ORDER BY timestamp DESC LIMIT 1",
+          "format": "table"
+        }],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 13,
+        "type": "stat",
+        "title": "Pipeline Status",
+        "gridPos": {"x": 12, "y": 23, "w": 6, "h": 4},
+        "targets": [{
+          "rawSql": "SELECT pipeline_status as value FROM serving.kpi_quality ORDER BY timestamp DESC LIMIT 1",
+          "format": "table"
+        }],
+        "options": {
+          "textMode": "value"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [{
+              "type": "value",
+              "options": {
+                "running": {"text": "✅ RUNNING", "color": "green"}
+              }
+            }]
+          }
+        }
+      },
+      {
+        "id": 14,
+        "type": "stat",
+        "title": "Tempo de Execução",
+        "gridPos": {"x": 18, "y": 23, "w": 6, "h": 4},
+        "targets": [{
+          "rawSql": "SELECT execution_duration_seconds as value FROM serving.kpi_quality ORDER BY timestamp DESC LIMIT 1",
+          "format": "table"
+        }],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          }
+        }
+      },
+      {
+        "id": 15,
+        "type": "timeseries",
+        "title": "Taxa de Validação ao Longo do Tempo",
+        "gridPos": {"x": 0, "y": 27, "w": 24, "h": 6},
+        "targets": [{
+          "rawSql": "SELECT timestamp as time, validation_rate FROM serving.kpi_quality WHERE timestamp > NOW() - INTERVAL '2 hours' ORDER BY timestamp",
+          "format": "time_series"
+        }]
+      }
+    ]
+  },
+  "overwrite": true
+}
