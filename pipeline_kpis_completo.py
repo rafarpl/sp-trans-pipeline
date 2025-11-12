@@ -435,7 +435,7 @@ def main():
     """Loop principal"""
     
     spark = init_spark()
-    interval_seconds = 180  # 3 minutos
+    interval_seconds = 120  # 2 minutos
     
     print(f"\n🔄 Iniciando loop de atualização...")
     print(f"⏱️  Intervalo: {interval_seconds}s ({interval_seconds/60:.1f} min)")
