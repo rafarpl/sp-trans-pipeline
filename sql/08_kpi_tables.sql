@@ -144,11 +144,11 @@ CREATE INDEX idx_kpi_timeseries_line ON serving.kpi_timeseries(line_id, timestam
 CREATE OR REPLACE FUNCTION serving.cleanup_old_data() 
 RETURNS void AS $$
 BEGIN
-    DELETE FROM serving.kpi_realtime WHERE timestamp < NOW() - INTERVAL '48 hours';
-    DELETE FROM serving.kpi_by_line WHERE timestamp < NOW() - INTERVAL '48 hours';
-    DELETE FROM serving.kpi_quality WHERE timestamp < NOW() - INTERVAL '48 hours';
-    DELETE FROM serving.vehicle_positions_latest WHERE timestamp < NOW() - INTERVAL '1 hour';
-    DELETE FROM serving.kpi_timeseries WHERE timestamp < NOW() - INTERVAL '48 hours';
+    DELETE FROM serving.kpi_realtime WHERE timestamp < NOW() - INTERVAL '30 days';
+    DELETE FROM serving.kpi_by_line WHERE timestamp < NOW() - INTERVAL '30 days';
+    DELETE FROM serving.kpi_quality WHERE timestamp < NOW() - INTERVAL '30 days';
+    DELETE FROM serving.vehicle_positions_latest WHERE timestamp < NOW() - INTERVAL '1 hour';  -- Manter 1 hora
+    DELETE FROM serving.kpi_timeseries WHERE timestamp < NOW() - INTERVAL '30 days';
 END;
 $$ LANGUAGE plpgsql;
 
