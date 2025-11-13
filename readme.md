@@ -10,6 +10,8 @@ Pipeline de dados em tempo real para monitoramento e análise do sistema de tran
 
 Sistema completo de engenharia de dados que coleta, processa e visualiza dados em tempo real da API Olho Vivo da SPTrans, implementando uma arquitetura Medallion (Bronze → Silver → Gold) com processamento distribuído.
 
+Documentação e apresentação na pasta /docs
+
 ### 🎯 Objetivos
 
 - Monitoramento em tempo real da frota de ônibus de São Paulo
